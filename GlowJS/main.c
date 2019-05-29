@@ -11,4 +11,8 @@ int main(int argc, char **argv)
 		js_dostring(J, line);
 	glow_deleteState(J);
 	*/
+
+	const char code[] = "var abc = 1";
+	const char* code_ptr = code;
+	parse_program(&code_ptr);
 }
