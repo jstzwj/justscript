@@ -1,18 +1,22 @@
 [package]
-name = "glow_js"
+name = "justscript"
 version = "0.1.0"
 authors = ["JasonWang <1103870790@qq.com>"]
 edition = "2018"
-default-run = "glow_example"
+default-run = "just_example"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-name = "glow_core"
+name = "just_core"
 path = "src/core/lib.rs"
 
+[lib]
+name = "just_syntax"
+path = "src/syntax/lib.rs"
+
 [[bin]]
-name = "glow_example"
+name = "just_example"
 path = "src/main.rs"
 
 [dependencies]
