@@ -3,7 +3,7 @@ use std::fs;
 
 pub fn load_from_string(code:&str) {
 
-} 
+}
 
 
 pub fn load_from_file(path:&str) {
