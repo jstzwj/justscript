@@ -1,3 +1,3 @@
 JustScript
 =====
-JustScript is just an lightweight Javascript engine written in Rust.
+JustScript is just a lightweight Javascript engine written in Rust.

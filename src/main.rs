@@ -1,8 +1,9 @@
 
-extern crate glow_core;
+extern crate justscript;
 
 fn main() {
     let code = "123";
     println!("Hello, world!");
-    glow_core::load::load_from_string(code);
+    let mut state = justscript::State::new();
+    
 }
