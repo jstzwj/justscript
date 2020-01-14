@@ -1,22 +1,25 @@
 
-
+#[derive(Debug, Copy, Clone)]
 pub struct BytePos(pub u32);
 
+#[derive(Debug, Copy, Clone)]
 pub struct CharPos(pub usize);
 
-/*
-pub struct Source {
-    pub source: String
+
+pub struct SourceFile {
+    pub start_pos: BytePos,
+    pub src: Option<String>
 }
 
-impl Source {
-    pub fn new(code:&str) -> Source{
-        Source {
-            source: String::from(code)
+impl SourceFile {
+    pub fn new(code:&str) -> SourceFile{
+        SourceFile {
+            start_pos: BytePos(0),
+            src: Some(String::from(code))
         }
     }
 }
-*/
+
 
 pub struct Span {
    begin: CharPos,

@@ -1,25 +1,27 @@
 use std::boxed;
 use std::option;
 
-use self::super::lexer::Lexer;
+use self::super::cursor::Cursor;
+use self::super::lexer::*;
 use self::super::ast::*;
 use self::super::span::*;
+use std::sync::Arc;
 
 
 pub struct Parser {
-    token_stream : Lexer,
+    token_stream : StringReader,
 }
 
 impl Parser {
     pub fn new(code: &str) -> Parser {
+        let source_file = SourceFile::new(code);
         Parser {
-            token_stream: Lexer::new(code)
+            token_stream: StringReader::new(Arc::new(source_file))
         }
     }
 
     pub fn parse(&mut self) -> SourceCode{
         let mut source = SourceCode::new();
-
         loop {
             match self.parse_source_element() {
                 Some(value) => source.elements.push(value),

@@ -5,6 +5,7 @@ pub mod punctuator;
 pub mod keyword;
 pub mod ast;
 pub mod span;
+pub mod cursor;
 
 pub fn parse(code:&str) -> ast::SourceElement {
     ast::SourceElement::FunctionDeclaration()

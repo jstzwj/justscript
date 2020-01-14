@@ -1,5 +1,7 @@
 use self::super::token::*;
-use self::super::span::{BytePos, CharPos};
+use self::super::span::{BytePos, CharPos, Span, SourceFile};
+use self::super::cursor::*;
+use std::sync::Arc;
 use std::str::Chars;
 use std::error;
 use std::fmt;
@@ -41,25 +43,27 @@ impl error::Error for LexerError {
     }
 }
 
-pub struct Lexer {
-    pub source: String,
-    pub position: BytePos,
-    pub last_pos: BytePos,
-    pub char_position: CharPos,
+/// Parses the first token from the provided input string.
+pub fn first_token(input: &str) -> Token {
+    debug_assert!(!input.is_empty());
+    Cursor::new(input).advance_token()
 }
 
-impl Lexer {
-    pub fn new(text: &str) -> Lexer {
-        Lexer {
-            source: text.to_string(),
-            position: BytePos(0),
-            last_pos: BytePos(text.as_bytes().len() as u32),
-            char_position: CharPos(0)
+/// Creates an iterator that produces tokens from the input string.
+pub fn tokenize(mut input: &str) -> impl Iterator<Item = Token> + '_ {
+    std::iter::from_fn(move || {
+        if input.is_empty() {
+            return None;
         }
-    }
+        let token = first_token(input);
+        input = &input[token.len..];
+        Some(token)
+    })
+}
 
+impl Cursor<'_> {
     // fn lex(&mut self, code: &str) {}
-    fn is_str(iter: &mut Chars, s: &str) -> bool {
+    fn eat_str(iter: &mut Chars, s: &str) -> bool {
         true
     }
 
@@ -106,21 +110,46 @@ impl Lexer {
         }
     }
 
-    fn next(&mut self) -> Result<Token, LexerError> {
-        let next_iter = self.source.get((self.position.0 as usize)..);
-        // todo: diagnose info
-        let mut iter = next_iter.unwrap().chars();
-
-        if let Some(value) = Lexer::lex_whitespace(&mut iter) {
-            Ok(value)
-        } else if let Some(value) = Lexer::lex_lineterminator(&mut iter) {
-            Ok(value)
-        } else {
-            Err(LexerError::new("Lexer error"))
-        }
+    fn advance_token(&mut self) -> Token {
+        let first_char = self.bump().unwrap();
+        let token_kind: TokenKind = match first_char {
+            _ => TokenKind::Unknown,
+        };
+        Token::new(token_kind, self.len_consumed())
     }
+}
 
-    fn peek(&mut self) -> Result<char, LexerError> {
-        Ok('a')
+
+
+pub struct StringReader {
+    /// Initial position, read-only.
+    start_pos: BytePos,
+    /// The absolute offset within the source_map of the current character.
+    pub pos: BytePos,
+    /// Stop reading src at this index.
+    end_src_index: usize,
+    /// Source text to tokenize.
+    src: Arc<String>,
+}
+
+impl StringReader {
+    pub fn new(
+        source_file: Arc<SourceFile>,
+    ) -> Self {
+        if source_file.src.is_none() {
+            /*
+            sess.span_diagnostic
+                .bug(&format!("cannot lex `source_file` without source: {}", source_file.name));
+            */
+        }
+
+        let src = (*source_file.src.as_ref().unwrap()).clone();
+
+        StringReader {
+            start_pos: source_file.start_pos,
+            pos: source_file.start_pos,
+            end_src_index: src.len(),
+            src: Arc::new(src),
+        }
     }
 }

@@ -13,6 +13,7 @@ impl Token {
 }
 
 pub enum TokenKind {
+    Unknown,
     WhiteSpace,
     LineTerminator,
     MultiLineComment,
