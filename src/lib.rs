@@ -1,19 +1,21 @@
-pub mod load;
 pub mod syntax;
 pub mod vm;
 
-use byteorder::{NativeEndian, WriteBytesExt};
+use std::fs;
+use std::path::Path;
+use crate::syntax::parser::Parser;
 use std::collections::HashMap;
 
+use byteorder::{NativeEndian, WriteBytesExt};
+
+
 pub struct State {
-    
 }
 
 
 impl State {
     pub fn new() -> State {
         State {
-
         }
     }
 
@@ -25,6 +27,21 @@ impl State {
     {
 
     }
+
+    pub fn run(&self, script:&Script) {
+    }
+
+    pub fn load_from_string(&self, code: &str) -> Script {
+        let mut parser = Parser::new();
+        let element = parser.parse(code);
+        Script::new()
+    }
+    
+    pub fn load_from_file(&self, path: &str) -> Script {
+        let contents = fs::read_to_string(path).expect("Something went wrong reading the file");
+        self.load_from_string(&contents)
+    }
+    
 }
 
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -156,3 +173,21 @@ impl Object {
         }
     }
 }
+
+
+pub struct Script {
+
+}
+
+impl Script {
+    pub fn new() -> Script {
+        Script {
+        }
+    }
+}
+
+
+pub fn compile(code:&str) -> Script{
+    Script::new()
+}
+
