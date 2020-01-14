@@ -35,13 +35,13 @@ pub enum SourceElement {
     FunctionDeclaration(),
 }
 
-pub struct Source {
+pub struct SourceCode {
     pub elements: Vec<SourceElement>
 }
 
-impl Source {
-    pub fn new() -> Source {
-        Source {
+impl SourceCode {
+    pub fn new() -> SourceCode {
+        SourceCode {
             elements: Vec::new()
         }
     }

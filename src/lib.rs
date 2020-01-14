@@ -30,18 +30,6 @@ impl State {
 
     pub fn run(&self, script:&Script) {
     }
-
-    pub fn load_from_string(&self, code: &str) -> Script {
-        let mut parser = Parser::new();
-        let element = parser.parse(code);
-        Script::new()
-    }
-    
-    pub fn load_from_file(&self, path: &str) -> Script {
-        let contents = fs::read_to_string(path).expect("Something went wrong reading the file");
-        self.load_from_string(&contents)
-    }
-    
 }
 
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -188,6 +176,8 @@ impl Script {
 
 
 pub fn compile(code:&str) -> Script{
+    let mut parser = Parser::new(code);
+    let element = parser.parse();
     Script::new()
 }
 

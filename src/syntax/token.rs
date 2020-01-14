@@ -7,7 +7,7 @@ pub struct Token {
 }
 
 impl Token {
-    fn new(kind: TokenKind, len: usize) -> Token {
+    pub fn new(kind: TokenKind, len: usize) -> Token {
         Token { kind, len }
     }
 }
@@ -15,7 +15,8 @@ impl Token {
 pub enum TokenKind {
     WhiteSpace,
     LineTerminator,
-    Comment,
+    MultiLineComment,
+    SingleLineComment,
     // common token
     IdentifierName,
     Punctuator,

@@ -3,22 +3,22 @@ use std::option;
 
 use self::super::lexer::Lexer;
 use self::super::ast::*;
+use self::super::span::*;
 
 
 pub struct Parser {
-    token_stream : Option<Lexer>,
+    token_stream : Lexer,
 }
 
 impl Parser {
-    pub fn new() -> Parser {
+    pub fn new(code: &str) -> Parser {
         Parser {
-            token_stream: None
+            token_stream: Lexer::new(code)
         }
     }
 
-    pub fn parse(&mut self, code: &str) -> Source{
-        self.token_stream = Some(Lexer::new(code));
-        let mut source = Source::new();
+    pub fn parse(&mut self) -> SourceCode{
+        let mut source = SourceCode::new();
 
         loop {
             match self.parse_source_element() {
