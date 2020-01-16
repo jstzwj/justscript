@@ -1,14 +1,27 @@
 use self::super::keyword;
 use self::super::punctuator;
+use self::super::span::Span;
 
-pub struct Token {
+
+pub struct LexToken {
     pub kind: TokenKind,
     pub len: usize,
 }
 
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+}
+
+impl LexToken {
+    pub fn new(kind: TokenKind, len: usize) -> LexToken {
+        LexToken { kind, len }
+    }
+}
+
 impl Token {
-    pub fn new(kind: TokenKind, len: usize) -> Token {
-        Token { kind, len }
+    pub fn new(kind: TokenKind, span: Span) -> Token {
+        Token { kind, span }
     }
 }
 
@@ -20,7 +33,9 @@ pub enum TokenKind {
     MultiLineComment,
     SingleLineComment,
     /// common token
-    IdentifierName,
+    /// Indentifier 
+    /// At this step keywords are also considered identifiers.
+    Ident,
     /// Punctuator
     /// ";"
     Semi,
@@ -76,9 +91,17 @@ pub enum TokenKind {
     Caret,
     /// "%"
     Percent,
+    /// "/="
+    DivEq,
     /// literal
-    NumericLiteral,
+    // NumericLiteral
+    DecimalLiteral,
+    BinaryIntegerLiteral,
+    OctalIntegerLiteral,
+    HexIntegerLiteral,
+    // StringLiteral
     StringLiteral,
+    // Template
     Template,
     EOF,
 }

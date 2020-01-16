@@ -7,13 +7,13 @@ use std::error;
 use std::fmt;
 
 /// Parses the first token from the provided input string.
-pub fn first_token(input: &str) -> Token {
+pub fn first_token(input: &str) -> LexToken {
     debug_assert!(!input.is_empty());
     Cursor::new(input).advance_token()
 }
 
 /// Creates an iterator that produces tokens from the input string.
-pub fn tokenize(mut input: &str) -> impl Iterator<Item = Token> + '_ {
+pub fn tokenize(mut input: &str) -> impl Iterator<Item = LexToken> + '_ {
     std::iter::from_fn(move || {
         if input.is_empty() {
             return None;
@@ -89,10 +89,6 @@ pub fn is_id_continue(c: char) -> bool {
 }
 
 impl Cursor<'_> {
-    // fn lex(&mut self, code: &str) {}
-    fn eat_str(iter: &mut Chars, s: &str) -> bool {
-        true
-    }
     /*
     fn eat_unicode_escape_sequence(&mut self) -> TokenKind {
         true
@@ -100,10 +96,10 @@ impl Cursor<'_> {
     */
 
     fn eat_identifier_name(&mut self) -> TokenKind {
-        TokenKind::IdentifierName
+        TokenKind::Ident
     }
 
-    fn advance_token(&mut self) -> Token {
+    fn advance_token(&mut self) -> LexToken {
         let first_char = self.bump().unwrap();
         let token_kind: TokenKind = match first_char {
             // whitespace
@@ -122,9 +118,15 @@ impl Cursor<'_> {
             '}' => TokenKind::CloseBrace,
             '(' => TokenKind::OpenParen,
             ')' => TokenKind::CloseParen,
+            '[' => TokenKind::OpenBracket,
+            ']' => TokenKind::CloseBracket,
+            ';' => TokenKind::Semi,
+            ',' => TokenKind::Comma,
+            '?' => TokenKind::Question,
+            ':' => TokenKind::Colon,
             _ => TokenKind::Unknown,
         };
-        Token::new(token_kind, self.len_consumed())
+        LexToken::new(token_kind, self.len_consumed())
     }
 }
 
@@ -160,5 +162,16 @@ impl StringReader {
             end_src_index: src.len(),
             src: Arc::new(src),
         }
+    }
+
+    pub fn next_token(&mut self) -> LexToken {
+        let start_src_index = self.pos.0 as usize;
+        let text: &str = &self.src[start_src_index..self.end_src_index];
+
+        if text.is_empty() {
+            return LexToken::new(TokenKind::EOF, 1);
+        }
+
+        first_token(text)
     }
 }

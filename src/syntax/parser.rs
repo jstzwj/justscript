@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 
 pub struct Parser {
-    token_stream : StringReader,
+    token_stream: StringReader,
 }
 
 impl Parser {
