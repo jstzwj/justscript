@@ -16,14 +16,74 @@ pub enum TokenKind {
     Unknown,
     WhiteSpace,
     LineTerminator,
+    /// comment
     MultiLineComment,
     SingleLineComment,
-    // common token
+    /// common token
     IdentifierName,
-    Punctuator,
+    /// Punctuator
+    /// ";"
+    Semi,
+    /// ","
+    Comma,
+    /// "."
+    Dot,
+    /// "("
+    OpenParen,
+    /// ")"
+    CloseParen,
+    /// "{"
+    OpenBrace,
+    /// "}"
+    CloseBrace,
+    /// "["
+    OpenBracket,
+    /// "]"
+    CloseBracket,
+    /// "@"
+    At,
+    /// "#"
+    Pound,
+    /// "~"
+    Tilde,
+    /// "?"
+    Question,
+    /// ":"
+    Colon,
+    /// "$"
+    Dollar,
+    /// "="
+    Eq,
+    /// "!"
+    Not,
+    /// "<"
+    Lt,
+    /// ">"
+    Gt,
+    /// "-"
+    Minus,
+    /// "&"
+    And,
+    /// "|"
+    Or,
+    /// "+"
+    Plus,
+    /// "*"
+    Star,
+    /// "/"
+    Slash,
+    /// "^"
+    Caret,
+    /// "%"
+    Percent,
+    /// literal
     NumericLiteral,
     StringLiteral,
     Template,
     EOF,
 }
 
+
+pub enum PunctuatorType {
+    
+}

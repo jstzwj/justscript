@@ -1,10 +1,12 @@
 use std::str::Chars;
-
+use regex::Regex;
 
 // https://github.com/rust-lang/rust/blob/master/src/librustc_lexer/src/cursor.rs
 pub struct Cursor<'a> {
     initial_len: usize,
     chars: Chars<'a>,
+    pub re_id_start: Regex,
+    pub re_id_continue: Regex,
     #[cfg(debug_assertions)]
     prev: char,
 }
@@ -16,6 +18,8 @@ impl<'a> Cursor<'a> {
         Cursor {
             initial_len: input.len(),
             chars: input.chars(),
+            re_id_start: Regex::new(r"\p{ID_Start}").unwrap(),
+            re_id_continue: Regex::new(r"\p{ID_Continue}").unwrap(),
             #[cfg(debug_assertions)]
             prev: EOF_CHAR,
         }
