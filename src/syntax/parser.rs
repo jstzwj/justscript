@@ -45,6 +45,26 @@ impl Parser {
     }
 
     pub fn parse_statement(&mut self) -> PResult<SourceElement> {
+        if let Ok(variable_statement) = self.parse_variable_statement() {
+            Ok(SourceElement::Statement(variable_statement))
+        } else if let Ok(block_statement) = self.parse_block_statement() {
+            Ok(SourceElement::Statement(block_statement))
+        } else if let Ok(empty_statement) = self.parse_empty_statement() {
+            Ok(SourceElement::Statement(empty_statement))
+        } else {
+            Err(build_error(0, 0, "unknown error"))
+        }
+    }
+
+    pub fn parse_block_statement(&mut self) -> PResult<Statement> {
+        Err(build_error(0, 0, "unknown error"))
+    }
+
+    pub fn parse_variable_statement(&mut self) -> PResult<Statement> {
+        Err(build_error(0, 0, "unknown error"))
+    }
+
+    pub fn parse_empty_statement(&mut self) -> PResult<Statement> {
         Err(build_error(0, 0, "unknown error"))
     }
 

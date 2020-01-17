@@ -1,4 +1,5 @@
 pub enum Statement {
+    BlockStatement,
     VariableStatement(VariableDeclarationList),
     EmptyStatement,
     ExpressionStatement,

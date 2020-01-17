@@ -24,6 +24,35 @@ pub fn tokenize(mut input: &str) -> impl Iterator<Item = LexToken> + '_ {
     })
 }
 
+fn hex2int(c:&char) -> i32 {
+    match c {
+        '0' => 0,
+        '1' => 1,
+        '2' => 2,
+        '3' => 3,
+        '4' => 4,
+        '5' => 5,
+        '6' => 6,
+        '7' => 7,
+        '8' => 8,
+        '9' => 9,
+        'a'|'A' => 10,
+        'b'|'B' => 11,
+        'c'|'C' => 12,
+        'd'|'D' => 13,
+        'e'|'E' => 14,
+        'f'|'F' => 15,
+        _ => 0
+    }
+}
+
+fn is_hex_digit(c: &char) -> bool {
+    match c {
+        '0'..='9' | 'a'..='z' | 'A'..='Z' => true,
+        _ => false,
+    }
+}
+
 fn is_whitespace(c: char) -> bool {
     // WhiteSpace
     match c {
@@ -89,14 +118,83 @@ pub fn is_id_continue(c: char) -> bool {
 }
 
 impl Cursor<'_> {
-    /*
-    fn eat_unicode_escape_sequence(&mut self) -> TokenKind {
-        true
+    fn eat_hex_digit(&mut self) -> bool {
+        let c = self.first();
+        match c {
+            '0'..='9' | 'a'..='z' | 'A'..='Z' => true,
+            _ => false
+        }
     }
-    */
+    fn eat_unicode_escape_sequence(&mut self) -> bool {
+        let mut ret = true;
+        let u = self.first();
+        if u != 'u' {
+            ret = false;
+        } else {
+            if self.first() == '{' {
+                let mut num = 0x0;
+                for _i in 0..6 {
+                    let c = self.first();
+                    if is_hex_digit(&c) {
+                        break;
+                    } else {
+                        num *= 16;
+                        num += hex2int(&c);
+                    }
+                }
 
-    fn eat_identifier_name(&mut self) -> TokenKind {
+                if num > 0x10FFFF {
+                    ret = false
+                }
+
+                if self.first() != '}' {
+                    ret = false
+                }
+            } else {
+                for _i in 0..4 {
+                    let c = self.first();
+                    if !is_hex_digit(&c) {
+                        ret = false;
+                        break;
+                    }
+                }
+            }
+        }
+        ret
+    }
+
+    fn identifier_name(&mut self) -> TokenKind {
+        while !self.is_eof() {
+            let c = self.first();
+
+            match c {
+                c if is_id_continue(c) => {
+                    self.bump();
+                },
+                '$' | '\u{200C}' | '\u{200D}' => {
+                    self.bump();
+                },
+                '\\' => {},
+                _ => ()
+            };
+            
+        }
         TokenKind::Ident
+    }
+
+    /// Eats symbols while predicate returns true or until the end of file is reached.
+    /// Returns amount of eaten symbols.
+    fn eat_while<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(char) -> bool,
+    {
+        let mut eaten: usize = 0;
+        while predicate(self.first()) && !self.is_eof() {
+            eaten += 1;
+            self.bump();
+        }
+
+        eaten
     }
 
     fn advance_token(&mut self) -> LexToken {
@@ -112,7 +210,7 @@ impl Cursor<'_> {
                 _ => TokenKind::Unknown
             },
             // identifier name
-            c if is_id_start(c) => self.eat_identifier_name(),
+            c if is_id_start(c) => self.identifier_name(),
             // punctuator
             '{' => TokenKind::OpenBrace,
             '}' => TokenKind::CloseBrace,
@@ -131,7 +229,7 @@ impl Cursor<'_> {
 }
 
 
-
+#[derive(Clone)]
 pub struct StringReader {
     /// Initial position, read-only.
     start_pos: BytePos,
