@@ -6,6 +6,7 @@ use self::super::lexer::*;
 use self::super::ast::*;
 use self::super::span::*;
 use self::super::errors::PResult;
+use self::super::diagnostic::*;
 use std::sync::Arc;
 
 
@@ -21,35 +22,33 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> SourceCode{
+    pub fn parse(&mut self) -> PResult<SourceCode>{
         let mut source = SourceCode::new();
         loop {
             match self.parse_source_element() {
-                Some(value) => source.elements.push(value),
-                None => break
+                Ok(value) => source.elements.push(value),
+                Err(_) => break
             };
         }
 
-        source
+        Ok(source)
     }
 
-    pub fn parse_source_element(&mut self) -> Option<SourceElement> {
-        let ret: Option<SourceElement>;
-        if let Some(statement) = self.parse_statement() {
-            ret = Some(statement);
-        } else if let Some(function_declaration) = self.parse_function_declaration() {
-            ret = Some(function_declaration);
+    pub fn parse_source_element(&mut self) -> PResult<SourceElement> {
+        if let Ok(statement) = self.parse_statement() {
+            Ok(statement)
+        } else if let Ok(function_declaration) = self.parse_function_declaration() {
+            Ok(function_declaration)
         } else {
-            ret = None;
+            Err(build_error(0, 0, "unknown error"))
         }
-        ret
     }
 
-    pub fn parse_statement(&mut self) -> Option<SourceElement> {
-        None
+    pub fn parse_statement(&mut self) -> PResult<SourceElement> {
+        Err(build_error(0, 0, "unknown error"))
     }
 
-    pub fn parse_function_declaration(&mut self) -> Option<SourceElement> {
-        None
+    pub fn parse_function_declaration(&mut self) -> PResult<SourceElement> {
+        Err(build_error(0, 0, "unknown error"))
     }
 }
