@@ -2,12 +2,13 @@ use self::super::keyword;
 use self::super::punctuator;
 use self::super::span::Span;
 
-
+#[derive(Debug)]
 pub struct LexToken {
     pub kind: TokenKind,
     pub len: usize,
 }
 
+#[derive(Debug)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -25,6 +26,7 @@ impl Token {
     }
 }
 
+#[derive(Debug)]
 pub enum TokenKind {
     Unknown,
     WhiteSpace,
@@ -93,6 +95,12 @@ pub enum TokenKind {
     Percent,
     /// "/="
     DivEq,
+    /// "="
+    Equal,
+    /// "=="
+    Equal2,
+    /// "==="
+    Equal3,
     /// literal
     // NumericLiteral
     DecimalLiteral,

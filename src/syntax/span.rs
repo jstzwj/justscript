@@ -111,7 +111,7 @@ impl SourceFile {
     }
 }
 
-
+#[derive(Debug)]
 pub struct Span {
    begin: CharPos,
    end: CharPos

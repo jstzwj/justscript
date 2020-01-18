@@ -1,6 +1,7 @@
 use self::super::token::*;
 use self::super::span::{BytePos, CharPos, Span, SourceFile};
 use self::super::cursor::*;
+use self::super::span::Pos;
 use std::sync::Arc;
 use std::str::Chars;
 use std::error;
@@ -131,24 +132,32 @@ impl Cursor<'_> {
         if u != 'u' {
             ret = false;
         } else {
+            self.bump();
             if self.first() == '{' {
+                self.bump();
                 let mut num = 0x0;
                 for _i in 0..6 {
-                    let c = self.first();
-                    if is_hex_digit(&c) {
-                        break;
+                    if let Some(c) = self.bump() {
+                        if is_hex_digit(&c) {
+                            ret = false;
+                            break;
+                        } else {
+                            num *= 16;
+                            num += hex2int(&c);
+                        }
                     } else {
-                        num *= 16;
-                        num += hex2int(&c);
+                        ret = false;
+                        break;
                     }
                 }
 
                 if num > 0x10FFFF {
-                    ret = false
+                    ret = false;
                 }
 
                 if self.first() != '}' {
-                    ret = false
+                    ret = false;
+                    self.bump();
                 }
             } else {
                 for _i in 0..4 {
@@ -157,6 +166,7 @@ impl Cursor<'_> {
                         ret = false;
                         break;
                     }
+                    self.bump();
                 }
             }
         }
@@ -174,12 +184,37 @@ impl Cursor<'_> {
                 '$' | '\u{200C}' | '\u{200D}' => {
                     self.bump();
                 },
-                '\\' => {},
-                _ => ()
+                '\\' => {
+                    self.eat_unicode_escape_sequence();
+                },
+                _ => {
+                    break;
+                }
             };
             
         }
         TokenKind::Ident
+    }
+
+    fn single_line_comment(&mut self) -> TokenKind {
+        self.bump();
+        self.eat_while(|c| !is_lineterminator(c));
+        TokenKind::SingleLineComment
+    }
+
+    fn multi_line_comment(&mut self) -> TokenKind {
+        self.bump();
+        while let Some(c) = self.bump() {
+            match c {
+                '*' if self.first() == '/' => {
+                    self.bump();
+                    break;
+                }
+                _ => (),
+            }
+        }
+
+        TokenKind::MultiLineComment
     }
 
     /// Eats symbols while predicate returns true or until the end of file is reached.
@@ -191,7 +226,7 @@ impl Cursor<'_> {
         let mut eaten: usize = 0;
         while predicate(self.first()) && !self.is_eof() {
             eaten += 1;
-            self.bump();
+            self.bump(); 
         }
 
         eaten
@@ -205,8 +240,8 @@ impl Cursor<'_> {
             // LineTerminator
             c if is_lineterminator(c) => TokenKind::LineTerminator,
             '/' => match self.first() {
-                '/' => TokenKind::SingleLineComment,
-                '*' => TokenKind::MultiLineComment,
+                '/' => self.single_line_comment(),
+                '*' => self.multi_line_comment(),
                 _ => TokenKind::Unknown
             },
             // identifier name
@@ -222,6 +257,20 @@ impl Cursor<'_> {
             ',' => TokenKind::Comma,
             '?' => TokenKind::Question,
             ':' => TokenKind::Colon,
+            // mutil-char punctuator
+            '=' => match self.first() {
+                '=' => match self.first() {
+                    '=' => {
+                        self.bump(); self.bump();
+                        TokenKind::Equal3
+                    },
+                    _ => {
+                        self.bump();
+                        TokenKind::Equal2
+                    }
+                },
+                _ => TokenKind::Equal
+            },
             _ => TokenKind::Unknown,
         };
         LexToken::new(token_kind, self.len_consumed())
@@ -270,6 +319,8 @@ impl StringReader {
             return LexToken::new(TokenKind::EOF, 1);
         }
 
-        first_token(text)
+        let token = first_token(text);
+        self.pos = self.pos + BytePos::from_usize(token.len);
+        token
     }
 }
