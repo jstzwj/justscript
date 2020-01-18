@@ -1,5 +1,6 @@
 pub mod syntax;
 pub mod vm;
+pub mod tests;
 
 use std::fs;
 use std::path::Path;

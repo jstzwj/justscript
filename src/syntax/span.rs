@@ -125,3 +125,19 @@ impl Span {
         }
     }
 }
+
+// used for diagnostic
+#[derive(Debug)]
+pub struct Loc {
+    pub column_number: u64,
+    pub line_number: u64,
+}
+
+impl Loc {
+    pub fn new(line_number: u64, column_number: u64) -> Self {
+        Self {
+            line_number,
+            column_number,
+        }
+    }
+}

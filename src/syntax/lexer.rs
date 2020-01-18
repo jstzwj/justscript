@@ -3,9 +3,6 @@ use self::super::span::{BytePos, CharPos, Span, SourceFile};
 use self::super::cursor::*;
 use self::super::span::Pos;
 use std::sync::Arc;
-use std::str::Chars;
-use std::error;
-use std::fmt;
 
 /// Parses the first token from the provided input string.
 pub fn first_token(input: &str) -> LexToken {
