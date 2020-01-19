@@ -29,13 +29,12 @@ pub enum ValueData {
     String(String),
     Number(f64),
     Integer(i32),
+    Object(Weak<Object>),
 }
-
-const PROPERTY_CACHE_NUM: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct Object {
     shape: Weak<Shape>,
-    fast_properties: Vec<Value>,
+    fast_properties: [Value; 8],
     properties: HashMap<String, Value>,
 }
