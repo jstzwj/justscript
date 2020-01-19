@@ -1,7 +1,6 @@
 use std::boxed;
 use std::option;
 
-use self::super::cursor::Cursor;
 use self::super::lexer::*;
 use self::super::ast::*;
 use self::super::span::*;

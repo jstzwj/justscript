@@ -2,22 +2,12 @@ use self::super::keyword;
 use self::super::punctuator;
 use self::super::span::Span;
 
-#[derive(Debug)]
-pub struct LexToken {
-    pub kind: TokenKind,
-    pub len: usize,
-}
+
 
 #[derive(Debug)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
-}
-
-impl LexToken {
-    pub fn new(kind: TokenKind, len: usize) -> LexToken {
-        LexToken { kind, len }
-    }
 }
 
 impl Token {

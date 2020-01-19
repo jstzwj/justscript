@@ -1,4 +1,4 @@
-use self::super::span::{Span, CharPos};
+use self::super::span::{Span, BytePos};
 
 pub enum DiagnosticMessage {
     Info(Span, String),
@@ -8,15 +8,15 @@ pub enum DiagnosticMessage {
 }
 
 pub fn build_info(start:usize, end:usize, msg:&str) -> DiagnosticMessage {
-    DiagnosticMessage::Info(Span::new(CharPos(start), CharPos(end)), String::from(msg))
+    DiagnosticMessage::Info(Span::make_span(start, end), String::from(msg))
 }
 
 pub fn build_debug(start:usize, end:usize, msg:&str) -> DiagnosticMessage {
-    DiagnosticMessage::Debug(Span::new(CharPos(start), CharPos(end)), String::from(msg))
+    DiagnosticMessage::Debug(Span::make_span(start, end), String::from(msg))
 }
 
 pub fn build_error(start:usize, end:usize, msg:&str) -> DiagnosticMessage {
-    DiagnosticMessage::Error(Span::new(CharPos(start), CharPos(end)), String::from(msg))
+    DiagnosticMessage::Error(Span::make_span(start, end), String::from(msg))
 }
 
 pub struct Diagnostic {

@@ -1,6 +1,6 @@
 
 use justscript::syntax::token::*;
-use justscript::syntax::cursor::*;
+use justscript::lexer::*;
 use justscript::syntax::lexer::*;
 use justscript::syntax::span::*;
 use std::sync::Arc;

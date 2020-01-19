@@ -113,15 +113,22 @@ impl SourceFile {
 
 #[derive(Debug)]
 pub struct Span {
-   begin: CharPos,
-   end: CharPos
+   begin: BytePos,
+   end: BytePos
 }
 
 impl Span {
-    pub fn new(b:CharPos, e:CharPos) -> Span{
+    pub fn new(b:BytePos, e:BytePos) -> Span{
         Span {
             begin: b,
             end: e,
+        }
+    }
+
+    pub fn make_span(b:usize, e:usize) -> Span {
+        Span {
+            begin: BytePos::from_usize(b),
+            end: BytePos::from_usize(e),
         }
     }
 }
