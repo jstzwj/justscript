@@ -19,13 +19,13 @@ fn main() {
     /* 这是一个函数abc */
     function abc() {
         test = 1;
-        return 1
+        return 1.0
     }
     ";
     let source_file = SourceFile::new(code);
     let mut reader = StringReader::new(Arc::new(source_file));
 
-    for _i in 0..60 {
+    for _i in 0..80 {
         println!("{:?}", reader.next_token());
     }
     

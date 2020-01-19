@@ -180,6 +180,25 @@ impl Cursor<'_> {
         true
     }
 
+    fn eat_octal_digits(&mut self) -> bool {
+        self.eat_while(|c| ('0'..='7').contains(&c));
+        true
+    }
+
+    fn eat_binary_digits(&mut self) -> bool {
+        self.eat_while(|c| ('0'..='1').contains(&c));
+        true
+    }
+
+    fn eat_hex_digits(&mut self) -> bool {
+        self.eat_while(|c| match c{
+            '0'..='9' | 'a'..='z' | 'A'..='Z' => true,
+            _ => false
+            }
+        );
+        true
+    }
+
     fn eat_exponent_part(&mut self) -> bool {
         match self.first() {
             '0'..='9' => {
@@ -244,15 +263,29 @@ impl Cursor<'_> {
     }
 
     fn binary_integer_literal(&mut self) -> TokenKind {
-        TokenKind::BinaryIntegerLiteral
+        if self.eat_binary_digits() {
+            TokenKind::BinaryIntegerLiteral
+        }
+        else {
+            TokenKind::Unknown
+        }
     }
 
     fn octal_integer_literal(&mut self) -> TokenKind {
-        TokenKind::OctalIntegerLiteral
+        if self.eat_octal_digits() {
+            TokenKind::OctalIntegerLiteral
+        }
+        else {
+            TokenKind::Unknown
+        }
     }
 
     fn hex_integer_literal(&mut self) -> TokenKind {
-        TokenKind::HexIntegerLiteral
+        if self.eat_hex_digits() {
+            TokenKind::HexIntegerLiteral
+        } else {
+            TokenKind::Unknown
+        }
     }
 
     fn decimal_literal(&mut self) -> TokenKind {
@@ -265,6 +298,7 @@ impl Cursor<'_> {
 
         match self.first() {
             '.' => {
+                self.bump();
                 self.eat_decimal_digits();
             }
             _ => ()
@@ -335,13 +369,15 @@ impl Cursor<'_> {
                 _ => TokenKind::Equal
             },
             '0' => match self.first() {
-                'b'|'B' => TokenKind::BinaryIntegerLiteral,
-                'o'|'O' => TokenKind::OctalIntegerLiteral,
-                'x'|'X' => TokenKind::HexIntegerLiteral,
-                '.' | '0'..='9' | 'e' | 'E' => TokenKind::DecimalLiteral,
+                'b'|'B' => self.binary_integer_literal(),
+                'o'|'O' => self.octal_integer_literal(),
+                'x'|'X' => self.hex_integer_literal(),
+                '.' | '0'..='9' | 'e' | 'E' => self.decimal_literal(),
                 _ => TokenKind::Unknown,
             },
             '.' | '1'..='9' => self.decimal_literal(),
+            '"' => TokenKind::Unknown,
+            '\'' => TokenKind::Unknown,
             _ => TokenKind::Unknown,
         };
         LexToken::new(token_kind, self.len_consumed())
