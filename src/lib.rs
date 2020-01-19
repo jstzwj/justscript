@@ -1,4 +1,5 @@
 pub mod lexer;
+pub mod runtime;
 pub mod syntax;
 pub mod vm;
 pub mod tests;
