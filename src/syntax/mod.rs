@@ -8,6 +8,6 @@ pub mod span;
 pub mod diagnostic;
 pub mod errors;
 
-pub fn parse(code:&str) -> ast::SourceElement {
-    ast::SourceElement::FunctionDeclaration()
+pub fn parse(code:&str) -> ast::StatementListItem {
+    ast::StatementListItem::FunctionDeclaration()
 }

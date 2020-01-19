@@ -31,18 +31,18 @@ pub struct Expression {
 
 }
 
-pub enum SourceElement {
+pub enum StatementListItem {
     Statement(Statement),
     FunctionDeclaration(),
 }
 
-pub struct SourceCode {
-    pub elements: Vec<SourceElement>
+pub struct StatementList {
+    pub elements: Vec<StatementListItem>
 }
 
-impl SourceCode {
-    pub fn new() -> SourceCode {
-        SourceCode {
+impl StatementList {
+    pub fn new() -> StatementList {
+        StatementList {
             elements: Vec::new()
         }
     }

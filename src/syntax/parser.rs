@@ -21,8 +21,8 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> PResult<SourceCode>{
-        let mut source = SourceCode::new();
+    pub fn parse(&mut self) -> PResult<StatementList>{
+        let mut source = StatementList::new();
         loop {
             match self.parse_source_element() {
                 Ok(value) => source.elements.push(value),
@@ -33,7 +33,7 @@ impl Parser {
         Ok(source)
     }
 
-    pub fn parse_source_element(&mut self) -> PResult<SourceElement> {
+    pub fn parse_source_element(&mut self) -> PResult<StatementListItem> {
         if let Ok(statement) = self.parse_statement() {
             Ok(statement)
         } else if let Ok(function_declaration) = self.parse_function_declaration() {
@@ -43,13 +43,13 @@ impl Parser {
         }
     }
 
-    pub fn parse_statement(&mut self) -> PResult<SourceElement> {
+    pub fn parse_statement(&mut self) -> PResult<StatementListItem> {
         if let Ok(variable_statement) = self.parse_variable_statement() {
-            Ok(SourceElement::Statement(variable_statement))
+            Ok(StatementListItem::Statement(variable_statement))
         } else if let Ok(block_statement) = self.parse_block_statement() {
-            Ok(SourceElement::Statement(block_statement))
+            Ok(StatementListItem::Statement(block_statement))
         } else if let Ok(empty_statement) = self.parse_empty_statement() {
-            Ok(SourceElement::Statement(empty_statement))
+            Ok(StatementListItem::Statement(empty_statement))
         } else {
             Err(build_error(0, 0, "unknown error"))
         }
@@ -67,7 +67,7 @@ impl Parser {
         Err(build_error(0, 0, "unknown error"))
     }
 
-    pub fn parse_function_declaration(&mut self) -> PResult<SourceElement> {
+    pub fn parse_function_declaration(&mut self) -> PResult<StatementListItem> {
         Err(build_error(0, 0, "unknown error"))
     }
 }
