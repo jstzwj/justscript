@@ -170,6 +170,35 @@ impl Cursor<'_> {
         ret
     }
 
+    fn eat_decimal_integer_literal(&mut self) -> bool {
+        self.eat_while(|c| ('0'..='9').contains(&c));
+        true
+    }
+
+    fn eat_decimal_digits(&mut self) -> bool {
+        self.eat_while(|c| ('0'..='9').contains(&c));
+        true
+    }
+
+    fn eat_exponent_part(&mut self) -> bool {
+        match self.first() {
+            '0'..='9' => {
+                self.eat_decimal_digits()
+            },
+            '+' => {
+                self.bump();
+                self.eat_decimal_digits()
+            },
+            '-' => {
+                self.bump();
+                self.eat_decimal_digits()
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
     fn identifier_name(&mut self) -> TokenKind {
         while !self.is_eof() {
             let c = self.first();
@@ -212,6 +241,43 @@ impl Cursor<'_> {
         }
 
         TokenKind::MultiLineComment
+    }
+
+    fn binary_integer_literal(&mut self) -> TokenKind {
+        TokenKind::BinaryIntegerLiteral
+    }
+
+    fn octal_integer_literal(&mut self) -> TokenKind {
+        TokenKind::OctalIntegerLiteral
+    }
+
+    fn hex_integer_literal(&mut self) -> TokenKind {
+        TokenKind::HexIntegerLiteral
+    }
+
+    fn decimal_literal(&mut self) -> TokenKind {
+        match self.first() {
+            '0'..='9' => {
+                self.eat_decimal_integer_literal();
+            },
+            _ => ()
+        };
+
+        match self.first() {
+            '.' => {
+                self.eat_decimal_digits();
+            }
+            _ => ()
+        };
+
+        match self.first() {
+            'e' | 'E' => {
+                self.eat_exponent_part();
+            }
+            _ => ()
+        };
+
+        TokenKind::DecimalLiteral
     }
 
     /// Eats symbols while predicate returns true or until the end of file is reached.
@@ -268,6 +334,14 @@ impl Cursor<'_> {
                 },
                 _ => TokenKind::Equal
             },
+            '0' => match self.first() {
+                'b'|'B' => TokenKind::BinaryIntegerLiteral,
+                'o'|'O' => TokenKind::OctalIntegerLiteral,
+                'x'|'X' => TokenKind::HexIntegerLiteral,
+                '.' | '0'..='9' | 'e' | 'E' => TokenKind::DecimalLiteral,
+                _ => TokenKind::Unknown,
+            },
+            '.' | '1'..='9' => self.decimal_literal(),
             _ => TokenKind::Unknown,
         };
         LexToken::new(token_kind, self.len_consumed())

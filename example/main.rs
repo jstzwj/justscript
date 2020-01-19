@@ -25,7 +25,7 @@ fn main() {
     let source_file = SourceFile::new(code);
     let mut reader = StringReader::new(Arc::new(source_file));
 
-    for _i in 0..20 {
+    for _i in 0..60 {
         println!("{:?}", reader.next_token());
     }
     

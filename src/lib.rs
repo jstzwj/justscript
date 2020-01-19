@@ -33,6 +33,12 @@ impl State {
     }
 }
 
+pub trait Data {
+    fn is_undefined() -> bool;
+    fn is_null() -> bool;
+}
+
+
 #[derive(PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SymbolType {
 
