@@ -371,7 +371,7 @@ impl Cursor<'_> {
             if self.is_eof() {
                 break;
             }
-            let c = self.first();
+            
             match self.first() {
                 '\u{2028}' | '\u{2029}' => {
                     self.bump();
@@ -401,7 +401,7 @@ impl Cursor<'_> {
             if self.is_eof() {
                 break;
             }
-            let c = self.first();
+
             match self.first() {
                 '\u{2028}' | '\u{2029}' => {
                     self.bump();

@@ -4,7 +4,6 @@ pub mod runtime;
 pub mod syntax;
 pub mod interpreter;
 
-use std::fs;
 use std::path::Path;
 use crate::parse::parser::Parser;
 use std::collections::HashMap;
