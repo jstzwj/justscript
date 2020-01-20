@@ -7,9 +7,9 @@ use std::sync::Arc;
 fn main() {
     println!("justscript starting...");
     /*
+    let script = "var a = 'hello world!'";
     let mut state = justscript::State::new();
-    let hello_script = justscript::compile("var a = 1;");
-    let result = state.run(&hello_script);
+    let result = state.run(&script);
     */
     // run lexer
     let code = "

@@ -1,14 +1,4 @@
-pub enum Statement {
-    BlockStatement,
-    VariableStatement(VariableDeclarationList),
-    EmptyStatement,
-    ExpressionStatement,
-    ContinueStatement,
-    BreakStatement,
-    ReturnStatement,
-    ThrowStatement,
-    DebuggerStatement,
-}
+use std::boxed::Box;
 
 pub struct variableDeclaration {
     pub identifier: String,
@@ -31,9 +21,25 @@ pub struct Expression {
 
 }
 
+pub enum Statement {
+    BlockStatement,
+    VariableStatement(VariableDeclarationList),
+    EmptyStatement,
+    ExpressionStatement,
+    ContinueStatement,
+    BreakStatement,
+    ReturnStatement,
+    ThrowStatement,
+    DebuggerStatement,
+}
+
+pub struct Declaration {
+
+}
+
 pub enum StatementListItem {
     Statement(Statement),
-    FunctionDeclaration(),
+    Declaration(Declaration),
 }
 
 pub struct StatementList {
