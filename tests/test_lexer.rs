@@ -1,6 +1,6 @@
 #[cfg(test)]
 
-use self::super::*;
+use justscript;
 use std::sync::Arc;
 
 #[test]
@@ -14,8 +14,8 @@ fn test_lexer() {
         return 1
     }
     ";
-    let source_file = syntax::span::SourceFile::new(code);
-    let mut reader = syntax::lexer::StringReader::new(Arc::new(source_file));
+    let source_file = justscript::syntax::span::SourceFile::new(code);
+    let mut reader = justscript::parse::lexer::StringReader::new(Arc::new(source_file));
 
     for _i in 0..10 {
         println!("{:?}", reader.next_token());

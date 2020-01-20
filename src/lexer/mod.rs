@@ -201,6 +201,35 @@ impl Cursor<'_> {
         true
     }
 
+    fn eat_escape_sequence(&mut self) -> bool {
+        match self.first() {
+            // CharacterEscapeSequence
+            '\''| '"' | '\\' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' => {
+                self.bump();
+            },
+            // 0
+            '0' => {
+                self.bump();
+                match self.first() {
+                    '0' ..= '9' => { self.eat_decimal_integer_literal(); },
+                    _ => ()
+                };
+            },
+            // HexEscapeSequence
+            'x' => {
+                self.bump();
+                self.eat_hex_digits();
+            },
+            // UnicodeEscapeSequence
+            'u' => {
+                self.eat_unicode_escape_sequence();
+            },
+            // CharacterEscapeSequence - NonEscapeCharacter
+            _ => (),
+        };
+        true
+    }
+
     fn eat_exponent_part(&mut self) -> bool {
         match self.first() {
             '0'..='9' => {
@@ -217,6 +246,27 @@ impl Cursor<'_> {
             _ => {
                 false
             }
+        }
+    }
+
+    fn eat_line_terminator_sequence(&mut self) -> bool {
+        match self.bump() {
+            Some(c) => match c{
+                // <LF> <LS> <PS>
+                '\u{000a}' | '\u{2028}' | '\u{2029}' => true,
+                // <CR>
+                '\u{000d}' => match self.first() {
+                    // <LF>
+                    '\u{000a}' => {
+                        self.bump();
+                        true
+                    },
+                    _ => true,
+                },
+                // other
+                _ => false
+            },
+            None => false
         }
     }
 
@@ -316,6 +366,66 @@ impl Cursor<'_> {
         TokenKind::DecimalLiteral
     }
 
+    fn double_string_literal(&mut self) -> TokenKind {
+        loop {
+            if self.is_eof() {
+                break;
+            }
+            let c = self.first();
+            match self.first() {
+                '\u{2028}' | '\u{2029}' => {
+                    self.bump();
+                },
+                '\\' => {
+                    self.bump();
+                    if is_lineterminator(self.first()) {
+                        self.eat_line_terminator_sequence();
+                    } else {
+                        self.eat_escape_sequence();
+                    }
+                },
+                '"' => {
+                    self.bump();
+                    break;
+                },
+                _ => {
+                    self.bump();
+                },
+            };
+        }
+        TokenKind::StringLiteral
+    }
+
+    fn single_string_literal(&mut self) -> TokenKind {
+        loop {
+            if self.is_eof() {
+                break;
+            }
+            let c = self.first();
+            match self.first() {
+                '\u{2028}' | '\u{2029}' => {
+                    self.bump();
+                },
+                '\\' => {
+                    self.bump();
+                    if is_lineterminator(self.first()) {
+                        self.eat_line_terminator_sequence();
+                    } else {
+                        self.eat_escape_sequence();
+                    }
+                },
+                '\'' => {
+                    self.bump();
+                    break;
+                },
+                _ => {
+                    self.bump();
+                },
+            };
+        }
+        TokenKind::StringLiteral
+    }
+
     /// Eats symbols while predicate returns true or until the end of file is reached.
     /// Returns amount of eaten symbols.
     fn eat_while<F>(&mut self, mut predicate: F) -> usize
@@ -378,8 +488,8 @@ impl Cursor<'_> {
                 _ => TokenKind::Unknown,
             },
             '.' | '1'..='9' => self.decimal_literal(),
-            '"' => TokenKind::Unknown,
-            '\'' => TokenKind::Unknown,
+            '"' => self.double_string_literal(),
+            '\'' => self.single_string_literal(),
             _ => TokenKind::Unknown,
         };
         LexToken::new(token_kind, self.len_consumed())

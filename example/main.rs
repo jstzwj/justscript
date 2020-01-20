@@ -1,7 +1,6 @@
 
 use justscript::syntax::token::*;
-use justscript::lexer::*;
-use justscript::syntax::lexer::*;
+use justscript::parse::lexer::*;
 use justscript::syntax::span::*;
 use std::sync::Arc;
 
@@ -16,6 +15,7 @@ fn main() {
     let code = "
     // 这是一个变量
     var i = 10;
+    j = '1234, hello world! \n'
     /* 这是一个函数abc */
     function abc() {
         test = 1;

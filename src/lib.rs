@@ -1,12 +1,12 @@
 pub mod lexer;
+pub mod parse;
 pub mod runtime;
 pub mod syntax;
 pub mod vm;
-pub mod tests;
 
 use std::fs;
 use std::path::Path;
-use crate::syntax::parser::Parser;
+use crate::parse::parser::Parser;
 use std::collections::HashMap;
 
 use byteorder::{NativeEndian, WriteBytesExt};

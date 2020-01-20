@@ -1,11 +1,11 @@
 use std::boxed;
 use std::option;
 
-use self::super::lexer::*;
-use self::super::ast::*;
-use self::super::span::*;
-use self::super::errors::PResult;
-use self::super::diagnostic::*;
+use crate::parse::lexer::*;
+use crate::syntax::ast::*;
+use crate::syntax::span::*;
+use crate::syntax::errors::PResult;
+use crate::syntax::diagnostic::*;
 use std::sync::Arc;
 
 

@@ -1,6 +1,6 @@
-use self::super::token::*;
-use self::super::span::{BytePos, CharPos, Span, SourceFile};
-use self::super::span::Pos;
+use crate::syntax::token::*;
+use crate::syntax::span::{BytePos, Span, SourceFile};
+use crate::syntax::span::Pos;
 use crate::lexer::first_token;
 use std::sync::Arc;
 
