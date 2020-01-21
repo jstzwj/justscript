@@ -55,22 +55,37 @@ impl StringReader {
 
     pub fn first(&mut self) -> Token {
         let origin_pos = self.pos;
+
         let token = self.next_token();
+
+        self.pos = origin_pos;
         token
     }
 
     pub fn second(&mut self) -> Token {
         let origin_pos = self.pos;
+
         self.next_token();
         let token = self.next_token();
+
+        self.pos = origin_pos;
         token
     }
 
     pub fn third(&mut self) -> Token {
         let origin_pos = self.pos;
+
         self.next_token();
         self.next_token();
         let token = self.next_token();
+
+        self.pos = origin_pos;
         token
+    }
+
+    pub fn get_str(&self, span: &Span) -> &str{
+        let begin = span.begin.0 as usize;
+        let end = span.end.0 as usize;
+        &self.src[begin..end]
     }
 }

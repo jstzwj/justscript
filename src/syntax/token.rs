@@ -16,7 +16,7 @@ impl Token {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum TokenKind {
     Unknown,
     WhiteSpace,

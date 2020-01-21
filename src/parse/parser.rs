@@ -4,7 +4,7 @@ use std::option;
 use crate::parse::lexer::*;
 use crate::syntax::ast::*;
 use crate::syntax::span::*;
-use crate::syntax::token::TokenKind;
+use crate::syntax::token::{TokenKind, Token};
 use crate::syntax::errors::PResult;
 use crate::syntax::diagnostic::*;
 use std::sync::Arc;
@@ -48,33 +48,111 @@ impl Parser {
     }
 
     pub fn parse_statement(&mut self) -> PResult<StatementListItem> {
-        if let Ok(variable_statement) = self.parse_variable_statement() {
-            Ok(StatementListItem::Statement(variable_statement))
-        } else if let Ok(block_statement) = self.parse_block_statement() {
-            Ok(StatementListItem::Statement(block_statement))
-        } else if let Ok(empty_statement) = self.parse_empty_statement() {
-            Ok(StatementListItem::Statement(empty_statement))
-        } else {
-            Err(())
+        self.eat_whitespace();
+        let first_token = self.token_stream.first();
+
+        match first_token.kind {
+            TokenKind::Ident => {
+                let ident_name = self.token_stream.get_str(&first_token.span);
+                match ident_name {
+                    "var" => {
+                        if let Ok(variable_statement) = self.parse_variable_statement() {
+                            Ok(StatementListItem::Statement(variable_statement))
+                        } else {
+                            Err(())
+                        }
+                    },
+                    _ => {
+                        Err(())
+                    }
+                }
+            },
+            TokenKind::OpenBrace => {
+                if let Ok(block_statement) = self.parse_block_statement() {
+                    Ok(StatementListItem::Statement(block_statement))
+                } else {
+                    Err(())
+                }
+            },
+            TokenKind::Semi => {
+                if let Ok(empty_statement) = self.parse_empty_statement() {
+                    Ok(StatementListItem::Statement(empty_statement))
+                } else {
+                    Err(())
+                }
+            },
+            _ => {
+                Err(())
+            }
         }
     }
 
     pub fn parse_block_statement(&mut self) -> PResult<Statement> {
-        Err(())
+        let scope_stream = self.token_stream.clone();
+
+        match self.token_stream.next_token().kind {
+            TokenKind::OpenBrace => {
+                self.eat_whitespace();
+                Ok(Statement::BlockStatement)
+            },
+            _ => Err(())
+        }
     }
 
     pub fn parse_variable_statement(&mut self) -> PResult<Statement> {
         let scope_stream = self.token_stream.clone();
 
-        Err(())
+        let mut variable_statement = VariableStatement::new();
+
+        let var_token = self.token_stream.next_token();
+        match var_token.kind {
+            TokenKind::Ident => {
+                if self.token_stream.get_str(&var_token.span) == "var" {
+                    loop {
+                        match self.parse_variable_declaration() {
+                            Ok(value) => variable_statement.variableDeclarationList.push(value),
+                            Err(_) => break
+                        };
+                    }
+                    return Err(());
+                } else {
+                    return Err(());
+                }
+            },
+            _ => {
+                return Err(());
+            }
+        };
     }
 
     pub fn parse_empty_statement(&mut self) -> PResult<Statement> {
+        let semi_token = self.token_stream.first();
+        match semi_token.kind {
+            TokenKind::Semi => {
+                self.token_stream.next_token();
+                Ok(Statement::EmptyStatement)
+            },
+            _ => Err(())
+        }
+    }
+
+    pub fn parse_variable_declaration(&mut self) -> PResult<VariableDeclaration> {
         Err(())
     }
 
     pub fn parse_function_declaration(&mut self) -> PResult<StatementListItem> {
         Err(())
+    }
+
+    pub fn is_ident(&mut self, token: &Token, ident_name: &str) -> bool {
+        match token.kind {
+            TokenKind::Ident => {
+                self.token_stream.get_str(&token.span) == ident_name
+            },
+            _ => {
+                false
+            }
+        }
     }
 
     pub fn eat_whitespace(&mut self) -> bool {

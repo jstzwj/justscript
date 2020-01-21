@@ -1,14 +1,22 @@
 use std::boxed::Box;
 
 #[derive(Debug)]
-pub struct variableDeclaration {
+pub struct VariableDeclaration {
     pub identifier: String,
     // pub initialiser: AssignmentExpression,
 }
 
 #[derive(Debug)]
-pub struct VariableDeclarationList {
-    list: Vec<variableDeclaration>
+pub struct VariableStatement {
+    pub variableDeclarationList: Vec<VariableDeclaration>
+}
+
+impl VariableStatement {
+    pub fn new() -> VariableStatement {
+        VariableStatement {
+            variableDeclarationList: Vec::new()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -29,7 +37,7 @@ pub struct Expression {
 #[derive(Debug)]
 pub enum Statement {
     BlockStatement,
-    VariableStatement(VariableDeclarationList),
+    VariableStatement(VariableStatement),
     EmptyStatement,
     ExpressionStatement,
     ContinueStatement,

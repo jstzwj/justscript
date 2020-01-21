@@ -113,8 +113,8 @@ impl SourceFile {
 
 #[derive(Debug)]
 pub struct Span {
-   begin: BytePos,
-   end: BytePos
+   pub begin: BytePos,
+   pub end: BytePos
 }
 
 impl Span {
