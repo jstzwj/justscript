@@ -52,4 +52,25 @@ impl StringReader {
         self.pos = self.pos + BytePos::from_usize(lex_token.len);
         token
     }
+
+    pub fn first(&mut self) -> Token {
+        let origin_pos = self.pos;
+        let token = self.next_token();
+        token
+    }
+
+    pub fn second(&mut self) -> Token {
+        let origin_pos = self.pos;
+        self.next_token();
+        let token = self.next_token();
+        token
+    }
+
+    pub fn third(&mut self) -> Token {
+        let origin_pos = self.pos;
+        self.next_token();
+        self.next_token();
+        let token = self.next_token();
+        token
+    }
 }

@@ -22,5 +22,12 @@ impl State {
     }
 
     pub fn run(&self, script:&str) {
+        let mut parser = Parser::new(script);
+        match parser.parse() {
+            Ok(ast) => {
+                println!("{:?}", ast);
+            },
+            Err(_) => ()
+        };
     }
 }

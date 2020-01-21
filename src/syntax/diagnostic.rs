@@ -22,3 +22,11 @@ pub fn build_error(start:usize, end:usize, msg:&str) -> DiagnosticMessage {
 pub struct Diagnostic {
     messages: Vec<DiagnosticMessage>
 }
+
+impl Diagnostic {
+    pub fn new() -> Diagnostic {
+        Diagnostic {
+            messages: Vec::new(),
+        }
+    }
+}
