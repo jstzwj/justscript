@@ -3,7 +3,16 @@ use std::boxed::Box;
 #[derive(Debug)]
 pub struct VariableDeclaration {
     pub identifier: String,
-    // pub initialiser: AssignmentExpression,
+    pub initializer: AssignmentExpression,
+}
+
+impl VariableDeclaration {
+    pub fn new() -> VariableDeclaration {
+        VariableDeclaration {
+            identifier: String::new(),
+            initializer: AssignmentExpression::new()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -20,9 +29,22 @@ impl VariableStatement {
 }
 
 #[derive(Debug)]
-pub struct AssignmentExpression {
-
+pub enum AssignmentExpression {
+    ConditionalExpression,
+    YieldExpression,
+    ArrowFunction,
+    AsyncArrowFunction,
+    LeftHandSideAssignmentExpression,
+    LeftHandSideAssignmentOperator,
 }
+/*
+impl AssignmentExpression {
+    pub fn new() -> AssignmentExpression {
+        AssignmentExpression {
+        }
+    }
+}
+*/
 
 #[derive(Debug)]
 pub struct ConditionalExpression {

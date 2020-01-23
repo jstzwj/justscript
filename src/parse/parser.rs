@@ -137,11 +137,33 @@ impl Parser {
     }
 
     pub fn parse_variable_declaration(&mut self) -> PResult<VariableDeclaration> {
-        Err(())
+        let scope_stream = self.token_stream.clone();
+        let mut variable_declaration = VariableDeclaration::new();
+
+        match self.parse_binding_identifier() {
+            Ok(value) => {
+                variable_declaration.identifier = value;
+            },
+            Err(_) => {
+                return Err(());
+            }
+        };
+
+        Ok(variable_declaration)
     }
 
     pub fn parse_function_declaration(&mut self) -> PResult<StatementListItem> {
         Err(())
+    }
+
+    pub fn parse_binding_identifier(&mut self) -> PResult<String> {
+        let token = self.token_stream.first();
+        if token.kind == TokenKind::Semi {
+            self.token_stream.next_token();
+            Ok(self.token_stream.get_str(&token.span).to_string())
+        } else {
+            Err(())
+        }
     }
 
     pub fn is_ident(&mut self, token: &Token, ident_name: &str) -> bool {
