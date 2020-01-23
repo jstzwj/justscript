@@ -155,6 +155,96 @@ impl Parser {
         }
     }
 
+    fn is_keyword(&mut self) -> bool {
+        let token = self.token_stream.first();
+        match token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&token.span) {
+                    "await" | "break" | "case" | "catch" | "class"
+                    | "const" | "continue" | "debugger" | "default"
+                    | "delete" | "do" | "else" | "export" | "extends"
+                    | "finally" | "for" | "function" | "if" | "import"
+                    | "in" | "instanceof" | "new" | "return" | "super"
+                    | "switch" | "this" | "throw" | "try" | "typeof"
+                    | "var" | "void" | "while" | "with" | "yield" => true,
+                    _ => false
+                }
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
+    fn is_future_reserved_word(&mut self) -> bool {
+        let token = self.token_stream.first();
+        match token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&token.span) {
+                    "enum" => true,
+                    _ => false
+                }
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
+    fn is_null_literal(&mut self) -> bool {
+        let token = self.token_stream.first();
+        match token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&token.span) {
+                    "null" => true,
+                    _ => false
+                }
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
+    fn is_boolean_literal(&mut self) -> bool {
+        let token = self.token_stream.first();
+        match token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&token.span) {
+                    "true" | "false"=> true,
+                    _ => false
+                }
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
+    fn is_reserved_word(&mut self) -> bool {
+        let token = self.token_stream.first();
+        match token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&token.span) {
+                    "await" | "break" | "case" | "catch" | "class"
+                    | "const" | "continue" | "debugger" | "default"
+                    | "delete" | "do" | "else" | "export" | "extends"
+                    | "finally" | "for" | "function" | "if" | "import"
+                    | "in" | "instanceof" | "new" | "return" | "super"
+                    | "switch" | "this" | "throw" | "try" | "typeof"
+                    | "var" | "void" | "while" | "with" | "yield" 
+                    | "enum"
+                    | "null"
+                    | "true" | "false" => true,
+                    _ => false
+                }
+            },
+            _ => {
+                false
+            }
+        }
+    }
+
     pub fn eat_whitespace(&mut self) -> bool {
         match self.token_stream.first().kind {
             TokenKind::WhiteSpace => {
