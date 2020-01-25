@@ -53,33 +53,24 @@ impl StringReader {
         token
     }
 
-    pub fn first(&mut self) -> Token {
-        let origin_pos = self.pos;
-
-        let token = self.next_token();
-
-        self.pos = origin_pos;
+    pub fn first(&self) -> Token {
+        let mut token_stream = self.clone();
+        let token = token_stream.next_token();
         token
     }
 
-    pub fn second(&mut self) -> Token {
-        let origin_pos = self.pos;
-
-        self.next_token();
-        let token = self.next_token();
-
-        self.pos = origin_pos;
+    pub fn second(&self) -> Token {
+        let mut token_stream = self.clone();
+        token_stream.next_token();
+        let token = token_stream.next_token();
         token
     }
 
-    pub fn third(&mut self) -> Token {
-        let origin_pos = self.pos;
-
-        self.next_token();
-        self.next_token();
-        let token = self.next_token();
-
-        self.pos = origin_pos;
+    pub fn third(&self) -> Token {
+        let mut token_stream = self.clone();
+        token_stream.next_token();
+        token_stream.next_token();
+        let token = token_stream.next_token();
         token
     }
 

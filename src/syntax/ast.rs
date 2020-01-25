@@ -35,41 +35,41 @@ pub enum AssignmentExpression {
     ArrowFunction,
     AsyncArrowFunction,
     LeftHandSideAssignmentExpression(LeftHandSideAssignmentExpression),
-    LeftHandSideAssignmentOperator(LeftHandSideAssignmentOperator),
 }
 
 #[derive(Debug)]
 pub struct LeftHandSideAssignmentExpression {
-
-}
-
-#[derive(Debug)]
-pub struct LeftHandSideAssignmentOperator {
-    
+    pub left_hand_side: Box<LeftHandSideExpression>,
+    pub assignment_op: AssignmentOperator,
+    pub right_hand_side: Box<AssignmentExpression>,
 }
 
 #[derive(Debug)]
 pub enum LeftHandSideExpression {
-
+    NewExpression(NewExpression),
+    CallExpression(CallExpression),
 }
 
 #[derive(Debug)]
 pub enum NewExpression {
-
+    MemberExpression(Box<MemberExpression>),
+    NewExpression(Box<NewExpression>),
 }
 
 #[derive(Debug)]
 pub enum CallExpression {
-
+    
 }
 
 #[derive(Debug)]
 pub enum MemberExpression {
-
+    PrimaryExpression(Box<PrimaryExpression>),
 }
 
 #[derive(Debug)]
 pub enum AssignmentOperator {
+    /// =
+    Equal,
     /// *=
     TimesEq,
     /// /=

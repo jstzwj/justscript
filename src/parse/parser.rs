@@ -145,11 +145,106 @@ impl Parser {
                 variable_declaration.identifier = value;
             },
             Err(_) => {
+                self.token_stream = scope_stream;
+                return Err(());
+            }
+        };
+
+        match self.token_stream.next_token().kind {
+            TokenKind::Equal => (),
+            _ => {
+                self.token_stream = scope_stream;
+                return Err(());
+            }
+        };
+
+        match self.parse_assignment_expression() {
+            Ok(value) => {
+                variable_declaration.initializer = value;
+            },
+            Err(_) => {
+                self.token_stream = scope_stream;
                 return Err(());
             }
         };
 
         Ok(variable_declaration)
+    }
+
+    pub fn parse_assignment_expression(&mut self) -> PResult<AssignmentExpression> {
+        Err(())
+    }
+
+    pub fn parse_left_hand_side_assignment_expression(&mut self) -> PResult<AssignmentExpression> {
+        let scope_stream = self.token_stream.clone();
+        let left_hand_side;
+        let assignment_operator;
+        let right_hand_side;
+
+        match self.parse_left_hand_side_expression() {
+            Ok(value) => {
+                left_hand_side = value;
+            },
+            Err(_) => {
+                self.token_stream = scope_stream;
+                return Err(());
+            }
+        };
+
+        match self.token_stream.next_token().kind {
+            TokenKind::Equal => {
+                assignment_operator = AssignmentOperator::Equal;
+            },
+            TokenKind::DivEq => {
+                assignment_operator = AssignmentOperator::DivideEq;
+            },
+            _ => {
+                self.token_stream = scope_stream;
+                return Err(());
+            }
+        };
+
+        match self.parse_assignment_expression() {
+            Ok(value) => {
+                right_hand_side = value;
+            },
+            Err(_) => {
+                self.token_stream = scope_stream;
+                return Err(());
+            }
+        };
+
+        Ok(
+            AssignmentExpression::LeftHandSideAssignmentExpression(
+                LeftHandSideAssignmentExpression{
+                    left_hand_side: Box::new(left_hand_side),
+                    assignment_op: assignment_operator,
+                    right_hand_side: Box::new(right_hand_side),
+                }
+            )
+        )
+    }
+
+    pub fn parse_left_hand_side_expression(&mut self) -> PResult<LeftHandSideExpression> {
+        let scope_stream = self.token_stream.clone();
+
+        if let Ok(value) = self.parse_new_expression() {
+            return Ok(LeftHandSideExpression::NewExpression(value));
+        } else if let Ok(value) = self.parse_call_expression() {
+            return Ok(LeftHandSideExpression::CallExpression(value));
+        } else {
+            self.token_stream = scope_stream;
+            return Err(());
+        }
+
+    }
+
+    pub fn parse_new_expression(&mut self) -> PResult<NewExpression> {
+        Err(())
+    }
+
+    pub fn parse_call_expression(&mut self) -> PResult<CallExpression> {
+        Err(())
     }
 
     pub fn parse_function_declaration(&mut self) -> PResult<StatementListItem> {
@@ -158,9 +253,62 @@ impl Parser {
 
     pub fn parse_binding_identifier(&mut self) -> PResult<String> {
         let token = self.token_stream.first();
-        if token.kind == TokenKind::Semi {
-            self.token_stream.next_token();
-            Ok(self.token_stream.get_str(&token.span).to_string())
+        let token_str = self.token_stream.get_str(&token.span).to_string();
+        if token.kind == TokenKind::Ident {
+            let reserved = self.is_reserved_word();
+            if (token_str == "yield") | (token_str == "await") | !reserved {
+                self.token_stream.next_token();
+                Ok(token_str)
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn parse_label_identifier(&mut self) -> PResult<String> {
+        let token = self.token_stream.first();
+        let token_str = self.token_stream.get_str(&token.span).to_string();
+        if token.kind == TokenKind::Ident {
+            let reserved = self.is_reserved_word();
+            if (token_str == "yield") | (token_str == "await") | !reserved {
+                self.token_stream.next_token();
+                Ok(token_str)
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn parse_identifier_reference(&mut self) -> PResult<String> {
+        let token = self.token_stream.first();
+        let token_str = self.token_stream.get_str(&token.span).to_string();
+        if token.kind == TokenKind::Ident {
+            let reserved = self.is_reserved_word();
+            if (token_str == "yield") | (token_str == "await") | !reserved {
+                self.token_stream.next_token();
+                Ok(token_str)
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn parse_identifier(&mut self) -> PResult<String> {
+        let token = self.token_stream.first();
+        let token_str = self.token_stream.get_str(&token.span).to_string();
+        if token.kind == TokenKind::Ident {
+            if !self.is_reserved_word() {
+                self.token_stream.next_token();
+                Ok(token_str)
+            } else {
+                Err(())
+            }
         } else {
             Err(())
         }
@@ -228,7 +376,7 @@ impl Parser {
         }
     }
 
-    fn is_boolean_literal(&mut self) -> bool {
+    fn is_boolean_literal(&self) -> bool {
         let token = self.token_stream.first();
         match token.kind {
             TokenKind::Ident => {
@@ -243,7 +391,7 @@ impl Parser {
         }
     }
 
-    fn is_reserved_word(&mut self) -> bool {
+    fn is_reserved_word(&self) -> bool {
         let token = self.token_stream.first();
         match token.kind {
             TokenKind::Ident => {
@@ -273,6 +421,27 @@ impl Parser {
                 loop {
                     match self.token_stream.first().kind {
                         TokenKind::WhiteSpace => {
+                            self.token_stream.next_token();
+                        },
+                        _ => {
+                            break;
+                        },
+                    };
+                };
+                true
+            },
+            _ => false,
+        }
+    }
+
+    // general whitespaces
+    pub fn eat_wbs(&mut self) -> bool {
+        match self.token_stream.first().kind {
+            TokenKind::WhiteSpace => {
+                loop {
+                    match self.token_stream.first().kind {
+                        TokenKind::WhiteSpace | TokenKind::LineTerminator
+                        | TokenKind::MultiLineComment | TokenKind::SingleLineComment=> {
                             self.token_stream.next_token();
                         },
                         _ => {
