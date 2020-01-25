@@ -10,7 +10,7 @@ impl VariableDeclaration {
     pub fn new() -> VariableDeclaration {
         VariableDeclaration {
             identifier: String::new(),
-            initializer: AssignmentExpression::new()
+            initializer: AssignmentExpression::ConditionalExpression
         }
     }
 }
@@ -34,17 +34,89 @@ pub enum AssignmentExpression {
     YieldExpression,
     ArrowFunction,
     AsyncArrowFunction,
-    LeftHandSideAssignmentExpression,
-    LeftHandSideAssignmentOperator,
+    LeftHandSideAssignmentExpression(LeftHandSideAssignmentExpression),
+    LeftHandSideAssignmentOperator(LeftHandSideAssignmentOperator),
 }
-/*
-impl AssignmentExpression {
-    pub fn new() -> AssignmentExpression {
-        AssignmentExpression {
-        }
-    }
+
+#[derive(Debug)]
+pub struct LeftHandSideAssignmentExpression {
+
 }
-*/
+
+#[derive(Debug)]
+pub struct LeftHandSideAssignmentOperator {
+    
+}
+
+#[derive(Debug)]
+pub enum LeftHandSideExpression {
+
+}
+
+#[derive(Debug)]
+pub enum NewExpression {
+
+}
+
+#[derive(Debug)]
+pub enum CallExpression {
+
+}
+
+#[derive(Debug)]
+pub enum MemberExpression {
+
+}
+
+#[derive(Debug)]
+pub enum AssignmentOperator {
+    /// *=
+    TimesEq,
+    /// /=
+    DivideEq,
+    /// %=
+    PercentEq,
+}
+
+#[derive(Debug)]
+pub enum PrimaryExpression {
+    This,
+    IdentifierReference(IdentifierReference),
+    Literal(Literal),
+    ArrayLiteral,
+    ObjectLiteral,
+    FunctionExpression,
+    ClassExpression,
+    GeneratorExpression,
+    AsyncFunctionExpression,
+    AsyncGeneratorExpression,
+    RegularExpressionLiteral,
+    TemplateLiteral,
+    CoverParenthesizedExpressionAndArrowParameterList,
+}
+
+#[derive(Debug)]
+pub enum IdentifierReference {
+    Identifier(String),
+    Yield,
+    Await,
+}
+
+#[derive(Debug)]
+pub enum Literal {
+    NullLiteral,
+    BooleanLiteral(bool),
+    NumericLiteral(NumericLiteral),
+    StringLiteral(String),
+}
+
+#[derive(Debug)]
+pub enum NumericLiteral {
+    DecimalLiteral(f64),
+    BinaryIntegerLiteral(i32),
+    OctalIntegerLiteral(i32),
+    HexIntegerLiteral(i32),
+}
 
 #[derive(Debug)]
 pub struct ConditionalExpression {
