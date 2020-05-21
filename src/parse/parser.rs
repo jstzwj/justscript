@@ -62,6 +62,35 @@ impl Parser {
                             Err(())
                         }
                     },
+                    "if" => {
+                        if let Ok(if_statement) = self.parse_if_statement() {
+                            Ok(StatementListItem::Statement(if_statement))
+                        } else {
+                            Err(())
+                        }
+                    },
+                    "do" | "while" | "for" | "switch" => {
+                        if let Ok(breakable_statement) = self.parse_breakable_statement() {
+                            Ok(StatementListItem::Statement(breakable_statement))
+                        } else {
+                            Err(())
+                        }
+                    },
+                    "continue" => {
+                        Err(())
+                    },
+                    "return" => {
+                        Err(())
+                    },
+                    "with" => {
+                        Err(())
+                    },
+                    "throw" => {
+                        Err(())
+                    },
+                    "try" => {
+                        Err(())
+                    },
                     _ => {
                         Err(())
                     }
@@ -110,7 +139,7 @@ impl Parser {
                 if self.token_stream.get_str(&var_token.span) == "var" {
                     loop {
                         match self.parse_variable_declaration() {
-                            Ok(value) => variable_statement.variableDeclarationList.push(value),
+                            Ok(value) => variable_statement.variable_declaration_list.push(value),
                             Err(_) => break
                         };
                     }
@@ -123,6 +152,49 @@ impl Parser {
                 return Err(());
             }
         };
+    }
+
+    pub fn parse_if_statement(&mut self) -> PResult<Statement> {
+        let semi_token = self.token_stream.first();
+        match semi_token.kind {
+            TokenKind::Semi => {
+                self.token_stream.next_token();
+                Ok(Statement::EmptyStatement)
+            },
+            _ => Err(())
+        }
+    }
+
+    pub fn parse_breakable_statement(&mut self) -> PResult<Statement> {
+        let first_token = self.token_stream.first();
+        match first_token.kind {
+            TokenKind::Ident => {
+                match self.token_stream.get_str(&first_token.span) {
+                    "for" | "while" | "do" => {
+                        match self.parse_iteration_statement() {
+                            Ok(breakable_statement) => Ok(Statement::BreakableStatement(breakable_statement)),
+                            _ => Err(())
+                        }
+                    },
+                    "switch" => {
+                        match self.parse_switch_statement() {
+                            Ok(switch_statement) => Ok(Statement::BreakableStatement(switch_statement)),
+                            _ => Err(())
+                        }
+                    },
+                    _ => Err(())
+                }
+            },
+            _ => Err(())
+        }
+    }
+
+    pub fn parse_iteration_statement(&mut self) -> PResult<BreakableStatement> {
+        Err(())
+    }
+
+    pub fn parse_switch_statement(&mut self) -> PResult<BreakableStatement> {
+        Err(())
     }
 
     pub fn parse_empty_statement(&mut self) -> PResult<Statement> {

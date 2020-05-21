@@ -17,15 +17,29 @@ impl VariableDeclaration {
 
 #[derive(Debug)]
 pub struct VariableStatement {
-    pub variableDeclarationList: Vec<VariableDeclaration>
+    pub variable_declaration_list: Vec<VariableDeclaration>
 }
 
 impl VariableStatement {
     pub fn new() -> VariableStatement {
         VariableStatement {
-            variableDeclarationList: Vec::new()
+            variable_declaration_list: Vec::new()
         }
     }
+}
+
+#[derive(Debug)]
+pub enum BreakableStatement {
+    IterationStatement(IterationStatement),
+    SwitchStatement(SwitchStatement),
+}
+
+#[derive(Debug)]
+pub struct IterationStatement {
+}
+
+#[derive(Debug)]
+pub struct SwitchStatement {
 }
 
 #[derive(Debug)]
@@ -135,7 +149,7 @@ pub enum Statement {
     EmptyStatement,
     ExpressionStatement,
     ContinueStatement,
-    BreakStatement,
+    BreakableStatement(BreakableStatement),
     ReturnStatement,
     ThrowStatement,
     DebuggerStatement,
