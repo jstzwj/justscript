@@ -1,0 +1,13 @@
+[package]
+name = "js-bytecode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Stack-based bytecode + AST compiler for JustScript"
+
+[dependencies]
+js-syntax.workspace = true
+js-runtime.workspace = true
+js-diagnostics.workspace = true

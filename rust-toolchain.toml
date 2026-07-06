@@ -1,0 +1,6 @@
+[toolchain]
+# The project is developed on the nightly channel; the JIT/AOT and
+# in-tree benchmarks rely on unstable tooling.
+channel = "nightly"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"

@@ -1,0 +1,11 @@
+[package]
+name = "js-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Span-aware diagnostics for JustScript"
+
+[dependencies]
+js-syntax.workspace = true

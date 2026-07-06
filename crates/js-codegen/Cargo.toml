@@ -1,0 +1,42 @@
+[package]
+name = "js-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cranelift JIT + AOT backends for JustScript"
+
+[features]
+default = []
+# Just-in-time native compilation at runtime.
+jit = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+    "dep:target-lexicon",
+]
+# Ahead-of-time native compilation to object files.
+aot = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-object",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+    "dep:target-lexicon",
+]
+
+[dependencies]
+js-syntax.workspace = true
+js-runtime.workspace = true
+js-bytecode.workspace = true
+js-diagnostics.workspace = true
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+cranelift-object = { workspace = true, optional = true }
+target-lexicon = { workspace = true, optional = true }

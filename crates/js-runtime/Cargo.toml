@@ -1,0 +1,11 @@
+[package]
+name = "js-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Value system, objects, GC, builtins and realm for JustScript"
+
+[dependencies]
+js-syntax.workspace = true

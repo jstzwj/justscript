@@ -1,21 +1,54 @@
-[package]
-name = "justscript"
+[workspace]
+resolver = "2"
+members = [
+    "crates/js-syntax",
+    "crates/js-lexer",
+    "crates/js-diagnostics",
+    "crates/js-parser",
+    "crates/js-runtime",
+    "crates/js-bytecode",
+    "crates/js-vm",
+    "crates/js-codegen",
+    "crates/js-engine",
+    "crates/js-cli",
+]
+
+[workspace.package]
 version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
 authors = ["JunWang <1103870790@qq.com>"]
-edition = "2018"
-default-run = "justscript_example"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jstzwj/justscript"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Centralized dependency versions — referenced from member crates via
+# `foo.workspace = true`.
+[workspace.dependencies]
+# Internal crates
+js-syntax = { path = "crates/js-syntax" }
+js-lexer = { path = "crates/js-lexer" }
+js-diagnostics = { path = "crates/js-diagnostics" }
+js-parser = { path = "crates/js-parser" }
+js-runtime = { path = "crates/js-runtime" }
+js-bytecode = { path = "crates/js-bytecode" }
+js-vm = { path = "crates/js-vm" }
+js-codegen = { path = "crates/js-codegen" }
+js-engine = { path = "crates/js-engine" }
 
-[lib]
-name = "justscript"
-path = "src/lib.rs"
+# External crates
+unicode-xid = "0.2"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
 
-[[bin]]
-name = "justscript_example"
-path = "example/main.rs"
+# Cranelift — JIT + AOT backend (versions kept in lock-step).
+cranelift-codegen = "0.115"
+cranelift-frontend = "0.115"
+cranelift-jit = "0.115"
+cranelift-module = "0.115"
+cranelift-native = "0.115"
+cranelift-object = "0.115"
+target-lexicon = "0.12"
 
-[dependencies]
-byteorder = "1.3.2"
-regex = "1.3.3"
-unicode-xid = "0.2.0"
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,10 @@
+[package]
+name = "js-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Source positions, tokens, keywords, punctuators and AST for JustScript"
+
+[dependencies]

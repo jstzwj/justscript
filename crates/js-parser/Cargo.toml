@@ -1,0 +1,13 @@
+[package]
+name = "js-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "ECMAScript recursive-descent + Pratt parser for JustScript"
+
+[dependencies]
+js-syntax.workspace = true
+js-lexer.workspace = true
+js-diagnostics.workspace = true

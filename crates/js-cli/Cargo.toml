@@ -1,0 +1,24 @@
+[package]
+name = "js-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "JustScript command-line runner and REPL"
+
+[[bin]]
+name = "justscript"
+path = "src/main.rs"
+
+[features]
+default = ["interpret"]
+interpret = ["js-engine/interpret"]
+jit = ["js-engine/jit"]
+aot = ["js-engine/aot"]
+
+[dependencies]
+js-engine.workspace = true
+js-diagnostics.workspace = true
+js-syntax.workspace = true
+clap.workspace = true

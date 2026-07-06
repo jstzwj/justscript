@@ -1,0 +1,31 @@
+[package]
+name = "js-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Top-level JustScript engine API: source → AST → (bytecode | native) → run"
+
+[features]
+default = ["interpret"]
+interpret = []
+# Pull in the Cranelift JIT/AOT backends (forwarded to js-codegen).
+jit = ["js-codegen/jit"]
+aot = ["js-codegen/aot"]
+
+[dependencies]
+js-syntax.workspace = true
+js-lexer.workspace = true
+js-parser.workspace = true
+js-runtime.workspace = true
+js-bytecode.workspace = true
+js-vm.workspace = true
+js-codegen.workspace = true
+js-diagnostics.workspace = true
+
+[dev-dependencies]
+js-lexer.workspace = true
+js-parser.workspace = true
+js-bytecode.workspace = true
+js-vm.workspace = true
