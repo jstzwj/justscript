@@ -451,6 +451,14 @@ name = "js-syntax"
 version = "0.1.0"
 
 [[package]]
+name = "js-test262"
+version = "0.1.0"
+dependencies = [
+ "js-parser",
+ "js-syntax",
+]
+
+[[package]]
 name = "js-vm"
 version = "0.1.0"
 dependencies = [

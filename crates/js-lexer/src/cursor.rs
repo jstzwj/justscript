@@ -45,6 +45,20 @@ impl<'a> Cursor<'a> {
         self.ahead[1]
     }
 
+    /// The next four upcoming chars, padded with `EOF_CHAR` past end of input.
+    /// Used for maximal-munch punctuator lookahead (the longest ECMAScript
+    /// punctuator is `>>>=`, 4 chars) without consuming. Returns chars (not
+    /// bytes) so slicing is always char-boundary safe.
+    pub fn peek_ahead4(&self) -> [char; 4] {
+        let mut out = [EOF_CHAR; 4];
+        out[0] = self.ahead[0];
+        out[1] = self.ahead[1];
+        let mut it = self.chars.clone();
+        out[2] = it.next().unwrap_or(EOF_CHAR);
+        out[3] = it.next().unwrap_or(EOF_CHAR);
+        out
+    }
+
     /// Whether the cursor is at end of input.
     #[inline]
     pub fn is_eof(&self) -> bool {

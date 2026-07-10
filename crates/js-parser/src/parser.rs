@@ -28,6 +28,9 @@ impl Parser {
 
     /// Parse a full program (script or module).
     pub fn parse(mut self, kind: ProgramKind) -> DiagResult<Program> {
+        if matches!(kind, ProgramKind::Module) {
+            self.tokens.set_module();
+        }
         let start = self.tokens.span();
         let mut stmt = StmtParser::new(&mut self.tokens);
         let mut body = Vec::new();
@@ -50,7 +53,15 @@ impl Parser {
         if !errors.is_empty() {
             return Err(errors);
         }
-        Ok(Program::new(Span::new(start.start, end.end), kind, body))
+        let program = Program::new(Span::new(start.start, end.end), kind, body);
+
+        // Semantic early errors (strict-mode + spec constraints) — only worth
+        // running once the syntactic parse succeeded cleanly.
+        let early = crate::early_errors::check(&program);
+        if !early.is_empty() {
+            return Err(early);
+        }
+        Ok(program)
     }
 }
 
@@ -83,5 +94,51 @@ mod tests {
     fn empty_script_parses() {
         let prog = parse("").expect("empty source should parse");
         assert!(prog.body.is_empty());
+    }
+
+    #[test]
+    fn private_names_parse() {
+        // `#` private fields/methods/accessors, including async + generator.
+        let src = "class C { #x = 1; #m() {} async #a() {} async *#g() {} get #y() {} }";
+        parse(src).expect("private-name class body should parse");
+    }
+
+    #[test]
+    fn decorators_parse() {
+        // Element-level + class-level decorators: id, member, private-member,
+        // call, and the parenthesized form.
+        let src = "\
+function dec() {}
+class C {
+  @dec m() {}
+  @ns.x @(dec) static #p = 1;
+  @a.b.#c[args](1, 2) method() {}
+}
+@dec class D {}
+var E = @dec class {};
+";
+        parse(src).expect("decorator syntax should parse");
+    }
+
+    #[test]
+    fn member_target_destructuring_parses() {
+        parse("[a.b] = x; ({ m: o.p } = y);").expect("member-target destructuring should parse");
+    }
+
+    #[test]
+    fn import_export_parse() {
+        let src = "\
+import \"mod\";
+import * as ns from \"mod\";
+import { a, b as c } from \"mod\";
+import def, { x } from \"mod\";
+export var v = 1;
+export function f() {}
+export default 42;
+export { a, b as bb };
+export * from \"mod\";
+export { a } from \"other\";
+";
+        parse(src).expect("module import/export should parse");
     }
 }

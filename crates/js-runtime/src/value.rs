@@ -8,6 +8,11 @@
 //! the constructors and never match on the raw enum.
 
 use crate::object::JsObject;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A shared, mutable local-variable cell, captured by closures.
+pub type Cell = Rc<RefCell<Value>>;
 
 /// An opaque, cheaply-clonable JavaScript value.
 ///
@@ -52,6 +57,9 @@ impl Value {
     pub fn function(f: JsFunction) -> Value {
         Value::new(ValueData::Function(f))
     }
+    pub fn generator(g: Rc<RefCell<GeneratorState>>) -> Value {
+        Value::new(ValueData::Generator(g))
+    }
 
     // --- type tests ------------------------------------------------------
     pub fn is_undefined(&self) -> bool {
@@ -72,6 +80,17 @@ impl Value {
     pub fn as_function(&self) -> Option<&JsFunction> {
         match &self.data {
             ValueData::Function(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn is_generator(&self) -> bool {
+        matches!(self.data, ValueData::Generator(_))
+    }
+
+    pub fn as_generator(&self) -> Option<&Rc<RefCell<GeneratorState>>> {
+        match &self.data {
+            ValueData::Generator(g) => Some(g),
             _ => None,
         }
     }
@@ -108,6 +127,28 @@ pub enum ValueData {
     /// A callable function. For bytecode functions, [`JsFunction::id`] is the
     /// index used by the VM's function table (0 = top-level `<main>`).
     Function(JsFunction),
+    /// A generator object: a suspended execution of a `function*` body. Holds
+    /// the paused frame state; the VM checks it out on `.next()` and saves it
+    /// back on `yield` / completion.
+    Generator(Rc<RefCell<GeneratorState>>),
+}
+
+/// The suspended state of a generator: the pieces of a call frame that persist
+/// between `.next()` calls. Lives in `js-runtime` (no `js-vm` types) so it can
+/// be a `Value` variant; the VM converts to/from its `CallFrame` on resume.
+#[derive(Debug)]
+pub struct GeneratorState {
+    pub func_index: u32,
+    pub pc: usize,
+    pub locals: Vec<Cell>,
+    pub stack: Vec<Value>,
+    pub upvalues: Vec<Cell>,
+    pub this: Value,
+    pub captured_this: Option<Cell>,
+    /// `true` once the body has completed; further `.next()` returns done.
+    pub done: bool,
+    /// `false` until the first `.next()` (pc starts at 0).
+    pub started: bool,
 }
 
 /// A JavaScript function value.
@@ -115,11 +156,27 @@ pub enum ValueData {
 /// `id` is an opaque handle resolved by whichever backend executes the call.
 /// For the interpreter it indexes into the [`js_bytecode::BytecodeModule`]
 /// function table; native builtins use the `Native` variant instead.
+///
+/// `upvalues` are the captured local-variable cells from the function's
+/// defining environment (closures), and `this_cell` optionally captures the
+/// enclosing `this` for arrow functions (which have no own `this`).
 #[derive(Clone, Debug)]
 pub struct JsFunction {
     pub name: String,
     pub id: u32,
     pub param_count: u16,
+    pub upvalues: Vec<Cell>,
+    /// For arrow functions: the lexically captured `this`. `None` for ordinary
+    /// functions (which get `this` from their call site).
+    pub this_cell: Option<Cell>,
+    /// Index into the VM's native-function table, if this is a builtin (e.g.
+    /// generator `.next`). `None` for bytecode functions.
+    pub native: Option<u16>,
+    /// For native generator methods: the generator this `.next`/`.return`/
+    /// `.throw` was extracted from. `None` for ordinary calls.
+    pub bound_generator: Option<Rc<RefCell<GeneratorState>>>,
+    /// `true` for `function*` — calling it produces a generator object.
+    pub is_generator: bool,
 }
 
 impl JsFunction {
@@ -128,6 +185,11 @@ impl JsFunction {
             name: name.into(),
             id,
             param_count,
+            upvalues: Vec::new(),
+            this_cell: None,
+            native: None,
+            bound_generator: None,
+            is_generator: false,
         }
     }
 }

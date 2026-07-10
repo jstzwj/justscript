@@ -16,8 +16,10 @@ pub enum TokenKind {
     Whitespace,
     /// Trivia: a line terminator (`\n`, `\r`, `\r\n`).
     LineTerminator,
-    /// Trivia: `// ...` or `/* ... */`.
-    Comment { is_block: bool },
+    /// Trivia: `// ...` or `/* ... */`. For block comments, `has_newline` records
+    /// whether the comment contains a line terminator — per spec 12.4 such a
+    /// comment is treated as a line terminator for Automatic Semicolon Insertion.
+    Comment { is_block: bool, has_newline: bool },
     /// An identifier; `raw` is the *decoded* identifier text (Unicode escapes
     /// resolved). Keyword classification is done separately via [`Keyword::from_str`].
     Ident(String),
@@ -36,9 +38,17 @@ pub enum TokenKind {
     Bigint(String),
     /// A regex literal: the full `patternflags` source between slashes.
     Regex { pattern: String, flags: String },
-    /// A template string chunk. Template literals are tokenized in multiple
-    /// parts by the lexer; this carries the raw text of one segment.
-    Template { raw: String, cooked: Option<String> },
+    /// One chunk of a template literal. Template literals are tokenized in
+    /// several parts: a `head` (`` `...${ ``), zero or more `middle` chunks
+    /// (`}...${ `), and a `tail` (`}...` `` ` ``). `tail` is true only for a
+    /// chunk that closed the template at a backtick. Between chunks the lexer
+    /// emits the substitution expression's tokens normally (the closing `}` of a
+    /// substitution is consumed and turned into the next chunk).
+    Template {
+        raw: String,
+        cooked: Option<String>,
+        tail: bool,
+    },
     /// Private name `#foo`.
     PrivateName(String),
     /// End of input.
@@ -53,7 +63,7 @@ impl PartialEq for TokenKind {
         use TokenKind::*;
         match (self, other) {
             (Whitespace, Whitespace) | (LineTerminator, LineTerminator) | (Eof, Eof) => true,
-            (Comment { is_block: a }, Comment { is_block: b }) => a == b,
+            (Comment { is_block: a, .. }, Comment { is_block: b, .. }) => a == b,
             (Ident(a), Ident(b)) => a == b,
             (Keyword(a), Keyword(b)) => a == b,
             (Punctuator(a), Punctuator(b)) => a == b,
@@ -64,7 +74,10 @@ impl PartialEq for TokenKind {
                 Regex { pattern: p1, flags: f1 },
                 Regex { pattern: p2, flags: f2 },
             ) => p1 == p2 && f1 == f2,
-            (Template { raw: r1, .. }, Template { raw: r2, .. }) => r1 == r2,
+            (
+                Template { raw: r1, cooked: c1, tail: t1 },
+                Template { raw: r2, cooked: c2, tail: t2 },
+            ) => r1 == r2 && c1 == c2 && t1 == t2,
             (PrivateName(a), PrivateName(b)) => a == b,
             (Unknown(a), Unknown(b)) => a == b,
             _ => false,

@@ -7,8 +7,10 @@
 //! **Skeleton state:** the dispatch loop and frame/stack types are in place;
 //! opcode semantics land incrementally.
 
+pub mod builtins;
 pub mod frame;
 pub mod interp;
+pub mod regex;
 pub mod stack;
 
 pub use frame::CallFrame;

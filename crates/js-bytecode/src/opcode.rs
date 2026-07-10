@@ -39,6 +39,8 @@ pub enum Opcode {
     Pop,
     /// Duplicate the top of the operand stack.
     Dup,
+    /// Swap the top two operands.
+    Swap,
     /// `undefined`
     LdaUndefined,
     /// `null`
@@ -47,6 +49,12 @@ pub enum Opcode {
     LdaFalse,
     /// Push a function value (function-table index `operand`).
     LdaFunction,
+    /// Push the current `this` binding.
+    LdaThis,
+    /// Load captured upvalue slot `operand` and push it.
+    LdaUpvalue,
+    /// Pop and store into captured upvalue slot `operand`.
+    StaUpvalue,
 
     // --- arithmetic / binary (operands popped, result pushed) -----------
     Add,
@@ -89,6 +97,25 @@ pub enum Opcode {
     JumpIfTrue,
     /// `return` (pops the return value if any; pushes undefined otherwise).
     Return,
+    /// `yield` (generator): pop the yielded value, suspend the frame, push the
+    /// value passed to the next `.next(v)` onto resumption.
+    Yield,
+    /// `throw expr` (pops a value): raise it as an exception.
+    Throw,
+    /// Push an exception handler (catch_pc + finally_pc from the function's
+    /// handler table at index `operand`).
+    TryBegin,
+    /// Pop the innermost exception handler (normal exit of a protected region).
+    TryEnd,
+    /// End of a `finally` block: re-raise `pending_throw` if set, else continue.
+    FinallyEnd,
+    /// Pop an iterable; push an iterator over it (generator→itself;
+    /// array/string→an array-iterator object).
+    GetIterator,
+    /// Pop an iterator; step it once, leaving an iterator-result `{value, done}`
+    /// on the stack. For generators this drives a `.next()` (the result lands
+    /// when the generator yields/returns).
+    IterNext,
 
     // --- objects / calls ------------------------------------------------
     /// Create a fresh object and push it.
@@ -97,12 +124,18 @@ pub enum Opcode {
     NewArray,
     /// `callee`, pop `operand` args, push result.
     Call,
+    /// Method call: stack `[obj, fn, args...]`, `this` = obj.
+    CallMethod,
     /// `new` call with `operand` args.
     New,
     /// Pop object + key, push the property.
     GetProp,
     /// Pop value + key + object.
     SetProp,
+    /// `a instanceof B`: pop B, pop a, push boolean.
+    Instanceof,
+    /// Create a RegExp object from constant `operand` (pattern + "\0" + flags).
+    NewRegex,
     /// Push the named global `operand` (constant index).
     GetGlobal,
     /// Set the named global `operand`.
@@ -111,6 +144,13 @@ pub enum Opcode {
     // --- bookkeeping ----------------------------------------------------
     /// No-op / padding.
     Nop,
+    /// Pop an object/array; push a fresh array of its enumerable own key
+    /// strings (numeric indices for arrays). Used by `for-in`.
+    ObjectKeys,
+    /// Stack `[arr, value]` → `[arr]`: append `value` to the array.
+    ArrayPush,
+    /// Stack `[arr, src]` → `[arr]`: append every element of `src` to `arr`.
+    ArrayExtend,
 }
 
 impl Opcode {
@@ -141,7 +181,8 @@ impl Opcode {
             Shl => Opcode::Shl,
             Shr => Opcode::Shr,
             Ushr => Opcode::Shr, // TODO: unsigned variant
-            In | Instanceof => Opcode::Nop, // runtime-call lowering, TODO
+            In => Opcode::Nop,
+        Instanceof => Opcode::Instanceof,
         }
     }
 

@@ -56,6 +56,8 @@ pub enum Punctuator {
     Div,       // /
     Mod,       // %
     Exp,       // **
+    Inc,       // ++
+    Dec,       // --
     // Logical
     And,       // &&
     Or,        // ||
@@ -68,6 +70,8 @@ pub enum Punctuator {
     Shl,       // <<
     Shr,       // >>
     Ushr,      // >>>
+    // Decorators (stage-3 proposal): leading `@` of `@decorator`.
+    At,        // @
 }
 
 impl Punctuator {
@@ -120,6 +124,8 @@ impl Punctuator {
             Div => "/",
             Mod => "%",
             Exp => "**",
+            Inc => "++",
+            Dec => "--",
             And => "&&",
             Or => "||",
             Not => "!",
@@ -130,6 +136,7 @@ impl Punctuator {
             Shl => "<<",
             Shr => ">>",
             Ushr => ">>>",
+            At => "@",
         }
     }
 }

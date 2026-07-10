@@ -1,0 +1,17 @@
+[package]
+name = "js-test262"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "test262 parse-phase conformance runner for JustScript"
+publish = false
+
+[[bin]]
+name = "js-test262"
+path = "src/main.rs"
+
+[dependencies]
+js-syntax.workspace = true
+js-parser.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/js-codegen",
     "crates/js-engine",
     "crates/js-cli",
+    "crates/js-test262",
 ]
 
 [workspace.package]

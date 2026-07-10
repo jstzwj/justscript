@@ -3,22 +3,19 @@
 //! The public entry points are free functions over a shared
 //! [`ParserTokenStream`], so statement parsing can drive expression parsing
 //! without borrow gymnastics.
-//!
-//! Implemented (milestone 1): numeric / string literals, identifiers, `this`,
-//! parenthesized expressions, unary prefix, binary operators (via Pratt),
-//! assignment, call (`f(args)`), and member access (`o.p` / `o[e]`).
 
 use crate::token_stream::ParserTokenStream;
 use js_diagnostics::Diagnostic;
 use js_syntax::ast::expr::{
-    AssignTarget, ArrowBody, ArrowExpr, ArrayExprElement, CallArg, CallExpr, Expr,
-    FunctionExpr, MemberExpr, MemberProp, ObjectProp, ObjectPropKind, ObjectPropValue,
+    ArrowBody, ArrowExpr, ArrayExprElement, AssignTarget, CallArg, CallExpr, Expr, FunctionExpr,
+    MemberExpr, MemberProp, NewExpr, ObjectProp, ObjectPropKind, ObjectPropValue,
 };
 use js_syntax::ast::lit::Lit;
-use js_syntax::ast::op::{AssignOp, BinOp, UnaryOp};
-use js_syntax::ast::pat::PropKey;
+use js_syntax::ast::op::{AssignOp, BinOp, UnaryOp, UpdateOp};
+use js_syntax::ast::pat::{ArrayPatElement, ObjectPatProp, Pat, PropKey};
 use js_syntax::ast::stmt::Stmt;
 use js_syntax::keyword::Keyword;
+use std::str::FromStr;
 use js_syntax::punctuator::Punctuator;
 use js_syntax::source::Span;
 use js_syntax::token::TokenKind;
@@ -46,7 +43,6 @@ fn binding_power(op: BinOp) -> Option<(u8, u8)> {
 /// Parse a full expression (a comma sequence if more than one).
 pub fn parse_expression(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
     let first = parse_assignment(tokens)?;
-    // Comma sequence.
     if !tokens.eat_punctuator(Punctuator::Comma) {
         return Ok(first);
     }
@@ -61,8 +57,17 @@ pub fn parse_expression(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
     Ok(Expr::Sequence { span, exprs })
 }
 
-/// Parse an assignment expression (right-associative).
+/// Parse an assignment expression (right-associative). Also the entry point for
+/// arrow functions (`x => ...`, `(a, b) => ...`), which are detected before the
+/// normal assignment path via speculative backtracking.
 pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    // `yield` (generator context) — parsed here at assignment precedence.
+    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Yield)) {
+        return parse_yield(tokens);
+    }
+    if let Some(arrow) = try_parse_arrow(tokens)? {
+        return Ok(arrow);
+    }
     let lhs = parse_conditional(tokens)?;
     let op = match tokens.peek_kind().clone() {
         TokenKind::Punctuator(p) => match p {
@@ -79,6 +84,9 @@ pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
             Punctuator::ShlAssign => AssignOp::Shl,
             Punctuator::ShrAssign => AssignOp::Shr,
             Punctuator::UshrAssign => AssignOp::Ushr,
+            Punctuator::AndAssign => AssignOp::And,
+            Punctuator::OrAssign => AssignOp::Or,
+            Punctuator::NullishAssign => AssignOp::Nullish,
             _ => return Ok(lhs),
         },
         _ => return Ok(lhs),
@@ -92,11 +100,14 @@ pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
             name: name.clone(),
         },
         Expr::Member(m) => AssignTarget::Member(m.clone()),
+        // Destructuring assignment: an array/object literal on the LHS is
+        // reinterpreted as a pattern. For the milestone we keep the literal as
+        // the pattern source; the compiler resolves it later.
+        Expr::Array { .. } | Expr::Object { .. } => {
+            AssignTarget::Pat(array_or_object_to_pat(&lhs).map_err(|e| vec![e])?)
+        }
         _ => {
-            return Err(vec![Diagnostic::error(
-                eq_span,
-                "invalid assignment target",
-            )]);
+            return Err(vec![Diagnostic::error(eq_span, "invalid assignment target")]);
         }
     };
     let span = Span::new(lhs.span().start, rhs.span().end);
@@ -108,7 +119,242 @@ pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
     })
 }
 
-/// Conditional (`c ? a : b`). Skeleton: parses the test then requires `?:`.
+/// Speculatively parse an arrow function; on any mismatch restore the stream and
+/// return `Ok(None)` so the caller falls back to a normal assignment/paren expr.
+fn try_parse_arrow(tokens: &mut ParserTokenStream) -> Result<Option<Expr>, Vec<Diagnostic>> {
+    // `Identifier =>` (also a contextual keyword like `yield`/`await` as a name).
+    if let Some(name) = peek_binding_name(tokens) {
+        if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow)) {
+            let snap = tokens.snapshot();
+            let start = tokens.span();
+            tokens.bump(); // the param name
+            tokens.bump(); // `=>`
+            return match parse_arrow_body(tokens, start) {
+                Ok(body) => Ok(Some(Expr::Arrow(Box::new(ArrowExpr {
+                    span: arrow_span(start, &body),
+                    params: vec![Pat::Ident {
+                        span: start,
+                        name,
+                    }],
+                    body,
+                    is_async: false,
+                })))),
+                Err(e) => {
+                    tokens.restore(snap);
+                    Err(e)
+                }
+            };
+        }
+    }
+    // `( ... ) =>` — only worth trying when we open a paren.
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        let snap = tokens.snapshot();
+        match parse_arrow_params(tokens) {
+            Ok(params) => {
+                if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow)) {
+                    let start = tokens.span();
+                    let lparen_start = start.start; // overwritten below via snap
+                    let _ = lparen_start;
+                    tokens.bump(); // `=>`
+                    let real_start = first_span_after(snap, tokens);
+                    match parse_arrow_body(tokens, real_start) {
+                        Ok(body) => {
+                            return Ok(Some(Expr::Arrow(Box::new(ArrowExpr {
+                                span: arrow_span(real_start, &body),
+                                params,
+                                body,
+                                is_async: false,
+                            }))));
+                        }
+                        Err(e) => {
+                            tokens.restore(snap);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        tokens.restore(snap);
+    }
+    Ok(None)
+}
+
+/// `async`-prefixed arrow (`async x => ...`, `async (a,b) => ...`), or fall
+/// back to treating `async` as a plain identifier. The `async` keyword token is
+/// already consumed by the caller.
+fn try_parse_async_arrow(tokens: &mut ParserTokenStream, start: Span) -> Result<Expr, Vec<Diagnostic>> {
+    let snap = tokens.snapshot();
+    // `async ident =>`
+    if let TokenKind::Ident(_) = tokens.peek_kind() {
+        if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow)) {
+            let name = match tokens.bump().kind {
+                TokenKind::Ident(n) => n,
+                _ => unreachable!(),
+            };
+            tokens.bump(); // `=>`
+            // Async-arrow body is an async context (`await` reserved).
+            tokens.enter_fn(true, false);
+            let body = parse_arrow_body(tokens, start);
+            tokens.pop_ctx();
+            return match body {
+                Ok(body) => Ok(Expr::Arrow(Box::new(ArrowExpr {
+                    span: arrow_span(start, &body),
+                    params: vec![Pat::Ident { span: start, name }],
+                    body,
+                    is_async: true,
+                }))),
+                Err(e) => {
+                    tokens.restore(snap);
+                    Err(e)
+                }
+            };
+        }
+    }
+    // `async ( params ) =>`
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        tokens.enter_fn(true, false);
+        let parsed = parse_arrow_params(tokens);
+        let is_arrow = parsed.is_ok()
+            && matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow));
+        if is_arrow {
+            let params = parsed.unwrap();
+            tokens.bump(); // `=>`
+            let body = parse_arrow_body(tokens, start);
+            tokens.pop_ctx();
+            return match body {
+                Ok(body) => Ok(Expr::Arrow(Box::new(ArrowExpr {
+                    span: arrow_span(start, &body),
+                    params,
+                    body,
+                    is_async: true,
+                }))),
+                Err(e) => {
+                    tokens.restore(snap);
+                    Err(e)
+                }
+            };
+        }
+        tokens.pop_ctx();
+        tokens.restore(snap);
+    }
+    // Not an async arrow — `async` is a plain identifier reference.
+    Ok(Expr::Ident {
+        span: start,
+        name: "async".to_string(),
+    })
+}
+
+/// Best-effort span for the arrow start.
+fn first_span_after(_snap: usize, _tokens: &ParserTokenStream) -> Span {
+    Span::DUMMY
+}
+
+fn arrow_span(start: Span, body: &ArrowBody) -> Span {
+    let end = match body {
+        ArrowBody::Block(_) => start.end,
+        ArrowBody::Expr(_) => start.end,
+    };
+    Span::new(start.start, end)
+}
+
+/// Parse the body of an arrow function: either a `{ ... }` block or a concise
+/// assignment expression.
+fn parse_arrow_body(
+    tokens: &mut ParserTokenStream,
+    _start: Span,
+) -> Result<ArrowBody, Vec<Diagnostic>> {
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LBrace)) {
+        let (body, _) = parse_block(tokens)?;
+        Ok(ArrowBody::Block(body))
+    } else {
+        let e = parse_assignment(tokens)?;
+        Ok(ArrowBody::Expr(Box::new(e)))
+    }
+}
+
+/// Parse `(` <binding-pattern-list> `)` for an arrow head. Returns `Err` (not a
+/// diagnostic) if the input is not a valid parameter list — the caller restores.
+fn parse_arrow_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, ()> {
+    if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        return Err(());
+    }
+    tokens.bump();
+    let mut params = Vec::new();
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+        tokens.bump();
+        return Ok(params);
+    }
+    loop {
+        // Rest parameter `...pat` — must be the last parameter.
+        if tokens.eat_punctuator(Punctuator::Spread) {
+            match parse_binding_pattern(tokens) {
+                Ok(p) => {
+                    let span = p.span();
+                    params.push(Pat::Rest { span, arg: Box::new(p) });
+                }
+                Err(_) => return Err(()),
+            }
+            // A rest parameter must be immediately followed by `)`.
+            if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+                return Err(());
+            }
+            tokens.bump();
+            return Ok(params);
+        }
+        match parse_binding_pattern(tokens) {
+            Ok(p) => params.push(p),
+            Err(_) => return Err(()),
+        }
+        match tokens.peek_kind() {
+            TokenKind::Punctuator(Punctuator::Comma) => {
+                tokens.bump();
+                // Trailing comma before `)`.
+                if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+                    tokens.bump();
+                    return Ok(params);
+                }
+            }
+            TokenKind::Punctuator(Punctuator::RParen) => {
+                tokens.bump();
+                return Ok(params);
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+/// `yield`, `yield expr`, or `yield* expr` (delegate). Restricted production:
+/// a line terminator before the operand means no operand.
+fn parse_yield(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    let start = tokens.span();
+    tokens.bump(); // `yield`
+    let delegate = tokens.eat_punctuator(Punctuator::Mul);
+    // No operand if a newline (or `;`/`}`/`)`/EOF) follows.
+    let stop = matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::Semicolon)
+            | TokenKind::Punctuator(Punctuator::RBrace)
+            | TokenKind::Punctuator(Punctuator::RParen)
+            | TokenKind::Punctuator(Punctuator::Comma)
+            | TokenKind::Punctuator(Punctuator::Colon)
+            | TokenKind::Punctuator(Punctuator::RBracket)
+            | TokenKind::Eof
+    ) || tokens.preceded_by_newline();
+    let arg = if stop {
+        None
+    } else {
+        Some(Box::new(parse_assignment(tokens)?))
+    };
+    let end = arg.as_ref().map(|e| e.span().end).unwrap_or(start.end);
+    Ok(Expr::Yield {
+        span: Span::new(start.start, end),
+        arg,
+        delegate,
+    })
+}
+
+/// Conditional (`c ? a : b`).
 fn parse_conditional(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
     let test = parse_binary(tokens, 0)?;
     if tokens.eat_punctuator(Punctuator::QuestionMark) {
@@ -167,8 +413,19 @@ fn parse_binary(tokens: &mut ParserTokenStream, min_bp: u8) -> Result<Expr, Vec<
     Ok(lhs)
 }
 
-/// Unary prefix operators.
+/// Unary prefix operators, including prefix `++` / `--`.
 fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    // `await expr` (async context) — a prefix unary at this precedence.
+    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Await)) {
+        let span = tokens.span();
+        tokens.bump();
+        let arg = parse_unary(tokens)?;
+        let span = Span::new(span.start, arg.span().end);
+        return Ok(Expr::Await {
+            span,
+            arg: Box::new(arg),
+        });
+    }
     let (op, span) = match tokens.peek_kind().clone() {
         TokenKind::Punctuator(Punctuator::Add) => (Some(UnaryOp::Pos), tokens.span()),
         TokenKind::Punctuator(Punctuator::Sub) => (Some(UnaryOp::Neg), tokens.span()),
@@ -177,6 +434,31 @@ fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
         TokenKind::Keyword(Keyword::Typeof) => (Some(UnaryOp::Typeof), tokens.span()),
         TokenKind::Keyword(Keyword::Void) => (Some(UnaryOp::Void), tokens.span()),
         TokenKind::Keyword(Keyword::Delete) => (Some(UnaryOp::Delete), tokens.span()),
+        // Prefix update.
+        TokenKind::Punctuator(Punctuator::Inc) => {
+            let span = tokens.span();
+            tokens.bump();
+            let arg = parse_unary(tokens)?;
+            let span = Span::new(span.start, arg.span().end);
+            return Ok(Expr::Update {
+                span,
+                op: UpdateOp::Inc,
+                prefix: true,
+                arg: Box::new(arg),
+            });
+        }
+        TokenKind::Punctuator(Punctuator::Dec) => {
+            let span = tokens.span();
+            tokens.bump();
+            let arg = parse_unary(tokens)?;
+            let span = Span::new(span.start, arg.span().end);
+            return Ok(Expr::Update {
+                span,
+                op: UpdateOp::Dec,
+                prefix: true,
+                arg: Box::new(arg),
+            });
+        }
         _ => (None, tokens.span()),
     };
     if let Some(op) = op {
@@ -189,99 +471,316 @@ fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
             arg: Box::new(arg),
         });
     }
-    parse_postfix(tokens)
+    parse_lhs(tokens)
 }
 
-/// Postfix: call and member access.
-fn parse_postfix(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
-    let mut expr = parse_primary(tokens)?;
-    loop {
-        if tokens.eat_punctuator(Punctuator::LParen) {
-            let mut args = Vec::new();
-            if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
-                loop {
-                    if tokens.eat_punctuator(Punctuator::Spread) {
-                        let e = parse_assignment(tokens)?;
-                        args.push(CallArg::Spread(e));
-                    } else {
-                        args.push(CallArg::Expr(parse_assignment(tokens)?));
-                    }
-                    if !tokens.eat_punctuator(Punctuator::Comma) {
-                        break;
-                    }
-                }
-            }
-            let close = expect_punctuator(tokens, Punctuator::RParen)?;
-            let span = Span::new(expr.span().start, close.end);
-            expr = Expr::Call(Box::new(CallExpr {
-                span,
-                callee: Box::new(expr),
-                args,
-                optional: false,
-            }));
-            continue;
-        }
-        // Member access.
-        if tokens.eat_punctuator(Punctuator::Dot) {
-            let name = match tokens.peek_kind().clone() {
-                TokenKind::Ident(n) => {
-                    tokens.bump();
-                    n
-                }
-                TokenKind::Keyword(kw) => {
-                    tokens.bump();
-                    kw.as_str().to_string()
-                }
-                _ => {
-                    return Err(vec![Diagnostic::error(
-                        tokens.span(),
-                        "expected property name after '.'",
-                    )]);
-                }
-            };
-            let end = tokens.span();
-            let span = Span::new(expr.span().start, end.start);
-            expr = Expr::Member(Box::new(MemberExpr {
-                span,
-                object: Box::new(expr),
-                property: MemberProp::Ident(name),
-            }));
-            continue;
-        }
-        if tokens.eat_punctuator(Punctuator::LBracket) {
-            let idx = parse_expression(tokens)?;
-            let close = expect_punctuator(tokens, Punctuator::RBracket)?;
-            let span = Span::new(expr.span().start, close.end);
-            expr = Expr::Member(Box::new(MemberExpr {
-                span,
-                object: Box::new(expr),
-                property: MemberProp::Computed(Box::new(idx)),
-            }));
-            continue;
-        }
-        break;
-    }
+/// Left-hand-side expressions: `new`, member access, calls, postfix `++`/`--`.
+pub(crate) fn parse_lhs(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    let mut expr = if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::New)) {
+        parse_new_expr(tokens)?
+    } else {
+        parse_primary(tokens)?
+    };
+    parse_postfix_chain(tokens, &mut expr)?;
     Ok(expr)
+}
+
+/// After a primary or `new`, consume any chain of `(args)`, `.prop`, `[expr]`
+/// and a trailing postfix `++`/`--` (restricted production: no newline before).
+fn parse_postfix_chain(
+    tokens: &mut ParserTokenStream,
+    expr: &mut Expr,
+) -> Result<(), Vec<Diagnostic>> {
+    loop {
+        match tokens.peek_kind() {
+            TokenKind::Punctuator(Punctuator::LParen) => {
+                let args = parse_call_args(tokens)?;
+                let span = Span::new(expr.span().start, last_arg_end(&args).unwrap_or(expr.span().end));
+                *expr = Expr::Call(Box::new(CallExpr {
+                    span,
+                    callee: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                    args,
+                    optional: false,
+                }));
+            }
+            TokenKind::Punctuator(Punctuator::Dot) => {
+                tokens.bump();
+                let (name, is_private) = parse_property_name(tokens)?;
+                let end = tokens.span();
+                let span = Span::new(expr.span().start, end.start);
+                let prop = if is_private {
+                    MemberProp::Private(name)
+                } else {
+                    MemberProp::Ident(name)
+                };
+                *expr = Expr::Member(Box::new(MemberExpr {
+                    span,
+                    object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                    property: prop,
+                }));
+            }
+            TokenKind::Punctuator(Punctuator::LBracket) => {
+                tokens.bump();
+                let idx = parse_expression(tokens)?;
+                let close = expect_punctuator(tokens, Punctuator::RBracket)?;
+                let span = Span::new(expr.span().start, close.end);
+                *expr = Expr::Member(Box::new(MemberExpr {
+                    span,
+                    object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                    property: MemberProp::Computed(Box::new(idx)),
+                }));
+            }
+            // Postfix update — restricted production: a line terminator before
+            // `++`/`--` forbids it (`x\n++` is not postfix).
+            TokenKind::Punctuator(Punctuator::Inc) if !tokens.preceded_by_newline() => {
+                let start = expr.span().start;
+                let end = tokens.span().end;
+                tokens.bump();
+                *expr = Expr::Update {
+                    span: Span::new(start, end),
+                    op: UpdateOp::Inc,
+                    prefix: false,
+                    arg: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                };
+                return Ok(());
+            }
+            TokenKind::Punctuator(Punctuator::Dec) if !tokens.preceded_by_newline() => {
+                let start = expr.span().start;
+                let end = tokens.span().end;
+                tokens.bump();
+                *expr = Expr::Update {
+                    span: Span::new(start, end),
+                    op: UpdateOp::Dec,
+                    prefix: false,
+                    arg: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                };
+                return Ok(());
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+fn last_arg_end(args: &[CallArg]) -> Option<js_syntax::source::BytePos> {
+    args.last().map(|a| match a {
+        CallArg::Expr(e) | CallArg::Spread(e) => e.span().end,
+    })
+}
+
+/// `new` expression: `new C`, `new C(args)`, `new C.x.y(args)`, `new.target`.
+fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    let start = tokens.span();
+    tokens.bump(); // `new`
+    // `new.target`
+    if tokens.eat_punctuator(Punctuator::Dot) {
+        if let TokenKind::Ident(n) = tokens.peek_kind().clone() {
+            tokens.bump();
+            // Represent new.target as a member access on `this` (parse-only).
+            let _ = n;
+            return Ok(Expr::Member(Box::new(MemberExpr {
+                span: Span::new(start.start, tokens.span().start),
+                object: Box::new(Expr::This(start)),
+                property: MemberProp::Ident("target".to_string()),
+            })));
+        }
+    }
+    // Callee: either another `new` (right-assoc) or a primary followed by a
+    // member-only chain (no calls — the first `(...)` belongs to `new`).
+    let mut callee = if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::New)) {
+        parse_new_expr(tokens)?
+    } else {
+        let mut e = parse_primary(tokens)?;
+        loop {
+            match tokens.peek_kind() {
+                TokenKind::Punctuator(Punctuator::Dot) => {
+                    tokens.bump();
+                    let (name, is_private) = parse_property_name(tokens)?;
+                    let end = tokens.span();
+                    let prop = if is_private {
+                        MemberProp::Private(name)
+                    } else {
+                        MemberProp::Ident(name)
+                    };
+                    e = Expr::Member(Box::new(MemberExpr {
+                        span: Span::new(e.span().start, end.start),
+                        object: Box::new(e),
+                        property: prop,
+                    }));
+                }
+                TokenKind::Punctuator(Punctuator::LBracket) => {
+                    tokens.bump();
+                    let idx = parse_expression(tokens)?;
+                    let close = expect_punctuator(tokens, Punctuator::RBracket)?;
+                    e = Expr::Member(Box::new(MemberExpr {
+                        span: Span::new(e.span().start, close.end),
+                        object: Box::new(e),
+                        property: MemberProp::Computed(Box::new(idx)),
+                    }));
+                }
+                _ => break,
+            }
+        }
+        e
+    };
+    // Optional constructor argument list.
+    let mut args_end = callee.span().end;
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        let args = parse_call_args(tokens)?;
+        args_end = last_arg_end(&args).unwrap_or(args_end);
+        let span = Span::new(start.start, args_end);
+        callee = Expr::New(Box::new(NewExpr {
+            span,
+            callee: Box::new(callee),
+            args,
+        }));
+    } else {
+        let span = Span::new(start.start, args_end);
+        callee = Expr::New(Box::new(NewExpr {
+            span,
+            callee: Box::new(callee),
+            args: Vec::new(),
+        }));
+    }
+    Ok(callee)
+}
+
+/// Parse `( arg, ... )` — a call/constructor argument list (without the leading
+/// paren consumed check; the caller ensures it).
+pub(crate) fn parse_call_args(tokens: &mut ParserTokenStream) -> Result<Vec<CallArg>, Vec<Diagnostic>> {
+    let _ = expect_punctuator(tokens, Punctuator::LParen)?;
+    let mut args = Vec::new();
+    if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+        loop {
+            if tokens.eat_punctuator(Punctuator::Spread) {
+                let e = parse_assignment(tokens)?;
+                args.push(CallArg::Spread(e));
+            } else {
+                args.push(CallArg::Expr(parse_assignment(tokens)?));
+            }
+            if !tokens.eat_punctuator(Punctuator::Comma) {
+                break;
+            }
+            // Trailing comma: `f(a, b,)`.
+            if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+                break;
+            }
+        }
+    }
+    let _ = expect_punctuator(tokens, Punctuator::RParen)?;
+    Ok(args)
+}
+
+/// Whether a keyword may appear as a shorthand property name (i.e. may be an
+/// ordinary identifier in some mode). Contextual/strict-only words are allowed;
+/// hard reserved words (var/continue/…) are not.
+fn shorthand_keyword_allowed(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::Let | Keyword::Static | Keyword::Async | Keyword::Await
+            | Keyword::Yield | Keyword::Of | Keyword::From | Keyword::As
+            | Keyword::Get | Keyword::Set | Keyword::Undefined
+    )
+}
+
+/// The property name after `.`: an identifier, a keyword used as a name, a
+/// private name, or (for completeness) a string/number. Returns `(name, is_private)`.
+pub(crate) fn parse_property_name(
+    tokens: &mut ParserTokenStream,
+) -> Result<(String, bool), Vec<Diagnostic>> {
+    match tokens.peek_kind().clone() {
+        TokenKind::Ident(n) => {
+            tokens.bump();
+            Ok((n, false))
+        }
+        TokenKind::PrivateName(n) => {
+            tokens.bump();
+            Ok((n, true))
+        }
+        TokenKind::Keyword(kw) => {
+            tokens.bump();
+            Ok((kw.as_str().to_string(), false))
+        }
+        TokenKind::String(_) => {
+            let s = match tokens.bump().kind {
+                TokenKind::String(s) => s,
+                _ => unreachable!(),
+            };
+            Ok((s, false))
+        }
+        _ => Err(vec![Diagnostic::error(
+            tokens.span(),
+            "expected property name after '.'",
+        )]),
+    }
 }
 
 /// Primary expressions.
 fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    // Decorated class expression `@dec class { … }` — intercepted before the
+    // uniform `bump()` below because decorators start with `@`.
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::At)) {
+        let span = tokens.span();
+        let decorators = crate::class::parse_decorator_list(tokens)?;
+        let cls_tok = tokens.bump();
+        if !matches!(cls_tok.kind, TokenKind::Keyword(Keyword::Class)) {
+            return Err(vec![Diagnostic::error(
+                cls_tok.span,
+                "a decorator may only precede a class",
+            )]);
+        }
+        return crate::class::parse_class_expr(tokens, span, decorators);
+    }
+
     let token = tokens.bump();
     let span = token.span;
     match token.kind {
         TokenKind::Numeric(raw) => {
-            let n: f64 = raw
-                .parse()
-                .map_err(|_| vec![Diagnostic::error(span, "invalid numeric literal")])?;
-            Ok(Expr::Lit(Lit::Number(span, n)))
+            let n = js_lexer::parse_number(&raw)
+                .map_err(|e| vec![Diagnostic::error(span, e.message())])?;
+            Ok(Expr::Lit(Lit::Number(span, n, raw)))
         }
-        TokenKind::Bigint(raw) => Ok(Expr::Lit(Lit::BigInt(span, raw))),
+        TokenKind::Bigint(raw) => {
+            js_lexer::validate_numeric_literal(&raw)
+                .map_err(|e| vec![Diagnostic::error(span, e.message())])?;
+            Ok(Expr::Lit(Lit::BigInt(span, raw)))
+        }
         TokenKind::String(s) => Ok(Expr::Lit(Lit::String(span, s))),
+        TokenKind::Regex { pattern, flags } => Ok(Expr::Regex { span, pattern, flags }),
+        TokenKind::Template { raw, cooked, tail } => {
+            parse_template(tokens, span, raw, cooked, tail)
+        }
         TokenKind::Ident(name) => Ok(Expr::Ident { span, name }),
+        TokenKind::PrivateName(name) => Ok(Expr::Member(Box::new(MemberExpr {
+            span,
+            object: Box::new(Expr::This(span)),
+            property: MemberProp::Private(name),
+        }))),
         TokenKind::Keyword(Keyword::This) => Ok(Expr::This(span)),
+        TokenKind::Keyword(Keyword::Super) => Ok(Expr::Super(span)),
+        TokenKind::Keyword(Keyword::New) => {
+            // `new` reached primary parsing (e.g. inside a member chain) — defer.
+            parse_new_from_primary(tokens, span)
+        }
         TokenKind::Keyword(Keyword::True) => Ok(Expr::Lit(Lit::Boolean(span, true))),
         TokenKind::Keyword(Keyword::False) => Ok(Expr::Lit(Lit::Boolean(span, false))),
         TokenKind::Keyword(Keyword::Null) => Ok(Expr::Lit(Lit::Null(span))),
+        TokenKind::Keyword(Keyword::Function) => parse_function_expr(tokens, span, false),
+        TokenKind::Keyword(Keyword::Async)
+            if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Function)) =>
+        {
+            // `async function` expression (`async` was already consumed by the
+            // `bump()` above; the next token is `function`).
+            tokens.bump(); // `function`
+            parse_function_expr(tokens, span, true)
+        }
+        TokenKind::Keyword(Keyword::Async) => {
+            // `async` arrow: `async x => ...` / `async (a, b) => ...`.
+            // Fall through to arrow detection, which handles `async`-prefixed
+            // params by first consuming `async`.
+            try_parse_async_arrow(tokens, span)
+        }
+        TokenKind::Keyword(Keyword::Class) => crate::class::parse_class_expr(tokens, span, Vec::new()),
         TokenKind::Keyword(Keyword::Undefined) => Ok(Expr::Ident {
             span,
             name: "undefined".to_string(),
@@ -295,8 +794,8 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
                 expr: Box::new(inner),
             })
         }
-        // Function / arrow expressions.
-        TokenKind::Keyword(Keyword::Function) => parse_function_expr(tokens, span),
+        TokenKind::Punctuator(Punctuator::LBracket) => parse_array_literal(tokens, span),
+        TokenKind::Punctuator(Punctuator::LBrace) => parse_object_literal(tokens, span),
         other => Err(vec![Diagnostic::error(
             span,
             format!("unexpected token in expression: {:?}", other),
@@ -304,46 +803,472 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
     }
 }
 
-/// `function name?(params){body}` expression.
-fn parse_function_expr(
+/// `new` consumed as a primary keyword token (rare; mainly guards re-entry).
+fn parse_new_from_primary(
     tokens: &mut ParserTokenStream,
     start: Span,
 ) -> Result<Expr, Vec<Diagnostic>> {
-    let name = if let TokenKind::Ident(n) = tokens.peek_kind().clone() {
-        tokens.bump();
-        Some(n)
+    if tokens.eat_punctuator(Punctuator::Dot) {
+        if let TokenKind::Ident(_) = tokens.peek_kind() {
+            tokens.bump();
+        }
+        return Ok(Expr::Member(Box::new(MemberExpr {
+            span: Span::new(start.start, tokens.span().start),
+            object: Box::new(Expr::This(start)),
+            property: MemberProp::Ident("target".to_string()),
+        })));
+    }
+    parse_new_expr_after_keyword(tokens, start)
+}
+
+fn parse_new_expr_after_keyword(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let mut callee = parse_primary(tokens)?;
+    loop {
+        match tokens.peek_kind() {
+            TokenKind::Punctuator(Punctuator::Dot) => {
+                tokens.bump();
+                let (name, is_private) = parse_property_name(tokens)?;
+                let end = tokens.span();
+                let prop = if is_private {
+                    MemberProp::Private(name)
+                } else {
+                    MemberProp::Ident(name)
+                };
+                callee = Expr::Member(Box::new(MemberExpr {
+                    span: Span::new(callee.span().start, end.start),
+                    object: Box::new(callee),
+                    property: prop,
+                }));
+            }
+            _ => break,
+        }
+    }
+    let args = if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        parse_call_args(tokens)?
     } else {
-        None
+        Vec::new()
     };
-    let params = parse_params(tokens)?;
-    let (body, close) = parse_block(tokens)?;
-    let span = Span::new(start.start, close.end);
-    Ok(Expr::Function(Box::new(FunctionExpr {
-        span,
-        name,
-        params,
-        body,
-        is_async: false,
-        is_generator: false,
+    let end = last_arg_end(&args).unwrap_or(callee.span().end);
+    Ok(Expr::New(Box::new(NewExpr {
+        span: Span::new(start.start, end),
+        callee: Box::new(callee),
+        args,
     })))
 }
 
+/// `[a, b, ...c, ,hole]`.
+fn parse_array_literal(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let mut elements = Vec::new();
+    loop {
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBracket)) {
+            break;
+        }
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+            elements.push(None); // hole
+            continue;
+        }
+        if tokens.eat_punctuator(Punctuator::Spread) {
+            let e = parse_assignment(tokens)?;
+            elements.push(Some(ArrayExprElement::Spread(e)));
+        } else {
+            let e = parse_assignment(tokens)?;
+            elements.push(Some(ArrayExprElement::Expr(e)));
+        }
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+        } else {
+            break;
+        }
+    }
+    let close = expect_punctuator(tokens, Punctuator::RBracket)?;
+    Ok(Expr::Array {
+        span: Span::new(start.start, close.end),
+        elements,
+    })
+}
+
+/// `{ a, b: c, [k]: v, ...d, m(){}, get p(){}, set p(x){} }`.
+fn parse_object_literal(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let mut props = Vec::new();
+    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+        // Spread.
+        if tokens.eat_punctuator(Punctuator::Spread) {
+            let e = parse_assignment(tokens)?;
+            props.push(ObjectProp {
+                span: e.span(),
+                key: PropKey::Ident(String::new()),
+                value: ObjectPropValue::Spread(e),
+                computed: false,
+                method: false,
+                shorthand: false,
+                kind: ObjectPropKind::Init,
+            });
+        } else {
+            props.push(parse_object_prop(tokens)?);
+        }
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+        } else {
+            break;
+        }
+    }
+    let close = expect_punctuator(tokens, Punctuator::RBrace)?;
+    Ok(Expr::Object {
+        span: Span::new(start.start, close.end),
+        props,
+    })
+}
+
+fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<Diagnostic>> {
+    let prop_start = tokens.span();
+
+    // Concise async / generator methods: `async name(){}`, `*name(){}`,
+    // `async *name(){}`. (`async` is contextual; it is a modifier only when an
+    // async method follows — shared lookahead with class-member parsing.)
+    let mut is_async = false;
+    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Async))
+        && crate::class::is_async_modifier_ahead(tokens)
+    {
+        tokens.bump();
+        is_async = true;
+    }
+    let is_generator = tokens.eat_punctuator(Punctuator::Mul);
+
+    // get / set accessors (not combinable with async/generator in valid code).
+    let mut kind = ObjectPropKind::Init;
+    let mut is_method = false;
+    if !is_async && !is_generator {
+        if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Get))
+            && !is_property_terminator(&tokens.peek2().kind)
+        {
+            tokens.bump();
+            kind = ObjectPropKind::Get;
+            is_method = true;
+        } else if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Set))
+            && !is_property_terminator(&tokens.peek2().kind)
+        {
+            tokens.bump();
+            kind = ObjectPropKind::Set;
+            is_method = true;
+        }
+    }
+
+    // Key (possibly computed).
+    let (key, computed) = parse_property_key(tokens)?;
+
+    // Method shorthand: `name(params){body}`, `*name(){}`, `async name(){}` …
+    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+        tokens.enter_fn(is_async, is_generator);
+        let result = (|| {
+            let params = parse_params(tokens)?;
+            let (body, close) = parse_block(tokens)?;
+            let span = Span::new(prop_start.start, close.end);
+            let func = FunctionExpr {
+                span,
+                name: propkey_name(&key),
+                params,
+                body,
+                is_async,
+                is_generator,
+            };
+            Ok(ObjectProp {
+                span,
+                key,
+                value: ObjectPropValue::Method(Box::new(func)),
+                computed,
+                method: true,
+                shorthand: false,
+                kind: if is_method { kind } else { ObjectPropKind::Init },
+            })
+        })();
+        tokens.pop_ctx();
+        return result;
+    }
+
+    // Normal `key: value`.
+    if tokens.eat_punctuator(Punctuator::Colon) {
+        let v = parse_assignment(tokens)?;
+        let span = Span::new(prop_start.start, v.span().end);
+        return Ok(ObjectProp {
+            span,
+            key,
+            value: ObjectPropValue::Expr(v),
+            computed,
+            method: false,
+            shorthand: false,
+            kind,
+        });
+    }
+
+    // Shorthand `{ a }` / `{ a = default }`. A shorthand property names a
+    // binding/identifier *reference*, which may NOT be a ReservedWord — so
+    // `{ continue }` and `{ continue }` are SyntaxErrors ("IdentifierName
+    // but not ReservedWord"). Computed keys (`[...]`) and explicit `key:`
+    // forms want an IdentifierName and are exempt. Contextual/strict-only
+    // words (let/async/yield/await/…) can be ordinary identifiers in some
+    // mode, so they are not unconditionally rejected here.
+    let shorthand_name = propkey_name(&key).unwrap_or_default();
+    if !computed {
+        let reserved_bad = Keyword::from_str(&shorthand_name)
+            .map(|kw| !shorthand_keyword_allowed(kw))
+            .unwrap_or(false);
+        if reserved_bad {
+            return Err(vec![Diagnostic::error(
+                prop_start,
+                "a shorthand property name may not be a reserved word",
+            )]);
+        }
+    }
+    let default = if tokens.eat_punctuator(Punctuator::Assign) {
+        Some(parse_assignment(tokens)?)
+    } else {
+        None
+    };
+    let value_expr = match default {
+        Some(d) => Expr::Assign {
+            span: Span::new(prop_start.start, d.span().end),
+            op: AssignOp::Assign,
+            left: AssignTarget::Ident {
+                span: prop_start,
+                name: shorthand_name.clone(),
+            },
+            right: Box::new(d),
+        },
+        None => Expr::Ident {
+            span: prop_start,
+            name: shorthand_name.clone(),
+        },
+    };
+    let span = Span::new(prop_start.start, value_expr.span().end);
+    Ok(ObjectProp {
+        span,
+        key,
+        value: ObjectPropValue::Expr(value_expr),
+        computed,
+        method: false,
+        shorthand: true,
+        kind: ObjectPropKind::Init,
+    })
+}
+
+/// Whether the token after `get`/`set` could *not* start a property key, meaning
+/// `get`/`set` is itself the property name (shorthand).
+fn is_property_terminator(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Punctuator(Punctuator::Comma)
+            | TokenKind::Punctuator(Punctuator::RBrace)
+            | TokenKind::Punctuator(Punctuator::Colon)
+            | TokenKind::Punctuator(Punctuator::LParen)
+            | TokenKind::Punctuator(Punctuator::Assign)
+    )
+}
+
+/// A property key: identifier, string, number, private name, or `[computed]`.
+fn parse_property_key(tokens: &mut ParserTokenStream) -> Result<(PropKey, bool), Vec<Diagnostic>> {
+    if tokens.eat_punctuator(Punctuator::LBracket) {
+        let e = parse_assignment(tokens)?;
+        let _ = expect_punctuator(tokens, Punctuator::RBracket)?;
+        return Ok((PropKey::Computed(Box::new(e)), true));
+    }
+    match tokens.peek_kind().clone() {
+        TokenKind::Ident(n) => {
+            tokens.bump();
+            Ok((PropKey::Ident(n), false))
+        }
+        TokenKind::PrivateName(n) => {
+            tokens.bump();
+            Ok((PropKey::Private(n), false))
+        }
+        TokenKind::Keyword(kw) => {
+            tokens.bump();
+            Ok((PropKey::Ident(kw.as_str().to_string()), false))
+        }
+        TokenKind::String(s) => {
+            tokens.bump();
+            Ok((PropKey::String(s), false))
+        }
+        TokenKind::Numeric(raw) => {
+            tokens.bump();
+            let n = js_lexer::parse_number(&raw).unwrap_or(f64::NAN);
+            Ok((PropKey::Number(n), false))
+        }
+        other => Err(vec![Diagnostic::error(
+            tokens.span(),
+            format!("expected property key, found {:?}", other),
+        )]),
+    }
+}
+
+/// Best-effort identifier name for a property key (for shorthand naming).
+fn propkey_name(key: &PropKey) -> Option<String> {
+    match key {
+        PropKey::Ident(n) | PropKey::String(n) | PropKey::Private(n) => Some(n.clone()),
+        PropKey::Number(n) => Some(n.to_string()),
+        PropKey::Computed(_) => None,
+    }
+}
+
+/// `PropKey` carries no span of its own; return a dummy for bookkeeping fields.
+fn propkey_span(_key: &PropKey) -> Span {
+    Span::DUMMY
+}
+
+/// A template literal `` `head${expr}...tail` ``. The first chunk was already
+/// consumed as the current token; `tail` tells whether it closed the template.
+/// For a non-tail chunk, substitution expressions follow, each terminated by the
+/// lexer turning the matching `}` into the next chunk.
+fn parse_template(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+    raw0: String,
+    cooked0: Option<String>,
+    tail0: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    if tail0 {
+        return Ok(Expr::TemplateLit {
+            span: start,
+            quasis: vec![(cooked0, raw0)],
+            expressions: Vec::new(),
+        });
+    }
+    let mut quasis = vec![(cooked0, raw0)];
+    let mut expressions = Vec::new();
+    let mut end;
+    loop {
+        let e = parse_expression(tokens)?;
+        expressions.push(e);
+        let nt = tokens.bump();
+        match nt.kind {
+            TokenKind::Template { raw, cooked, tail } => {
+                end = nt.span.end;
+                quasis.push((cooked, raw));
+                if tail {
+                    break;
+                }
+            }
+            other => {
+                return Err(vec![Diagnostic::error(
+                    nt.span,
+                    format!("expected template chunk, found {:?}", other),
+                )]);
+            }
+        }
+    }
+    Ok(Expr::TemplateLit {
+        span: Span::new(start.start, end),
+        quasis,
+        expressions,
+    })
+}
+
+/// `function name?(params){body}` expression. `is_async` covers the
+/// `async function` prefix; a leading `*` makes it a generator.
+fn parse_function_expr(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+    is_async: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let is_generator = tokens.eat_punctuator(Punctuator::Mul);
+    let name = binding_identifier(tokens);
+    tokens.enter_fn(is_async, is_generator);
+    let result = (|| {
+        let params = parse_params(tokens)?;
+        let (body, close) = parse_block(tokens)?;
+        let span = Span::new(start.start, close.end);
+        Ok(Expr::Function(Box::new(FunctionExpr {
+            span,
+            name,
+            params,
+            body,
+            is_async,
+            is_generator,
+        })))
+    })();
+    tokens.pop_ctx();
+    result
+}
+
+/// Consume a BindingIdentifier: an `Ident`, or a contextual keyword used as a
+/// name. `await` is a valid identifier only outside async contexts (and module
+/// top level); `yield` only outside generators; `async`/`of`/`from`/`as`/`get`/
+/// `set` are purely contextual and always allowed. Strict-mode-only reserved
+/// words (`let`, `static`, `implements`, …) are NOT accepted here — they need
+/// strict-mode tracking, which the parser does not yet do. Returns `None`
+/// (consuming nothing) when the token can't be a binding name.
+/// Whether a keyword may serve as a binding identifier in the given context,
+/// returning its spelling if so (`await` outside async, `yield` outside
+/// generators, the always-contextual words). Strict-mode-only reserved words
+/// (`let`, `static`, …) are excluded (need strict tracking).
+fn keyword_binding_name(kw: Keyword, ctx: crate::token_stream::FnCtx) -> Option<&'static str> {
+    let allowed = match kw {
+        Keyword::Await => !ctx.is_async,
+        Keyword::Yield => !ctx.is_generator,
+        // `let`/`static` are valid identifiers in sloppy mode, but accepting
+        // them without full directive-prologue strict tracking was net-negative
+        // (rejected valid strict negatives). Deferred until strict mode is
+        // tracked through the directive prologue.
+        Keyword::Async | Keyword::Of | Keyword::From | Keyword::As
+        | Keyword::Get | Keyword::Set | Keyword::Undefined => true,
+        _ => false,
+    };
+    if allowed { Some(kw.as_str()) } else { None }
+}
+
+/// Peek the current token as a binding-identifier name without consuming it.
+pub(crate) fn peek_binding_name(tokens: &ParserTokenStream) -> Option<String> {
+    match tokens.peek_kind().clone() {
+        TokenKind::Ident(n) => Some(n),
+        TokenKind::Keyword(k) => keyword_binding_name(k, tokens.current_ctx()).map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn binding_identifier(tokens: &mut ParserTokenStream) -> Option<String> {
+    match tokens.peek_kind().clone() {
+        TokenKind::Ident(n) => {
+            tokens.bump();
+            Some(n)
+        }
+        TokenKind::Keyword(k) => {
+            let name = keyword_binding_name(k, tokens.current_ctx()).map(|s| s.to_string());
+            if name.is_some() { tokens.bump(); }
+            name
+        }
+        _ => None,
+    }
+}
+
 /// `(a, b, ...rest)` — parameter list.
-pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<js_syntax::ast::pat::Pat>, Vec<Diagnostic>> {
+pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, Vec<Diagnostic>> {
     let _ = expect_punctuator(tokens, Punctuator::LParen)?;
     let mut params = Vec::new();
     if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
         loop {
             if tokens.eat_punctuator(Punctuator::Spread) {
-                let p = parse_binding_identifier(tokens)?;
-                params.push(js_syntax::ast::pat::Pat::Rest {
+                let p = parse_binding_pattern(tokens)?;
+                params.push(Pat::Rest {
                     span: p.span(),
                     arg: Box::new(p),
                 });
             } else {
-                params.push(parse_binding_identifier(tokens)?);
+                params.push(parse_binding_pattern(tokens)?);
             }
             if !tokens.eat_punctuator(Punctuator::Comma) {
+                break;
+            }
+            // Trailing comma: `f(a, b,)` — end the list.
+            if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
                 break;
             }
         }
@@ -352,20 +1277,236 @@ pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<js_synt
     Ok(params)
 }
 
-/// A simple identifier binding pattern.
-fn parse_binding_identifier(
+/// A binding pattern *without* a trailing default. Used by `var`/`let`/`const`
+/// declarators, where the `= init` belongs to the declarator, not the pattern.
+/// (Defaults *inside* nested `[...]`/`{...}` are still parsed.)
+pub(crate) fn parse_binding_target(
     tokens: &mut ParserTokenStream,
-) -> Result<js_syntax::ast::pat::Pat, Vec<Diagnostic>> {
+) -> Result<Pat, Vec<Diagnostic>> {
     let span = tokens.span();
+    if let Some(name) = binding_identifier(tokens) {
+        return Ok(Pat::Ident { span, name });
+    }
     match tokens.peek_kind().clone() {
-        TokenKind::Ident(name) => {
-            tokens.bump();
-            Ok(js_syntax::ast::pat::Pat::Ident { span, name })
-        }
+        TokenKind::Punctuator(Punctuator::LBracket) => parse_array_pattern(tokens),
+        TokenKind::Punctuator(Punctuator::LBrace) => parse_object_pattern(tokens),
         other => Err(vec![Diagnostic::error(
-            span,
-            format!("expected identifier, found {:?}", other),
+            tokens.span(),
+            format!("expected binding pattern, found {:?}", other),
         )]),
+    }
+}
+
+/// A binding pattern with an optional default `= expr`. Used by function params,
+/// arrow params, and `catch`.
+pub(crate) fn parse_binding_pattern(
+    tokens: &mut ParserTokenStream,
+) -> Result<Pat, Vec<Diagnostic>> {
+    let mut pat = parse_binding_target(tokens)?;
+    // Default value: `x = expr`.
+    if tokens.eat_punctuator(Punctuator::Assign) {
+        let default = parse_assignment(tokens)?;
+        let span = Span::new(pat.span().start, default.span().end);
+        pat = Pat::Assignment {
+            span,
+            left: Box::new(pat),
+            right: Box::new(default),
+        };
+    }
+    Ok(pat)
+}
+
+fn parse_array_pattern(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagnostic>> {
+    let start = tokens.span();
+    tokens.bump(); // `[`
+    let mut elements = Vec::new();
+    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBracket)) {
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+            elements.push(Some(ArrayPatElement::Hole(tokens.span())));
+            continue;
+        }
+        if tokens.eat_punctuator(Punctuator::Spread) {
+            let p = parse_binding_pattern(tokens)?;
+            elements.push(Some(ArrayPatElement::Pat(Pat::Rest {
+                span: p.span(),
+                arg: Box::new(p),
+            })));
+            break;
+        }
+        let p = parse_binding_pattern(tokens)?;
+        elements.push(Some(ArrayPatElement::Pat(p)));
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+        } else {
+            break;
+        }
+    }
+    let close = expect_punctuator(tokens, Punctuator::RBracket)?;
+    Ok(Pat::Array {
+        span: Span::new(start.start, close.end),
+        elements,
+    })
+}
+
+fn parse_object_pattern(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagnostic>> {
+    let start = tokens.span();
+    tokens.bump(); // `{`
+    let mut properties = Vec::new();
+    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+        if tokens.eat_punctuator(Punctuator::Spread) {
+            let p = parse_binding_pattern(tokens)?;
+            properties.push(ObjectPatProp::Rest {
+                span: p.span(),
+                arg: Box::new(p),
+            });
+            break;
+        }
+        let (key, computed) = parse_property_key(tokens)?;
+        let value = if tokens.eat_punctuator(Punctuator::Colon) {
+            parse_binding_pattern(tokens)?
+        } else {
+            // Shorthand: the key is itself the binding name. A BindingIdentifier
+            // may not be a ReservedWord, so `{ continue }` in a destructuring
+            // pattern is a SyntaxError (computed keys exempt).
+            let name = propkey_name(&key).unwrap_or_default();
+            let span = propkey_span(&key);
+            if !computed {
+                let reserved_bad = Keyword::from_str(&name)
+                    .map(|kw| !shorthand_keyword_allowed(kw))
+                    .unwrap_or(false);
+                if reserved_bad {
+                    return Err(vec![Diagnostic::error(
+                        span,
+                        "a shorthand binding name may not be a reserved word",
+                    )]);
+                }
+            }
+            let mut p = Pat::Ident { span, name };
+            if tokens.eat_punctuator(Punctuator::Assign) {
+                let d = parse_assignment(tokens)?;
+                p = Pat::Assignment {
+                    span: Span::new(span.start, d.span().end),
+                    left: Box::new(p),
+                    right: Box::new(d),
+                };
+            }
+            p
+        };
+        properties.push(ObjectPatProp::KeyValue {
+            span: propkey_span(&key),
+            key,
+            value,
+        });
+        let _ = computed;
+        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
+            tokens.bump();
+        } else {
+            break;
+        }
+    }
+    let close = expect_punctuator(tokens, Punctuator::RBrace)?;
+    Ok(Pat::Object {
+        span: Span::new(start.start, close.end),
+        properties,
+    })
+}
+
+/// Reinterpret an array/object literal expression as an assignment-target
+/// pattern (for destructuring assignment `[a, b] = x` / `{ a, b: c } = x`).
+/// Nested patterns, defaults (`a = 1`), holes (`[a, , b]`), and rests
+/// (`...r`) are handled. Member targets inside a pattern (`[a.b] = x`) are
+/// syntactically valid but not represented by [`Pat`] and are rejected.
+fn array_or_object_to_pat(expr: &Expr) -> Result<Pat, Diagnostic> {
+    match expr {
+        Expr::Array { span, elements } => {
+            let mut out = Vec::with_capacity(elements.len());
+            for (idx, el) in elements.iter().enumerate() {
+                match el {
+                    None => out.push(None), // hole `,`
+                    Some(ArrayExprElement::Spread(e)) => {
+                        // `...rest` — must be the final element.
+                        if idx != elements.len() - 1 {
+                            return Err(Diagnostic::error(
+                                e.span(),
+                                "rest element must be last in an array pattern",
+                            ));
+                        }
+                        let arg = expr_to_assignment_pat(e)?;
+                        out.push(Some(ArrayPatElement::Pat(Pat::Rest {
+                            span: e.span(),
+                            arg: Box::new(arg),
+                        })));
+                    }
+                    Some(ArrayExprElement::Expr(e)) => {
+                        out.push(Some(ArrayPatElement::Pat(expr_to_assignment_pat(e)?)));
+                    }
+                }
+            }
+            Ok(Pat::Array { span: *span, elements: out })
+        }
+        Expr::Object { span, props } => {
+            let mut properties = Vec::with_capacity(props.len());
+            for (idx, p) in props.iter().enumerate() {
+                match &p.value {
+                    ObjectPropValue::Spread(e) => {
+                        // `...rest` — must be the final property.
+                        if idx != props.len() - 1 {
+                            return Err(Diagnostic::error(
+                                p.span,
+                                "rest property must be last in an object pattern",
+                            ));
+                        }
+                        let arg = Box::new(expr_to_assignment_pat(e)?);
+                        properties.push(ObjectPatProp::Rest { span: p.span, arg });
+                    }
+                    ObjectPropValue::Expr(v) => {
+                        let value = expr_to_assignment_pat(v)?;
+                        properties.push(ObjectPatProp::KeyValue {
+                            span: p.span,
+                            key: p.key.clone(),
+                            value,
+                        });
+                    }
+                    ObjectPropValue::Method(_) => {
+                        return Err(Diagnostic::error(
+                            p.span,
+                            "a method cannot be a destructuring target",
+                        ));
+                    }
+                }
+            }
+            Ok(Pat::Object { span: *span, properties })
+        }
+        _ => Err(Diagnostic::error(expr.span(), "not a destructuring pattern")),
+    }
+}
+
+/// Convert an expression that appears in an assignment-target position into a
+/// [`Pat`]: identifier, nested array/object pattern, or a defaulted target
+/// (`x = default`). Plain member expressions (`a.b`) are not patterns and are
+/// rejected (they are valid assignment targets, but [`Pat`] cannot represent
+/// them).
+fn expr_to_assignment_pat(e: &Expr) -> Result<Pat, Diagnostic> {
+    match e {
+        Expr::Ident { span, name } => Ok(Pat::Ident { span: *span, name: name.clone() }),
+        Expr::Array { .. } | Expr::Object { .. } => array_or_object_to_pat(e),
+        Expr::Member(m) => Ok(Pat::Member(m.clone())),
+        Expr::Assign { span, op: AssignOp::Assign, left, right } => {
+            let lp = assign_target_to_pat(left)?;
+            Ok(Pat::Assignment { span: *span, left: Box::new(lp), right: right.clone() })
+        }
+        _ => Err(Diagnostic::error(e.span(), "invalid destructuring target")),
+    }
+}
+
+/// Convert an [`AssignTarget`] (the LHS of an already-parsed `=` expression)
+/// into a [`Pat`], for nested defaults like `[a = 1, b = 2] = x`.
+fn assign_target_to_pat(t: &AssignTarget) -> Result<Pat, Diagnostic> {
+    match t {
+        AssignTarget::Ident { span, name } => Ok(Pat::Ident { span: *span, name: name.clone() }),
+        AssignTarget::Pat(p) => Ok(p.clone()),
+        AssignTarget::Member(m) => Ok(Pat::Member(m.clone())),
     }
 }
 
@@ -373,7 +1514,7 @@ fn parse_binding_identifier(
 pub(crate) fn parse_block(
     tokens: &mut ParserTokenStream,
 ) -> Result<(Vec<Stmt>, Span), Vec<Diagnostic>> {
-    let open = expect_punctuator(tokens, Punctuator::LBrace)?;
+    let _open = expect_punctuator(tokens, Punctuator::LBrace)?;
     let mut body = Vec::new();
     let mut errors = Vec::new();
     while !matches!(
@@ -389,7 +1530,6 @@ pub(crate) fn parse_block(
         }
     }
     let close = expect_punctuator(tokens, Punctuator::RBrace)?;
-    let _ = open;
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -412,8 +1552,32 @@ pub(crate) fn expect_punctuator(
     }
 }
 
+/// Consume a statement terminator, implementing Automatic Semicolon Insertion
+/// (ES2024 12.9). A semicolon is considered present when:
+///   1. an explicit `;` is consumed, or
+///   2. the upcoming token is `}` or EOF, or
+///   3. a line terminator preceded the upcoming token.
+/// Otherwise the statement is unterminated → SyntaxError.
+pub(crate) fn consume_asi(tokens: &mut ParserTokenStream) -> Result<(), Vec<Diagnostic>> {
+    if tokens.eat_punctuator(Punctuator::Semicolon) {
+        return Ok(());
+    }
+    let at_boundary = matches!(
+        tokens.peek_kind(),
+        TokenKind::Eof | TokenKind::Punctuator(Punctuator::RBrace)
+    );
+    if at_boundary || tokens.preceded_by_newline() {
+        Ok(())
+    } else {
+        Err(vec![Diagnostic::error(
+            tokens.span(),
+            "expected `;` or a line terminator before this token",
+        )])
+    }
+}
+
 /// Error recovery shared with statement parsing.
-fn recover_to_statement_boundary(tokens: &mut ParserTokenStream) {
+pub(crate) fn recover_to_statement_boundary(tokens: &mut ParserTokenStream) {
     if matches!(tokens.peek_kind(), TokenKind::Eof) {
         return;
     }
@@ -431,19 +1595,4 @@ fn recover_to_statement_boundary(tokens: &mut ParserTokenStream) {
             return;
         }
     }
-}
-
-// Keep a few placeholder symbols referenced by the AST re-exports so future
-// milestones can extend incrementally without churn here.
-#[allow(dead_code)]
-fn _unused_ast_types() -> (
-    ArrowBody,
-    ArrowExpr,
-    ArrayExprElement,
-    ObjectProp,
-    ObjectPropKind,
-    ObjectPropValue,
-    PropKey,
-) {
-    unreachable!()
 }

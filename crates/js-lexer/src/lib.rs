@@ -11,9 +11,11 @@
 
 pub mod cursor;
 pub mod lexer;
+pub mod validate;
 
 pub use cursor::Cursor;
 pub use lexer::{tokenize, Lexer};
+pub use validate::{parse_number, validate_numeric_literal, NumericError};
 
 #[cfg(test)]
 mod tests;

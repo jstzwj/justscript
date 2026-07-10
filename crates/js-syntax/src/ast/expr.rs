@@ -247,6 +247,9 @@ pub struct Class {
     pub name: Option<String>,
     pub superclass: Option<BoxExpr>,
     pub body: Vec<ClassMember>,
+    /// Class-level decorators (`@dec class C {}`). Stage-3 proposal; parsed,
+    /// not executed.
+    pub decorators: Vec<crate::ast::expr::Expr>,
 }
 
 pub type ClassExpr = Class;
@@ -260,12 +263,18 @@ pub struct ClassMember {
     pub static_: bool,
     pub computed: bool,
     pub kind: ClassMemberKind,
+    /// Element-level decorators (`@dec method() {}`). Stage-3 proposal; parsed,
+    /// not executed.
+    pub decorators: Vec<crate::ast::expr::Expr>,
 }
 
 #[derive(Clone, Debug)]
 pub enum ClassMemberValue {
     Method(Box<FunctionExpr>),
     Field(Option<Expr>),
+    /// `static { ... }` — a class static initializer block (executes at class
+    /// creation; parsed but not yet executed by the VM).
+    StaticBlock(Vec<crate::ast::stmt::Stmt>),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -276,4 +285,5 @@ pub enum ClassMemberKind {
     Get,
     Set,
     Field,
+    StaticBlock,
 }

@@ -8,6 +8,8 @@
 //! **Skeleton state:** the public API and Pratt precedence table are in place;
 //! the grammar methods are filled in incrementally.
 
+pub mod class;
+pub mod early_errors;
 pub mod expr;
 pub mod parser;
 pub mod sess;

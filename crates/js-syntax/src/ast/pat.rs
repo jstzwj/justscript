@@ -25,6 +25,10 @@ pub enum Pat {
         left: Box<Pat>,
         right: Box<crate::ast::expr::Expr>,
     },
+    /// A member assignment target inside a destructuring pattern (`[a.b] = x`,
+    /// `{ a: b.c } = x`). Only valid in *assignment* destructuring, never in a
+    /// binding pattern (`var`/params/catch).
+    Member(Box<crate::ast::expr::MemberExpr>),
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +69,7 @@ impl Pat {
             | Pat::Object { span, .. }
             | Pat::Rest { span, .. }
             | Pat::Assignment { span, .. } => *span,
+            Pat::Member(m) => m.span,
         }
     }
 }
