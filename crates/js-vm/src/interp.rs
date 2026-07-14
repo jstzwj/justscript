@@ -118,7 +118,20 @@ pub struct Interpreter {
     /// A native-call error surfaced to the dispatch loop (which checks it and
     /// unwinds). `None` while no error is pending.
     pending_err: Option<InterpError>,
+    /// Instructions executed so far. Bounded by [`MAX_STEPS`] so a runaway loop
+    /// (a VM bug or an infinite-loop test) terminates as `Internal` instead of
+    /// hanging the conformance runner.
+    steps: u64,
 }
+
+/// Hard cap on instructions per program. Generous enough for legitimate
+/// programs, small enough to bound a stuck run (each exhausted budget costs a
+/// fraction of a second, which matters when many tests hit it).
+const MAX_STEPS: u64 = 5_000_000;
+/// Maximum nested call depth. JS recursion drives Rust recursion through
+/// `step → invoke → call_value → step`, so this bounds the native stack and
+/// prevents a stack-overflow abort on deep (or runaway) recursion.
+const MAX_FRAMES: usize = 2000;
 
 impl Interpreter {
     pub fn new(ctx: RealmContext) -> Interpreter {
@@ -127,6 +140,7 @@ impl Interpreter {
             frames: Vec::new(),
             natives: default_natives(),
             pending_err: None,
+            steps: 0,
         };
         // Install the global builtins (console, Math, Object, JSON, parseInt, …).
         {
@@ -200,6 +214,14 @@ impl Interpreter {
     /// One-instruction outcome of [`Self::step`]: keep going, or the running
     /// frame returned `Value` (the top-level script, in [`Self::dispatch`]).
     fn step(&mut self, module: &BytecodeModule) -> Result<Step, InterpError> {
+            // Step budget: bound runaway loops so a stuck program surfaces as an
+            // `Internal` error instead of hanging the runner.
+            self.steps = self.steps.saturating_add(1);
+            if self.steps > MAX_STEPS {
+                return Err(InterpError::Internal(
+                    "step budget exceeded (possible infinite loop)".into(),
+                ));
+            }
             // A native call may have surfaced an error to unwind the loop.
             if let Some(err) = self.pending_err.take() {
                 return Err(err);
@@ -733,6 +755,13 @@ impl Interpreter {
                 return;
             }
         };
+        // Bound recursion depth: JS calls drive Rust recursion through
+        // `step → invoke → call_value → step`, so this prevents a native
+        // stack-overflow abort on deep or runaway recursion.
+        if self.frames.len() >= MAX_FRAMES {
+            self.pending_err = Some(InterpError::Internal("maximum call depth exceeded".into()));
+            return;
+        }
         // Native (builtin) function: run it and handle the result.
         if let Some(nid) = f.native {
             // SAFETY: a native call never mutates `self.natives` (the table is
@@ -1031,7 +1060,7 @@ fn typeof_(a: Value) -> Value {
     Value::string(s)
 }
 
-fn eq_strict(a: Value, b: Value) -> bool {
+pub(crate) fn eq_strict(a: Value, b: Value) -> bool {
     use ValueData::*;
     match (a.data(), b.data()) {
         (Integer(x), Integer(y)) => x == y,

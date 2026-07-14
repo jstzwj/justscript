@@ -86,3 +86,4 @@ fn lex_numeric_separators() {
     }
     assert!(matches!(&toks[1], TokenKind::Numeric(_)));
 }
+

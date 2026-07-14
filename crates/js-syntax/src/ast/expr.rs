@@ -8,6 +8,18 @@ use crate::Span;
 /// A boxed expression, used pervasively to break recursive type sizes.
 pub type BoxExpr = Box<Expr>;
 
+/// Which phase a dynamic `import`/`import.source`/`import.defer` call targets.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum ImportPhase {
+    /// `import(...)`.
+    #[default]
+    Eval,
+    /// `import.source(...)`.
+    Source,
+    /// `import.defer(...)`.
+    Defer,
+}
+
 /// An ECMAScript expression.
 #[derive(Clone, Debug)]
 pub enum Expr {
@@ -93,6 +105,17 @@ pub enum Expr {
     Yield { span: Span, arg: Option<BoxExpr>, delegate: bool },
     /// `await expr`.
     Await { span: Span, arg: BoxExpr },
+    /// Dynamic import call `import(source)` / `import(source, options)`,
+    /// and the source/defer phase forms `import.source(...)` /
+    /// `import.defer(...)`. Parsed, not executed (no module linker).
+    ImportCall {
+        span: Span,
+        phase: ImportPhase,
+        source: BoxExpr,
+        options: Option<BoxExpr>,
+    },
+    /// `import.meta` — the module metadata object. Parsed, not executed.
+    ImportMeta(Span),
 }
 
 impl Expr {
@@ -117,7 +140,9 @@ impl Expr {
             | Expr::TaggedTemplate { span, .. }
             | Expr::Spread { span, .. }
             | Expr::Yield { span, .. }
-            | Expr::Await { span, .. } => *span,
+            | Expr::Await { span, .. }
+            | Expr::ImportCall { span, .. }
+            | Expr::ImportMeta(span) => *span,
             Expr::Function(f) => f.span,
             Expr::Arrow(a) => a.span,
             Expr::Class(c) => c.span,
@@ -148,6 +173,8 @@ pub struct MemberExpr {
     pub span: Span,
     pub object: BoxExpr,
     pub property: MemberProp,
+    /// `true` for an optional access `obj?.prop` / `obj?.[expr]`.
+    pub optional: bool,
 }
 
 #[derive(Clone, Debug)]

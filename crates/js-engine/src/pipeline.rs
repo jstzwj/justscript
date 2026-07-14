@@ -23,6 +23,24 @@ pub struct RunResult {
     pub mode: ExecutionMode,
 }
 
+/// A structured execution outcome, distinguishing the failure modes the runtime
+/// conformance runner cares about: a parse/compile error (a *front-end* miss),
+/// a real JavaScript throw (a test assertion failure or an *expected* negative
+/// exception), or an internal VM limitation (an unimplemented opcode / VM bug —
+/// not a meaningful pass or fail).
+#[derive(Debug)]
+pub enum ExecOutcome {
+    /// Ran to completion with this value.
+    Ok(Value),
+    /// Parse or bytecode-compile error (front-end rejected the source).
+    CompileError(Vec<js_diagnostics::Diagnostic>),
+    /// A JavaScript `throw` reached the top level (assertion failure, or the
+    /// expected exception of a `negative: runtime` test).
+    Threw(Value),
+    /// The VM could not execute the program (unimplemented feature / VM bug).
+    Internal(String),
+}
+
 /// The top-level engine handle.
 pub struct Engine {
     config: EngineConfig,
@@ -73,6 +91,30 @@ impl Engine {
             value,
             mode: self.config.mode,
         })
+    }
+
+    /// Install the test262 harness globals (`assert`, `Test262Error`, `$DONE`)
+    /// into this engine's realm. Persist for the life of the engine (the realm
+    /// is shared across `execute` calls). Idempotent.
+    pub fn install_test262_harness(&mut self) {
+        let mut realm = self.ctx.realm.borrow_mut();
+        js_vm::builtins::install_test262_harness(&mut realm.globals);
+    }
+
+    /// Parse + compile + execute, returning a structured outcome that separates
+    /// compile errors, JavaScript throws, and internal VM limitations. Drives
+    /// the interpret backend only (JIT/AOT don't run programs yet).
+    pub fn execute(&mut self, src: &str) -> ExecOutcome {
+        let compiled = match self.compile(src) {
+            Ok(c) => c,
+            Err(diags) => return ExecOutcome::CompileError(diags),
+        };
+        let mut interp = js_vm::Interpreter::new(self.ctx_realm_clone());
+        match interp.run_module(&compiled.bytecode) {
+            Ok(v) => ExecOutcome::Ok(v),
+            Err(js_vm::InterpError::Throw(v)) => ExecOutcome::Threw(v),
+            Err(js_vm::InterpError::Internal(msg)) => ExecOutcome::Internal(msg),
+        }
     }
 
     fn ctx_realm_clone(&self) -> RealmContext {
@@ -146,3 +188,4 @@ mod tests {
         assert!(result.value.is_undefined());
     }
 }
+

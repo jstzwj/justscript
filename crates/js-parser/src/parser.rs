@@ -141,4 +141,18 @@ export { a } from \"other\";
 ";
         parse(src).expect("module import/export should parse");
     }
+
+    #[test]
+    fn let_disambiguation_parses() {
+        // `let` as an identifier reference (sloppy mode), in for-heads and as
+        // an expression statement. Each must parse cleanly.
+        for src in [
+            "for (let in obj) ;",
+            "for (let; ;) break;",
+            "let = 1; let;",
+            "for (let.x of y) ;",
+        ] {
+            parse(src).unwrap_or_else(|e| panic!("`{src}` should parse: {}", e[0].message));
+        }
+    }
 }

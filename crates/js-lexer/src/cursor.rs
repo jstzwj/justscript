@@ -33,6 +33,25 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// A cursor over `src` positioned at `byte_offset` (the next char to consume
+    /// is the one starting at that byte). Used by the parser to re-lex an
+    /// ambiguous `/` token range under a different regex/division goal than the
+    /// one the lexer originally assumed. The cursor reports *absolute* byte
+    /// offsets (relative to `src`), so re-lexed token spans line up with the
+    /// original token's span.
+    pub fn new_at(src: &'a str, byte_offset: usize) -> Cursor<'a> {
+        let suffix: &'a str = &src[byte_offset..];
+        let mut chars = suffix.chars();
+        let c0 = chars.next().unwrap_or(EOF_CHAR);
+        let c1 = chars.next().unwrap_or(EOF_CHAR);
+        Cursor {
+            chars,
+            start: src.as_ptr() as usize,
+            pos: byte_offset,
+            ahead: [c0, c1],
+        }
+    }
+
     /// The current (not yet consumed) char, or `EOF_CHAR`.
     #[inline]
     pub fn first(&self) -> char {

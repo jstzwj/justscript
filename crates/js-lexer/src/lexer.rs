@@ -23,6 +23,12 @@ pub struct Lexer<'a> {
     /// non-empty we are inside one or more substitutions; a `}` at depth 0 of
     /// the top frame closes the substitution and resumes template scanning.
     tmpl_stack: Vec<i32>,
+    /// Set when a substitution just closed (`}` at depth 0): the next token to
+    /// emit is the template *continuation* chunk (the text from here up to the
+    /// next `` ` `` or `${`). Emitting the closing `}` as a regular `RBrace`
+    /// and the chunk as a separate `Template` token keeps template-continuation
+    /// tokens unambiguous with tagged-template literals (`a\`…\``).
+    tmpl_pending: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -32,6 +38,25 @@ impl<'a> Lexer<'a> {
             cursor: Cursor::new(src),
             regex_allowed: true,
             tmpl_stack: Vec::new(),
+            tmpl_pending: false,
+        }
+    }
+
+    /// A lexer positioned at `byte_offset`, with the given regex/division goal as
+    /// its initial state. The parser uses this to *re-lex* an ambiguous `/` token
+    /// under the goal demanded by its grammar position (operand start ⇒ regex,
+    /// operator position ⇒ division) — fixing the cases the lexer's
+    /// previous-token heuristic gets wrong (notably a `/` right after a `}` that
+    /// closed a value-producing expression, or a `)` that closed a statement
+    /// header). Template-substitution state is empty, which is correct: a
+    /// re-lexed `/` range never straddles a template boundary.
+    pub fn new_at(src: &'a str, byte_offset: usize, regex_allowed: bool) -> Lexer<'a> {
+        Lexer {
+            src,
+            cursor: Cursor::new_at(src, byte_offset),
+            regex_allowed,
+            tmpl_stack: Vec::new(),
+            tmpl_pending: false,
         }
     }
 
@@ -91,6 +116,13 @@ impl<'a> Lexer<'a> {
     }
 
     fn advance_kind(&mut self, first: char) -> TokenKind {
+        // A template substitution just closed — the cursor sits at the start of
+        // the next template chunk (text up to `` ` `` or `${`).
+        if self.tmpl_pending {
+            self.tmpl_pending = false;
+            let (raw, cooked, tail) = self.scan_template_chunk();
+            return TokenKind::Template { raw, cooked, tail };
+        }
         // Hashbang comment: `#!...` is allowed only as the very first thing in
         // the source (a single line comment, like a shell shebang).
         if first == '#' && self.cursor.second() == '!' && self.cursor.byte_offset() == BytePos(0) {
@@ -173,11 +205,14 @@ impl<'a> Lexer<'a> {
         if first == '}' {
             if let Some(top) = self.tmpl_stack.last() {
                 if *top == 0 {
-                    // Close the substitution and resume template scanning.
+                    // Close the substitution: emit the `}` as a regular RBrace
+                    // (so it unambiguously terminates the substitution's
+                    // expression), and resume template scanning on the NEXT
+                    // token via `tmpl_pending`.
                     self.tmpl_stack.pop();
                     self.cursor.bump(); // consume the closing `}`
-                    let (raw, cooked, tail) = self.scan_template_chunk();
-                    return TokenKind::Template { raw, cooked, tail };
+                    self.tmpl_pending = true;
+                    return TokenKind::Punctuator(Punctuator::RBrace);
                 }
             }
             if let Some(top) = self.tmpl_stack.last_mut() {
@@ -654,7 +689,9 @@ impl<'a> Lexer<'a> {
         let mut out = String::new();
         loop {
             let c = self.cursor.first();
-            if c == EOF_CHAR || is_line_terminator(c) {
+            // Only `<LF>` (`\n`) / `<CR>` (`\r`) terminate a string literal
+            // raw; ES2019 permits `<LS>` (U+2028) / `<PS>` (U+2029) inline.
+            if c == EOF_CHAR || c == '\n' || c == '\r' {
                 // Unterminated string — bail with what we have.
                 break;
             }
@@ -665,6 +702,15 @@ impl<'a> Lexer<'a> {
             if c == '\\' {
                 self.cursor.bump(); // backslash
                 let esc = self.cursor.first();
+                // LineContinuation: `\` + LineTerminatorSequence → nothing.
+                if is_line_terminator(esc) {
+                    self.cursor.bump();
+                    // Collapse a `<CR><LF>` pair into one continuation.
+                    if esc == '\r' && self.cursor.first() == '\n' {
+                        self.cursor.bump();
+                    }
+                    continue;
+                }
                 self.cursor.bump();
                 match esc {
                     'n' => out.push('\n'),
@@ -789,7 +835,7 @@ pub fn tokenize(src: &str) -> Tokens<'_> {
 // ---- helpers --------------------------------------------------------------
 
 fn is_whitespace(c: char) -> bool {
-    matches!(c, ' ' | '\t')
+    matches!(c, ' ' | '\t' | '\u{000B}' | '\u{000C}')
         || (c >= '\u{2000}' && c <= '\u{200A}')
         || matches!(c, '\u{00A0}' | '\u{FEFF}' | '\u{3000}')
 }

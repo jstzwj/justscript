@@ -454,6 +454,7 @@ version = "0.1.0"
 name = "js-test262"
 version = "0.1.0"
 dependencies = [
+ "js-engine",
  "js-parser",
  "js-syntax",
 ]

@@ -5,7 +5,7 @@
 //! implements [`NativeFn`] and matches on the id. Callback-taking methods
 //! (`map`/`filter`/`forEach`) are deferred — they need native→JS sub-dispatch.
 
-use crate::interp::{array_get, array_len, make_array, to_string, InterpError, Interpreter, NativeFn, NativeResult};
+use crate::interp::{array_get, array_len, eq_strict, make_array, to_string, InterpError, Interpreter, NativeFn, NativeResult};
 use js_bytecode::BytecodeModule;
 use js_runtime::value::{JsFunction, Value, ValueData};
 
@@ -96,8 +96,15 @@ pub mod id {
     pub const REGEX_EXEC: u16 = 84;
     pub const STR_MATCH: u16 = 85;
     pub const STR_SEARCH: u16 = 86;
+    // test262 harness (assert.*, Test262Error, $DONE). Installed on demand via
+    // `install_test262_harness`, not present in a plain realm.
+    pub const TEST262_ERROR_CTOR: u16 = 87;
+    pub const ASSERT_SAME_VALUE: u16 = 88;
+    pub const ASSERT_NOT_SAME_VALUE: u16 = 89;
+    pub const ASSERT_THROWS: u16 = 90;
+    pub const DONE: u16 = 91;
     /// One-past-the-last id (for registering the dispatch table).
-    pub const COUNT: u16 = 87;
+    pub const COUNT: u16 = 92;
 }
 
 /// Resolve a static method on a global constructor function (Number/String).
@@ -301,6 +308,12 @@ impl NativeFn for Builtin {
             REGEX_EXEC => return regex_exec(&this, &args),
             STR_MATCH => return str_match(&this, &args),
             STR_SEARCH => Value::integer(str_search(&this, &args) as i32),
+            // ---- test262 harness ----
+            TEST262_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "Test262Error"))),
+            ASSERT_SAME_VALUE => return assert_same_value(&args, false),
+            ASSERT_NOT_SAME_VALUE => return assert_same_value(&args, true),
+            ASSERT_THROWS => return assert_throws(interp, module, &args),
+            DONE => return done(&args),
             _ => Value::undefined(),
         };
         Ok(NativeResult::Value(result))
@@ -1505,6 +1518,175 @@ pub fn error_ctor(this: &Value, args: &[Value], name: &str) -> Value {
     let msg = args.get(0).map(to_string).filter(|s| !s.is_empty()).unwrap_or_default();
     crate::interp::set_property(&obj, &Value::string("message"), Value::string(msg));
     obj
+}
+
+// ---- test262 harness natives ----------------------------------------------
+//
+// The runtime conformance runner (`js-test262 --execute`) drives programs that
+// call the test262 assertion API. Rather than evaluate the upstream `assert.js`
+// (which leans on features this engine lacks), the core API is implemented
+// directly as natives: `assert.sameValue` / `assert.notSameValue` /
+// `assert.throws`, the `Test262Error` constructor, and `$DONE`.
+
+/// Build a fresh Test262Error object carrying `message`.
+fn test262_error(msg: &str) -> Value {
+    let obj = Value::object(js_runtime::object::ObjectData::new_handle());
+    crate::interp::set_property(&obj, &Value::string("name"), Value::string("Test262Error"));
+    crate::interp::set_property(&obj, &Value::string("message"), Value::string(msg));
+    obj
+}
+
+/// `Object.is` semantics (NaN equals NaN; -0 differs from +0) — what test262's
+/// `assert.sameValue` checks. Numbers are normalized through `f64`.
+fn same_value(a: &Value, b: &Value) -> bool {
+    let na = arg_f64(std::slice::from_ref(a), 0);
+    let nb = arg_f64(std::slice::from_ref(b), 0);
+    match (na, nb) {
+        // Both numeric (covers Integer and Number): use SameValue rules.
+        (Some(x), Some(y)) => {
+            if x.is_nan() && y.is_nan() {
+                true
+            } else if x == 0.0 && y == 0.0 {
+                x.is_sign_positive() == y.is_sign_positive()
+            } else {
+                x == y
+            }
+        }
+        _ => eq_strict(a.clone(), b.clone()),
+    }
+}
+
+/// `assert.sameValue` / `assert.notSameValue`. `negate` selects the latter.
+fn assert_same_value(args: &[Value], negate: bool) -> Result<NativeResult, InterpError> {
+    let actual = args.get(0).cloned().unwrap_or_else(Value::undefined);
+    let expected = args.get(1).cloned().unwrap_or_else(Value::undefined);
+    let same = same_value(&actual, &expected);
+    let ok = if negate { !same } else { same };
+    if ok {
+        return Ok(NativeResult::Value(Value::undefined()));
+    }
+    let op = if negate { "not " } else { "" };
+    let detail = args.get(2).filter(|v| matches!(v.data(), ValueData::String(_)));
+    let msg = match detail {
+        Some(v) => to_string(v),
+        None => format!(
+            "Expected {}SameValue({:?}, {:?}) to be true",
+            op, actual, expected
+        ),
+    };
+    Err(InterpError::Throw(test262_error(&msg)))
+}
+
+/// `assert.throws(constructor, callable[, message])` — call `callable`, expect it
+/// to throw a value whose error name matches `constructor`'s. Also accepts the
+/// `(ctor, callable, predicateFn)` shape: the predicate must return truthy for
+/// the thrown value. Throws Test262Error if nothing is thrown or the type/predicate
+/// is wrong.
+fn assert_throws(
+    interp: &mut Interpreter,
+    module: &BytecodeModule,
+    args: &[Value],
+) -> Result<NativeResult, InterpError> {
+    let ctor = args.get(0).cloned().unwrap_or_else(Value::undefined);
+    // The callable is the first function-valued argument after the constructor.
+    let callable = args
+        .iter()
+        .skip(1)
+        .find(|v| v.as_function().is_some())
+        .cloned();
+    let callable = match callable {
+        Some(f) => f,
+        None => {
+            return Err(InterpError::Throw(test262_error(
+                "assert.throws expects a function argument",
+            )))
+        }
+    };
+    // A second function (if any) is a predicate over the thrown value.
+    let predicate = args
+        .iter()
+        .skip(1)
+        .filter(|v| v.as_function().is_some())
+        .skip(1)
+        .next()
+        .cloned();
+
+    let expected_name = ctor.as_function().map(|f| f.name.clone());
+    let thrown = match interp.call_value(module, callable, Vec::new(), Value::undefined()) {
+        Ok(_) => {
+            let nm = expected_name.as_deref().unwrap_or("Error");
+            let msg = format!("Expected a {nm} exception to be thrown but no exception was thrown");
+            return Err(InterpError::Throw(test262_error(&msg)));
+        }
+        Err(InterpError::Throw(v)) => v,
+        Err(other) => return Err(other),
+    };
+    // Type check: prefer the native instanceof table; fall back to name match
+    // (covers Test262Error / EvalError / URIError / user-defined throws).
+    let type_ok = instanceof_check(&thrown, &ctor)
+        || match (thrown_name(&thrown), &expected_name) {
+            (Some(got), Some(want)) => got == *want,
+            _ => false,
+        };
+    if !type_ok {
+        let want = expected_name.as_deref().unwrap_or("Error");
+        let got = thrown_name(&thrown).unwrap_or_else(|| to_string(&thrown));
+        return Err(InterpError::Throw(test262_error(&format!(
+            "Expected {want} but threw {got}"
+        ))));
+    }
+    if let Some(pred) = predicate {
+        let verdict = interp.call_value(module, pred, vec![thrown.clone()], Value::undefined())?;
+        if !is_truthy(&verdict) {
+            return Err(InterpError::Throw(test262_error(
+                "assert.throws predicate returned falsy",
+            )));
+        }
+    }
+    Ok(NativeResult::Value(thrown))
+}
+
+/// Read the `.name` property of a thrown value as a `String`.
+fn thrown_name(v: &Value) -> Option<String> {
+    let name_val = crate::interp::get_property(v, &Value::string("name"));
+    if let ValueData::String(s) = name_val.data() {
+        Some(s.as_str().to_string())
+    } else {
+        None
+    }
+}
+
+/// `$DONE([error])` — async completion callback. With no argument (or
+/// `undefined`) it signals success; any other argument is a failure, surfaced
+/// as a throw so the runner observes it. (Async scheduling itself isn't
+/// supported, but synchronous `$DONE(value)` rejection paths still matter.)
+fn done(args: &[Value]) -> Result<NativeResult, InterpError> {
+    match args.get(0) {
+        Some(v) if !matches!(v.data(), ValueData::Undefined) => {
+            Err(InterpError::Throw(v.clone()))
+        }
+        _ => Ok(NativeResult::Value(Value::undefined())),
+    }
+}
+
+/// Install the test262 harness globals (`assert`, `Test262Error`, `$DONE`) into a
+/// realm's global map. Not installed in a plain realm — the runtime conformance
+/// runner opts in.
+pub fn install_test262_harness(globals: &mut std::collections::HashMap<String, Value>) {
+    use id::*;
+    globals.insert(
+        "assert".to_string(),
+        namespace(vec![
+            ("sameValue", native_fn("sameValue", ASSERT_SAME_VALUE)),
+            ("notSameValue", native_fn("notSameValue", ASSERT_NOT_SAME_VALUE)),
+            ("throws", native_fn("throws", ASSERT_THROWS)),
+        ]),
+    );
+    globals.insert(
+        "Test262Error".to_string(),
+        native_fn("Test262Error", TEST262_ERROR_CTOR),
+    );
+    globals.insert("$DONE".to_string(), native_fn("$DONE", DONE));
 }
 
 /// `a instanceof B`: for Error native constructors, checks `a.name`.

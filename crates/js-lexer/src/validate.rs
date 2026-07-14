@@ -41,11 +41,6 @@ impl NumericError {
 pub fn validate_numeric_literal(raw: &str) -> Result<(), NumericError> {
     let (is_bigint, body) = strip_bigint(raw);
 
-    // BigInts forbid `.` and exponents entirely.
-    if is_bigint && (body.contains('.') || contains_exp(body)) {
-        return Err(NumericError::BigIntFractional);
-    }
-
     let (radix, digits) = match radix_prefix(body) {
         Some((r, d)) => (r, d),
         // No radix prefix → decimal.
@@ -54,10 +49,15 @@ pub fn validate_numeric_literal(raw: &str) -> Result<(), NumericError> {
         }
     };
 
-    // Radix-prefixed integer literal (0x.., 0b.., 0o..).
+    // Radix-prefixed integer literal (0x.., 0b.., 0o..). These are always
+    // integer literals — no fractional/exponent part exists, so a BigInt suffix
+    // is always fine here. (Note: in `0x…E…`, 'E' is a hex digit, NOT an
+    // exponent — the BigInt-fractional check must therefore run only in the
+    // decimal branch, never against a hex body.)
     if digits.is_empty() {
         return Err(NumericError::Empty);
     }
+    let _ = is_bigint;
     if !separators_ok(digits, digit_pred(radix)) {
         return Err(NumericError::BadSeparator);
     }
@@ -94,10 +94,6 @@ fn strip_bigint(raw: &str) -> (bool, &str) {
     }
 }
 
-fn contains_exp(s: &str) -> bool {
-    s.contains('e') || s.contains('E')
-}
-
 fn radix_prefix(s: &str) -> Option<(u32, &str)> {
     if let Some(r) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some((16, r))
@@ -116,11 +112,15 @@ fn digit_pred(radix: u32) -> impl Fn(char) -> bool {
 
 fn validate_decimal(body: &str, is_bigint: bool) -> Result<(), NumericError> {
     // DecimalIntegerLiteral [. DecimalDigits] [ExponentPart]
-    // BigInt: only DecimalIntegerLiteral allowed → no '.', no exponent (already
-    // rejected above for `.`/exp when is_bigint). Also: a non-zero decimal
-    // integer / bigint may not start with '0' unless it is exactly "0" — but
-    // that legacy-octal rule is strict-mode-only for plain numbers. For BigInt,
-    // leading-zero is unconditionally invalid.
+    // BigInt: only a plain DecimalIntegerLiteral is allowed — no '.', no
+    // exponent. (This check is decimal-only: in a hex literal 'E' is a digit,
+    // not an exponent, so the radix branch never runs it.)
+    if is_bigint && (body.contains('.') || body.contains('e') || body.contains('E')) {
+        return Err(NumericError::BigIntFractional);
+    }
+    // A non-zero decimal integer / bigint may not start with '0' unless it is
+    // exactly "0" — but that legacy-octal rule is strict-mode-only for plain
+    // numbers. For BigInt, leading-zero is unconditionally invalid.
     if is_bigint && has_leading_zero(body) {
         return Err(NumericError::BigIntLeadingZero);
     }
@@ -230,6 +230,16 @@ mod tests {
         assert_eq!(validate_numeric_literal("08n"), Err(NumericError::BigIntLeadingZero));
         assert_eq!(validate_numeric_literal("00n"), Err(NumericError::BigIntLeadingZero));
         assert_eq!(validate_numeric_literal("0_0n"), Err(NumericError::BigIntLeadingZero));
+    }
+
+    #[test]
+    fn accepts_radix_bigint_with_hex_letter_e() {
+        // `0x…E…`: 'E' is a hex digit, not an exponent — must NOT trip the
+        // BigInt-fractional rule.
+        assert!(validate_numeric_literal("0xFEDCBA9876543210n").is_ok());
+        assert!(validate_numeric_literal("0xDEAD_BEEFn").is_ok());
+        assert!(validate_numeric_literal("0b1010n").is_ok());
+        assert!(validate_numeric_literal("0o777n").is_ok());
     }
 
     #[test]

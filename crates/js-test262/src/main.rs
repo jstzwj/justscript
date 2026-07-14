@@ -4,7 +4,7 @@
 //!   js-test262 run <test262-root> [--dir test/language/asi] [--show-fails N]
 //!   js-test262 false-accepts <test262-root>   # list only false-accept bugs
 
-use js_test262::{run, Outcome, TestResult};
+use js_test262::{run, run_runtime, Outcome, TestResult};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -12,13 +12,24 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage:\n  {} run <test262-root> [--dir <sub>] [--show-fails <N>] [--list-false-accepts] [--cluster]\n  {} false-accepts <test262-root>",
-            args[0], args[0]
+            "usage:\n  {} run <test262-root> [--dir <sub>] [--show-fails <N>] [--list-false-accepts] [--cluster]\n  {} execute <test262-root> [--dir <sub>] [--show-fails <N>]\n  {} false-accepts <test262-root>",
+            args[0], args[0], args[0]
         );
         return ExitCode::from(2);
     }
-    let _cmd = &args[1];
+    let cmd = &args[1];
     let root = PathBuf::from(&args[2]);
+
+    // `execute` is the runtime phase — dispatch to a separate path.
+    if cmd == "execute" {
+        return run_execute_mode(&args, &root);
+    }
+
+    // `execute-one` runs a single test (emitting one outcome line). Invoked by
+    // the parent `execute` mode as an isolated child process per test.
+    if cmd == "execute-one" {
+        return run_execute_one(&args);
+    }
 
     let mut subdir: Option<String> = None;
     let mut show_fails: usize = 0;
@@ -134,6 +145,171 @@ fn main() -> ExitCode {
 
 fn rel(path: &std::path::Path, base: &std::path::Path) -> String {
     path.strip_prefix(base).map(|p| p.display().to_string()).unwrap_or_else(|_| path.display().to_string())
+}
+
+/// `execute <root>` — the runtime (execution) conformance phase. Runs each test
+/// under a fresh realm with the test262 harness installed and classifies the
+/// outcome (pass / fail / incomplete / skip).
+fn run_execute_mode(args: &[String], root: &std::path::Path) -> ExitCode {
+    let mut subdir: Option<String> = None;
+    let mut show_fails: usize = 0;
+    let mut cluster = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                subdir = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--show-fails" => {
+                show_fails = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--cluster" => {
+                cluster = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let scan_root = match &subdir {
+        Some(s) => root.join(s),
+        None => root.join("test/language"),
+    };
+    if !scan_root.exists() {
+        eprintln!("error: scan root does not exist: {}", scan_root.display());
+        return ExitCode::from(2);
+    }
+
+    let (results, stats) = run_runtime(&scan_root);
+
+    println!(
+        "scanned: {} | executed: {} | pass: {} | fail: {} | incomplete: {} | skip: {}",
+        stats.total, stats.executed, stats.pass, stats.fail, stats.incomplete, stats.skip
+    );
+    if stats.executed > 0 {
+        println!(
+            "  runtime pass rate over executed: {:.1}%",
+            100.0 * stats.pass as f64 / stats.executed as f64
+        );
+    }
+
+    if cluster {
+        cluster_runtime(&results, root);
+        return ExitCode::SUCCESS;
+    }
+
+    if show_fails > 0 {
+        println!("\n=== first {} runtime failures (sample) ===", show_fails);
+        let mut shown = 0;
+        for r in &results {
+            if shown >= show_fails {
+                break;
+            }
+            if let js_test262::RuntimeOutcome::Fail(reason) = &r.outcome {
+                println!("  {}  ({})", rel(&r.path, root), reason);
+                shown += 1;
+            }
+        }
+        if shown == 0 {
+            println!("  (no failures)");
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Cluster runtime failures by feature directory + normalized reason, so the
+/// biggest execution gaps surface first.
+fn cluster_runtime(results: &[js_test262::RuntimeResult], root: &std::path::Path) {
+    use std::collections::BTreeMap;
+    let mut by_dir: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut by_reason: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut total = 0usize;
+    for r in results {
+        let reason = match &r.outcome {
+            js_test262::RuntimeOutcome::Fail(reason) => reason.clone(),
+            _ => continue,
+        };
+        total += 1;
+        let relp = rel(&r.path, root);
+        let feat = feature_dir(&relp);
+        let e = by_dir.entry(feat).or_default();
+        e.0 += 1;
+        if e.1.len() < 3 {
+            e.1.push(relp.clone());
+        }
+        let nm = normalize_runtime_reason(&reason);
+        let e = by_reason.entry(nm).or_default();
+        e.0 += 1;
+        if e.1.len() < 3 {
+            e.1.push(relp);
+        }
+    }
+    println!("\n=== runtime failures by FEATURE DIRECTORY ({} total) ===", total);
+    let mut dirs: Vec<_> = by_dir.into_iter().collect();
+    dirs.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    for (feat, (n, samples)) in dirs.iter().take(40) {
+        println!("  {:5}  {}", n, feat);
+        for s in samples {
+            println!("           e.g. {}", s);
+        }
+    }
+    println!("\n=== runtime failures by REASON (top 30) ===");
+    let mut msgs: Vec<_> = by_reason.into_iter().collect();
+    msgs.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    for (msg, (n, samples)) in msgs.iter().take(30) {
+        println!("  {:5}  {}", n, msg);
+        for s in samples {
+            println!("           e.g. {}", s);
+        }
+    }
+}
+
+fn normalize_runtime_reason(reason: &str) -> String {
+    // vm internal errors carry a trailing detail; bucket by the kind prefix.
+    if let Some(idx) = reason.find(" (") {
+        return reason[..idx].to_string();
+    }
+    reason.to_string()
+}
+
+/// `execute-one <root> <relpath>` — child-process entry: read one test, classify
+/// it, run it in-process, and emit a single outcome line on stdout:
+///   `PASS` | `FAIL\t<reason>` | `INCOMPLETE\t<reason>` | `SKIP\t<reason>`
+fn run_execute_one(args: &[String]) -> ExitCode {
+    let root = PathBuf::from(&args[2]);
+    let relpath = PathBuf::from(&args[3]);
+    let path = root.join(&relpath);
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("INCOMPLETE\tunreadable: {e}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let fm = js_test262::FrontMatter::parse(&src);
+    let (expect, skip_reason) = js_test262::classify_runtime(&fm);
+    if let Some(reason) = skip_reason {
+        println!("SKIP\t{}", reason);
+        return ExitCode::SUCCESS;
+    }
+    let outcome = js_test262::execute_test_source(&src, &expect);
+    match outcome {
+        js_test262::RuntimeOutcome::Pass => println!("PASS"),
+        js_test262::RuntimeOutcome::Fail(r) => println!("FAIL\t{}", one_line(&r)),
+        js_test262::RuntimeOutcome::Incomplete(r) => println!("INCOMPLETE\t{}", one_line(&r)),
+        js_test262::RuntimeOutcome::Skip(r) => println!("SKIP\t{}", r),
+    }
+    ExitCode::SUCCESS
+}
+
+/// Collapse a reason to a single line (no embedded newlines/tabs).
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect()
 }
 
 /// Cluster false-rejects (valid syntax we reject) by feature directory and by

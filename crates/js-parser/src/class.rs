@@ -40,12 +40,10 @@ fn parse_class(
     start: Span,
     decorators: Vec<js_syntax::ast::expr::Expr>,
 ) -> Result<Class, Vec<Diagnostic>> {
-    let name = if let TokenKind::Ident(n) = tokens.peek_kind().clone() {
-        tokens.bump();
-        Some(n)
-    } else {
-        None
-    };
+    // A class name is a BindingIdentifier — contextual keywords like `await`
+    // (legal in a sloppy script) are accepted via `binding_identifier`, which
+    // returns `None` without consuming for an anonymous class (`{`/`extends`).
+    let name = expr::binding_identifier(tokens);
     let superclass = if tokens.eat_keyword(Keyword::Extends) {
         Some(Box::new(expr::parse_lhs(tokens)?))
     } else {
@@ -116,6 +114,7 @@ fn parse_decorator(
                     span: Span::new(start.start, tokens.span().start),
                     object: Box::new(node),
                     property: prop,
+                    optional: false,
                 }));
             }
             TokenKind::Punctuator(Punctuator::LBracket) => {
@@ -126,6 +125,7 @@ fn parse_decorator(
                     span: Span::new(start.start, close.end),
                     object: Box::new(node),
                     property: MemberProp::Computed(Box::new(idx)),
+                    optional: false,
                 }));
             }
             TokenKind::Punctuator(Punctuator::LParen) => {
@@ -231,14 +231,18 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
     let is_generator = tokens.eat_punctuator(Punctuator::Mul);
 
     // get / set accessors (not combinable with async/generator in valid code).
+    // `[no LineTerminator here]`: `get`/`set` followed by a newline is a plain
+    // field name, not an accessor (e.g. `get\n*a(){}`).
     let mut kind = ClassMemberKind::Method;
     if !is_async && !is_generator {
         if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Get))
+            && !tokens.preceded_by_newline_at(1)
             && !is_member_continuation(&tokens.peek2().kind)
         {
             tokens.bump();
             kind = ClassMemberKind::Get;
         } else if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Set))
+            && !tokens.preceded_by_newline_at(1)
             && !is_member_continuation(&tokens.peek2().kind)
         {
             tokens.bump();
@@ -311,7 +315,34 @@ pub(crate) fn is_async_modifier_ahead(tokens: &ParserTokenStream) -> bool {
     if matches!(k2, TokenKind::Punctuator(Punctuator::Mul)) {
         return true;
     }
-    is_plain_prop_name_start(k2) && matches!(tokens.peek3().kind, TokenKind::Punctuator(Punctuator::LParen))
+    if is_plain_prop_name_start(k2) {
+        return matches!(tokens.peek3().kind, TokenKind::Punctuator(Punctuator::LParen));
+    }
+    // Computed-key async method: `async [expr](`. Scan past the bracket-balanced
+    // `[...]` and check that a `(` follows.
+    if matches!(k2, TokenKind::Punctuator(Punctuator::LBracket)) {
+        let mut depth = 0isize;
+        let mut i = 1; // start at the `[` (== peek2, offset 1 from current)
+        loop {
+            let k = &tokens.peek_at(i).kind;
+            match k {
+                TokenKind::Punctuator(Punctuator::LBracket) => depth += 1,
+                TokenKind::Punctuator(Punctuator::RBracket) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            tokens.peek_at(i + 1).kind,
+                            TokenKind::Punctuator(Punctuator::LParen)
+                        );
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 /// A property-name token usable for the simple `async name(` lookahead (excludes

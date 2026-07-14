@@ -131,6 +131,33 @@ impl Checker {
         }
     }
 
+    /// Validate the body of an unbraced `if`/`for`/`while`/`do` clause, then
+    /// recurse. A non-block single-statement body may not be a lexical
+    /// (`let`/`const`), class, or function declaration — those require a block.
+    fn check_unbraced_body(&mut self, body: &Stmt) {
+        // A non-block single-statement body may not be a lexical
+        // (`let`/`const`/`using`), class, or function declaration — those
+        // require a block. (`var` is permitted.)
+        let bad = if let Stmt::Decl(d) = body {
+            matches!(
+                d.as_ref(),
+                Decl::Class(_) | Decl::Function(_)
+            ) || matches!(d.as_ref(), Decl::Var { kind, .. } if matches!(
+                kind,
+                js_syntax::ast::stmt::VarKind::Let
+                    | js_syntax::ast::stmt::VarKind::Const
+                    | js_syntax::ast::stmt::VarKind::Using
+                    | js_syntax::ast::stmt::VarKind::AwaitUsing
+            ))
+        } else {
+            false
+        };
+        if bad {
+            self.err(body.span(), "lexical/class/function declaration cannot be the body of an unbraced statement; use a block `{ ... }`");
+        }
+        self.check_stmt(body);
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Block { body, .. } => {
@@ -144,14 +171,14 @@ impl Checker {
             Stmt::Decl(d) => self.check_decl(d),
             Stmt::If { test, cons, alt, .. } => {
                 self.check_expr(test);
-                self.check_stmt(cons);
+                self.check_unbraced_body(cons);
                 if let Some(a) = alt {
-                    self.check_stmt(a);
+                    self.check_unbraced_body(a);
                 }
             }
             Stmt::While { test, body, .. } | Stmt::DoWhile { test, body, .. } => {
                 self.check_expr(test);
-                self.check_stmt(body);
+                self.check_unbraced_body(body);
             }
             Stmt::For {
                 init, test, update, body, ..
@@ -170,16 +197,29 @@ impl Checker {
                 if let Some(u) = update {
                     self.check_expr(u);
                 }
-                self.check_stmt(body);
+                self.check_unbraced_body(body);
                 self.leave();
             }
             Stmt::ForIn { left, right, body, .. } | Stmt::ForOf { left, right, body, .. } => {
+                let is_for_in = matches!(stmt, Stmt::ForIn { .. });
                 self.enter(false);
                 if let js_syntax::ast::stmt::ForTarget::Var(d) = left {
+                    // `using`/`await using` are not permitted as `for...in` targets.
+                    if is_for_in {
+                        if let Decl::Var { kind, span, .. } = d.as_ref() {
+                            if matches!(
+                                kind,
+                                js_syntax::ast::stmt::VarKind::Using
+                                    | js_syntax::ast::stmt::VarKind::AwaitUsing
+                            ) {
+                                self.err(*span, "`using` is not allowed in a `for...in` statement");
+                            }
+                        }
+                    }
                     self.check_decl_opts(d, true);
                 }
                 self.check_expr(right);
-                self.check_stmt(body);
+                self.check_unbraced_body(body);
                 self.leave();
             }
             Stmt::Switch { disc, cases, .. } => {
@@ -261,7 +301,13 @@ impl Checker {
                     // Declare the binding names with scope-aware conflict checks.
                     let mut names = Vec::new();
                     collect_binding_names(&d.name, &mut names);
-                    let is_let = matches!(kind, js_syntax::ast::stmt::VarKind::Let | js_syntax::ast::stmt::VarKind::Const);
+                    let is_let = matches!(
+                        kind,
+                        js_syntax::ast::stmt::VarKind::Let
+                            | js_syntax::ast::stmt::VarKind::Const
+                            | js_syntax::ast::stmt::VarKind::Using
+                            | js_syntax::ast::stmt::VarKind::AwaitUsing
+                    );
                     for n in &names {
                         if is_let {
                             self.declare_lexical(n, d.span);
@@ -273,10 +319,20 @@ impl Checker {
                     self.check_binding_pat(&d.name);
                     if let Some(init) = &d.init {
                         self.check_expr(init);
-                    } else if !is_iteration_target
-                        && matches!(kind, js_syntax::ast::stmt::VarKind::Const)
-                    {
-                        self.err(d.span, "`const` declaration must have an initializer");
+                    } else {
+                        // `const` and `using`/`await using` need an initializer
+                        // — except when the declaration is a `for...of`/`for...in`
+                        // iteration target, where the binding is fed by iteration.
+                        let needs_init = !is_iteration_target
+                            && matches!(
+                                kind,
+                                js_syntax::ast::stmt::VarKind::Const
+                                    | js_syntax::ast::stmt::VarKind::Using
+                                    | js_syntax::ast::stmt::VarKind::AwaitUsing
+                            );
+                        if needs_init {
+                            self.err(d.span, "this declaration must have an initializer");
+                        }
                     }
                 }
             }
@@ -284,7 +340,7 @@ impl Checker {
                 if let Some(name) = &f.name {
                     self.declare_var(name, f.span);
                 }
-                self.check_function(f, false, false, false);
+                self.check_function(f, false, false, false, false);
             }
             Decl::Class(c) => {
                 if let Some(name) = &c.name {
@@ -296,12 +352,21 @@ impl Checker {
         }
     }
 
-    fn check_function(&mut self, f: &FunctionDecl, force_strict: bool, super_prop_ok: bool, super_call_ok: bool) {
+    fn check_function(
+        &mut self,
+        f: &FunctionDecl,
+        force_strict: bool,
+        super_prop_ok: bool,
+        super_call_ok: bool,
+        name_is_property: bool,
+    ) {
         // Strictness: inherited, forced (class member/generator/async), or own
         // directive prologue.
         let body_strict = self.strict || force_strict || strict_directive_stmts(&f.body);
-        // Function name (strict): eval/arguments/FRW restrictions.
-        if body_strict {
+        // Function name (strict): eval/arguments/FRW restrictions. A *method*
+        // name is a property name (IdentifierName), not a BindingIdentifier, so
+        // it is exempt — `{ eval(){} }` / `class C { arguments(){} }` are fine.
+        if body_strict && !name_is_property {
             if let Some(name) = &f.name {
                 self.check_strict_binding_name(name, f.span);
             }
@@ -369,22 +434,24 @@ impl Checker {
                     // `super.x` is valid in any method/constructor; `super()`
                     // only in a constructor of a derived class.
                     let call_ok = is_ctor && derived;
-                    self.check_function(func, true, true, call_ok);
+                    self.check_function(func, true, true, call_ok, true);
                 }
                 js_syntax::ast::expr::ClassMemberValue::Field(init) => {
                     if let Some(e) = init {
-                        // `super` is not valid in a field initializer.
-                        self.super_prop.push(false);
+                        // A field initializer has the class as its [[HomeObject]],
+                        // so `super.prop` is valid (an arrow nested here inherits
+                        // it); only a `super()` *call` is invalid.
+                        self.super_prop.push(true);
                         self.super_call.push(false);
                         self.check_expr(e);
                         self.super_prop.pop();
                         self.super_call.pop();
                     }
                 }
-                // Static initializer blocks: checked in class-strict mode; no
-                // `super`/special binding rules beyond the body statements.
+                // Static initializer blocks: `super.prop` is valid (the static
+                // [[HomeObject]] is the class); `super()` is not.
                 js_syntax::ast::expr::ClassMemberValue::StaticBlock(body) => {
-                    self.super_prop.push(false);
+                    self.super_prop.push(true);
                     self.super_call.push(false);
                     for s in body {
                         self.check_stmt(s);
@@ -510,7 +577,7 @@ impl Checker {
 
     fn check_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Function(f) => self.check_function(f, false, false, false),
+            Expr::Function(f) => self.check_function(f, false, false, false, false),
             Expr::Arrow(a) => self.check_arrow(a),
             Expr::Class(c) => self.check_class(c),
             Expr::Assign { op, left, right, .. } => {
@@ -538,7 +605,15 @@ impl Checker {
                 }
                 self.check_expr(arg);
             }
-            Expr::Update { arg, .. } => {
+            Expr::Update { arg, span, .. } => {
+                // `import(...)` and optional-chaining results are not valid
+                // `++`/`--` operands.
+                if matches!(arg.as_ref(), Expr::ImportCall { .. }) {
+                    self.err(*span, "invalid update target: `import(...)` is not assignable");
+                }
+                if optional_chain_target(arg.as_ref()) {
+                    self.err(*span, "invalid update target: an optional chaining is not assignable");
+                }
                 if self.strict {
                     if let Expr::Ident { name, span } = arg.as_ref() {
                         if name == "eval" || name == "arguments" {
@@ -586,6 +661,10 @@ impl Checker {
                 }
             }
             Expr::New(n) => {
+                // `new import(...)` (and the phase forms) is a SyntaxError.
+                if let Expr::ImportCall { span, .. } = n.callee.as_ref() {
+                    self.err(*span, "`import(...)` cannot be the callee of `new`");
+                }
                 self.check_expr(&n.callee);
                 for a in &n.args {
                     if let js_syntax::ast::expr::CallArg::Expr(e) = a {
@@ -604,10 +683,22 @@ impl Checker {
             Expr::Object { props, .. } => {
                 let mut proto_count = 0;
                 for p in props {
-                    let is_proto = matches!(&p.key, js_syntax::ast::pat::PropKey::String(s) | js_syntax::ast::pat::PropKey::Ident(s) if s == "__proto__")
-                        && !p.computed
-                        && matches!(p.kind, js_syntax::ast::expr::ObjectPropKind::Init);
-                    if is_proto {
+                    // Only a `__proto__: value` *data* property (the prototype
+                    // setter form) counts toward the duplicate-`__proto__`
+                    // SyntaxError. Methods, getters, setters, shorthand, and
+                    // computed keys do not.
+                    let is_proto_data = !p.computed
+                        && !p.method
+                        && p.shorthand == false
+                        && matches!(p.kind, js_syntax::ast::expr::ObjectPropKind::Init)
+                        && matches!(
+                            &p.key,
+                            js_syntax::ast::pat::PropKey::String(s)
+                                | js_syntax::ast::pat::PropKey::Ident(s)
+                            if s == "__proto__"
+                        )
+                        && matches!(p.value, js_syntax::ast::expr::ObjectPropValue::Expr(_));
+                    if is_proto_data {
                         proto_count += 1;
                     }
                     match &p.value {
@@ -616,7 +707,7 @@ impl Checker {
                             // `super.x` is valid inside an object-literal method
                             // (resolves via the object's prototype); `super()`
                             // never is.
-                            self.check_function(f, false, true, false)
+                            self.check_function(f, false, true, false, true)
                         }
                         js_syntax::ast::expr::ObjectPropValue::Spread(e) => self.check_expr(e),
                     }
@@ -633,6 +724,13 @@ impl Checker {
             Expr::Paren { expr, .. } => self.check_expr(expr),
             Expr::Spread { arg, .. } => self.check_expr(arg),
             Expr::TaggedTemplate { tag, .. } => self.check_expr(tag),
+            Expr::ImportCall { source, options, .. } => {
+                self.check_expr(source);
+                if let Some(o) = options {
+                    self.check_expr(o);
+                }
+            }
+            Expr::ImportMeta(_) => {}
             Expr::Yield { arg, span, .. } => {
                 if !*self.yield_ctx.last().unwrap() {
                     self.err(*span, "`yield` is only valid within a generator function");
@@ -673,7 +771,14 @@ impl Checker {
     fn check_assign_target(&mut self, target: &AssignTarget) {
         match target {
             AssignTarget::Pat(pat) => self.check_binding_pat(pat),
-            AssignTarget::Member(m) => self.check_expr(&m.object),
+            AssignTarget::Member(m) => {
+                // An optional-chaining member (`a?.b`) is not a valid assignment
+                // target.
+                if m.optional {
+                    self.err(m.span, "invalid assignment target: an optional chaining is not assignable");
+                }
+                self.check_expr(&m.object);
+            }
             AssignTarget::Ident { .. } => {}
         }
     }
@@ -755,6 +860,16 @@ fn directive_string(expr: &Expr) -> Option<String> {
         Expr::Lit(Lit::String(_, s)) => Some(s.clone()),
         Expr::Paren { expr, .. } => directive_string(expr),
         _ => None,
+    }
+}
+
+/// Whether `e` is the result of an optional chaining (`a?.b`, `a?.[x]`,
+/// `a?.()`), which is never a valid assignment / update target.
+fn optional_chain_target(e: &Expr) -> bool {
+    match e {
+        Expr::Member(m) => m.optional,
+        Expr::Call(c) => c.optional,
+        _ => false,
     }
 }
 
@@ -922,15 +1037,19 @@ mod tests {
     // ---- await / yield / super context ----
 
     #[test]
-    fn yield_outside_generator() {
-        let errs = check_src("function f(){ yield 1; }");
-        assert!(errs.iter().any(|m| m.contains("yield")), "{:?}", errs);
+    fn yield_outside_generator_is_identifier() {
+        // In a sloppy ordinary function, `yield` is a plain identifier
+        // reference — `yield;` is a valid (no-op) expression statement.
+        let errs = check_src("function f(){ yield; }");
+        assert!(errs.is_empty(), "{:?}", errs);
     }
 
     #[test]
-    fn await_outside_async() {
-        let errs = check_src("function f(){ await 1; }");
-        assert!(errs.iter().any(|m| m.contains("await")), "{:?}", errs);
+    fn await_outside_async_is_identifier() {
+        // In a sloppy ordinary function, `await` is a plain identifier
+        // reference — `await;` is a valid (no-op) expression statement.
+        let errs = check_src("function f(){ await; }");
+        assert!(errs.is_empty(), "{:?}", errs);
     }
 
     #[test]
@@ -979,7 +1098,15 @@ mod tests {
 
     #[test]
     fn super_in_field_initializer_invalid() {
-        let errs = check_src("class C { x = super.y; }");
+        // `super.prop` is valid in a field initializer (the field's
+        // [[HomeObject]] is the class); only a `super()` *call* is invalid.
+        let errs = check_src("class C { x = super(); }");
         assert!(errs.iter().any(|m| m.contains("super")), "{:?}", errs);
+    }
+
+    #[test]
+    fn super_prop_in_field_initializer_ok() {
+        let errs = check_src("class C extends B { x = super.y; }");
+        assert!(errs.is_empty(), "{:?}", errs);
     }
 }

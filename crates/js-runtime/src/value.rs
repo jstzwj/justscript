@@ -94,6 +94,24 @@ impl Value {
             _ => None,
         }
     }
+
+    /// If this is an object carrying a string `.name` property (as thrown Error
+    /// values do), return that name. Used by the runtime conformance runner to
+    /// classify `negative: { type: <Name> }` expectations.
+    pub fn error_name(&self) -> Option<String> {
+        let obj = match &self.data {
+            ValueData::Object(o) => o,
+            _ => return None,
+        };
+        let b = obj.borrow();
+        match b.properties.get("name")? {
+            crate::object::PropertyDescriptor::Data { value, .. } => match &value.data {
+                ValueData::String(s) => Some(s.as_str().to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Value {

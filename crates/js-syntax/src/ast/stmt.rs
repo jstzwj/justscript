@@ -137,6 +137,12 @@ pub enum VarKind {
     Var,
     Let,
     Const,
+    /// `using x = expr;` — explicit resource management (disposes at scope exit).
+    /// Parsed, not executed.
+    Using,
+    /// `await using x = expr;` — async-variant (disposes via `Symbol.asyncDispose`).
+    /// Parsed, not executed.
+    AwaitUsing,
 }
 
 #[derive(Clone, Debug)]

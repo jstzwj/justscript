@@ -8,7 +8,7 @@ use crate::token_stream::ParserTokenStream;
 use js_diagnostics::Diagnostic;
 use js_syntax::ast::expr::{
     ArrowBody, ArrowExpr, ArrayExprElement, AssignTarget, CallArg, CallExpr, Expr, FunctionExpr,
-    MemberExpr, MemberProp, NewExpr, ObjectProp, ObjectPropKind, ObjectPropValue,
+    ImportPhase, MemberExpr, MemberProp, NewExpr, ObjectProp, ObjectPropKind, ObjectPropValue,
 };
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::op::{AssignOp, BinOp, UnaryOp, UpdateOp};
@@ -42,12 +42,24 @@ fn binding_power(op: BinOp) -> Option<(u8, u8)> {
 
 /// Parse a full expression (a comma sequence if more than one).
 pub fn parse_expression(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
-    let first = parse_assignment(tokens)?;
+    parse_expression_inner(tokens, true)
+}
+
+/// Like [`parse_expression`], but when `in_ok` is false the top-level `in`
+/// operator is left unconsumed — the `[~In]` grammar used in `for...in` /
+/// `for...of` heads. (Only the *immediate* head level is affected; nested
+/// bracketed/braced/parenthesized sub-expressions always re-enable `in`.)
+pub(crate) fn parse_expression_inner(
+    tokens: &mut ParserTokenStream,
+    in_ok: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let first = parse_assignment_inner(tokens, in_ok)?;
     if !tokens.eat_punctuator(Punctuator::Comma) {
         return Ok(first);
     }
     let mut exprs = vec![first];
     loop {
+        // After the first comma we're in a sequence — `in` is always allowed.
         exprs.push(parse_assignment(tokens)?);
         if !tokens.eat_punctuator(Punctuator::Comma) {
             break;
@@ -61,14 +73,24 @@ pub fn parse_expression(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
 /// arrow functions (`x => ...`, `(a, b) => ...`), which are detected before the
 /// normal assignment path via speculative backtracking.
 pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
-    // `yield` (generator context) — parsed here at assignment precedence.
-    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Yield)) {
+    parse_assignment_inner(tokens, true)
+}
+
+fn parse_assignment_inner(
+    tokens: &mut ParserTokenStream,
+    in_ok: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    // `yield` — a yield expression only inside a generator; outside one,
+    // `yield` is a plain identifier reference (sloppy mode).
+    if tokens.current_ctx().is_generator
+        && matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Yield))
+    {
         return parse_yield(tokens);
     }
     if let Some(arrow) = try_parse_arrow(tokens)? {
         return Ok(arrow);
     }
-    let lhs = parse_conditional(tokens)?;
+    let lhs = parse_conditional_inner(tokens, in_ok)?;
     let op = match tokens.peek_kind().clone() {
         TokenKind::Punctuator(p) => match p {
             Punctuator::Assign => AssignOp::Assign,
@@ -93,7 +115,14 @@ pub fn parse_assignment(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diag
     };
     let eq_span = tokens.span();
     tokens.bump();
-    let rhs = parse_assignment(tokens)?;
+    // The RHS inherits the `In` grammar parameter (`for (x = a in b; …)` blocks `in`).
+    let rhs = parse_assignment_inner(tokens, in_ok)?;
+    // Unwrap parenthesization: `(x) = 1` / `(a.b) = 1` are valid assignment
+    // targets (CoverParenthesizedExpression collapses to the inner expression).
+    let mut lhs = lhs;
+    while let Expr::Paren { expr, .. } = &lhs {
+        lhs = (**expr).clone();
+    }
     let target = match &lhs {
         Expr::Ident { span, name } => AssignTarget::Ident {
             span: *span,
@@ -185,31 +214,29 @@ fn try_parse_arrow(tokens: &mut ParserTokenStream) -> Result<Option<Expr>, Vec<D
 /// already consumed by the caller.
 fn try_parse_async_arrow(tokens: &mut ParserTokenStream, start: Span) -> Result<Expr, Vec<Diagnostic>> {
     let snap = tokens.snapshot();
-    // `async ident =>`
-    if let TokenKind::Ident(_) = tokens.peek_kind() {
-        if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow)) {
-            let name = match tokens.bump().kind {
-                TokenKind::Ident(n) => n,
-                _ => unreachable!(),
-            };
-            tokens.bump(); // `=>`
-            // Async-arrow body is an async context (`await` reserved).
-            tokens.enter_fn(true, false);
-            let body = parse_arrow_body(tokens, start);
-            tokens.pop_ctx();
-            return match body {
-                Ok(body) => Ok(Expr::Arrow(Box::new(ArrowExpr {
-                    span: arrow_span(start, &body),
-                    params: vec![Pat::Ident { span: start, name }],
-                    body,
-                    is_async: true,
-                }))),
-                Err(e) => {
-                    tokens.restore(snap);
-                    Err(e)
-                }
-            };
-        }
+    // `async <binding> =>` — a single-parameter async arrow. The parameter may
+    // be a contextual keyword (`async of => …`, `async as => …`).
+    if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow))
+        && peek_binding_name(tokens).is_some()
+    {
+        let name = binding_identifier(tokens).unwrap_or_default();
+        tokens.bump(); // `=>`
+        // Async-arrow body is an async context (`await` reserved).
+        tokens.enter_fn(true, false);
+        let body = parse_arrow_body(tokens, start);
+        tokens.pop_ctx();
+        return match body {
+            Ok(body) => Ok(Expr::Arrow(Box::new(ArrowExpr {
+                span: arrow_span(start, &body),
+                params: vec![Pat::Ident { span: start, name }],
+                body,
+                is_async: true,
+            }))),
+            Err(e) => {
+                tokens.restore(snap);
+                Err(e)
+            }
+        };
     }
     // `async ( params ) =>`
     if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
@@ -355,12 +382,15 @@ fn parse_yield(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
 }
 
 /// Conditional (`c ? a : b`).
-fn parse_conditional(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
-    let test = parse_binary(tokens, 0)?;
+fn parse_conditional_inner(
+    tokens: &mut ParserTokenStream,
+    in_ok: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let test = parse_binary_inner(tokens, 0, in_ok)?;
     if tokens.eat_punctuator(Punctuator::QuestionMark) {
-        let cons = parse_assignment(tokens)?;
+        let cons = parse_assignment_inner(tokens, in_ok)?;
         let _ = expect_punctuator(tokens, Punctuator::Colon)?;
-        let alt = parse_assignment(tokens)?;
+        let alt = parse_assignment_inner(tokens, in_ok)?;
         let span = Span::new(test.span().start, alt.span().end);
         return Ok(Expr::Conditional {
             span,
@@ -373,14 +403,31 @@ fn parse_conditional(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnos
 }
 
 /// The Pratt loop for binary operators with minimum binding power `min_bp`.
-fn parse_binary(tokens: &mut ParserTokenStream, min_bp: u8) -> Result<Expr, Vec<Diagnostic>> {
+fn parse_binary_inner(
+    tokens: &mut ParserTokenStream,
+    min_bp: u8,
+    in_ok: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
     let mut lhs = parse_unary(tokens)?;
     loop {
+        // Operator position: a `/` here is always the division operator, never a
+        // regex (a regex literal never serves as a binary operator). The lexer's
+        // previous-token heuristic can mis-classify it as a regex — most often
+        // after a `}` that closed a value-producing expression such as an object
+        // literal (`{a: 1} / 2`), a function/class expression, or an arrow block
+        // — so re-lex under the division goal before matching the operator.
+        match tokens.peek_kind() {
+            TokenKind::Regex { .. } | TokenKind::Unknown('/') => {
+                tokens.reslash_div();
+            }
+            _ => {}
+        }
         let op = match tokens.peek_kind().clone() {
             TokenKind::Punctuator(p) => match BinOp::from_punctuator(p) {
                 Some(o) => o,
                 None => break,
             },
+            TokenKind::Keyword(Keyword::In) if !in_ok => break,
             TokenKind::Keyword(Keyword::In) => BinOp::In,
             TokenKind::Keyword(Keyword::Instanceof) => BinOp::Instanceof,
             _ => break,
@@ -392,7 +439,7 @@ fn parse_binary(tokens: &mut ParserTokenStream, min_bp: u8) -> Result<Expr, Vec<
             break;
         }
         tokens.bump();
-        let rhs = parse_binary(tokens, r_bp)?;
+        let rhs = parse_binary_inner(tokens, r_bp, in_ok)?;
         let span = Span::new(lhs.span().start, rhs.span().end);
         lhs = if matches!(op, BinOp::And | BinOp::Or | BinOp::NullishCoal) {
             Expr::Logical {
@@ -415,8 +462,11 @@ fn parse_binary(tokens: &mut ParserTokenStream, min_bp: u8) -> Result<Expr, Vec<
 
 /// Unary prefix operators, including prefix `++` / `--`.
 fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
-    // `await expr` (async context) — a prefix unary at this precedence.
-    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Await)) {
+    // `await expr` — a prefix unary operator only inside an async function;
+    // outside one, `await` is a plain identifier reference (sloppy mode).
+    if tokens.current_ctx().is_async
+        && matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Await))
+    {
         let span = tokens.span();
         tokens.bump();
         let arg = parse_unary(tokens)?;
@@ -476,6 +526,17 @@ fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
 
 /// Left-hand-side expressions: `new`, member access, calls, postfix `++`/`--`.
 pub(crate) fn parse_lhs(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+    // Operand start: a leading `/` is always a regex literal here, never the
+    // division operator (a division operator never begins an operand). The
+    // lexer's previous-token heuristic can mis-classify it as division — most
+    // often after a statement-header `)` such as `if (x) /re/.test(y)` — so
+    // re-lex under the regex goal before parsing the operand.
+    match tokens.peek_kind() {
+        TokenKind::Punctuator(Punctuator::Div) | TokenKind::Punctuator(Punctuator::DivAssign) => {
+            tokens.reslash_regex();
+        }
+        _ => {}
+    }
     let mut expr = if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::New)) {
         parse_new_expr(tokens)?
     } else {
@@ -503,6 +564,51 @@ fn parse_postfix_chain(
                     optional: false,
                 }));
             }
+            // Optional chaining `?.` — splits into `?.name` / `?.#priv`,
+            // `?.[expr]`, and `?.(args)`.
+            TokenKind::Punctuator(Punctuator::OptChain) => {
+                tokens.bump(); // `?.`
+                match tokens.peek_kind() {
+                    TokenKind::Punctuator(Punctuator::LParen) => {
+                        let args = parse_call_args(tokens)?;
+                        let span = Span::new(expr.span().start, last_arg_end(&args).unwrap_or(expr.span().end));
+                        *expr = Expr::Call(Box::new(CallExpr {
+                            span,
+                            callee: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                            args,
+                            optional: true,
+                        }));
+                    }
+                    TokenKind::Punctuator(Punctuator::LBracket) => {
+                        tokens.bump();
+                        let idx = parse_expression(tokens)?;
+                        let close = expect_punctuator(tokens, Punctuator::RBracket)?;
+                        let span = Span::new(expr.span().start, close.end);
+                        *expr = Expr::Member(Box::new(MemberExpr {
+                            span,
+                            object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                            property: MemberProp::Computed(Box::new(idx)),
+                            optional: true,
+                        }));
+                    }
+                    _ => {
+                        let (name, is_private) = parse_property_name(tokens)?;
+                        let end = tokens.span();
+                        let span = Span::new(expr.span().start, end.start);
+                        let prop = if is_private {
+                            MemberProp::Private(name)
+                        } else {
+                            MemberProp::Ident(name)
+                        };
+                        *expr = Expr::Member(Box::new(MemberExpr {
+                            span,
+                            object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                            property: prop,
+                            optional: true,
+                        }));
+                    }
+                }
+            }
             TokenKind::Punctuator(Punctuator::Dot) => {
                 tokens.bump();
                 let (name, is_private) = parse_property_name(tokens)?;
@@ -517,6 +623,7 @@ fn parse_postfix_chain(
                     span,
                     object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
                     property: prop,
+                    optional: false,
                 }));
             }
             TokenKind::Punctuator(Punctuator::LBracket) => {
@@ -528,7 +635,26 @@ fn parse_postfix_chain(
                     span,
                     object: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
                     property: MemberProp::Computed(Box::new(idx)),
+                    optional: false,
                 }));
+            }
+            // Tagged template: `tag\`…\`` / `obj.method\`…\``. The current token
+            // is the template's first chunk.
+            TokenKind::Template { .. } => {
+                let (raw, cooked, tail) = match tokens.peek_kind() {
+                    TokenKind::Template { raw, cooked, tail } => {
+                        (raw.clone(), cooked.clone(), *tail)
+                    }
+                    _ => unreachable!(),
+                };
+                let tok = tokens.bump();
+                let template = parse_template(tokens, tok.span, raw, cooked, tail)?;
+                let span = Span::new(expr.span().start, template.span().end);
+                *expr = Expr::TaggedTemplate {
+                    span,
+                    tag: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
+                    template: Box::new(template),
+                };
             }
             // Postfix update — restricted production: a line terminator before
             // `++`/`--` forbids it (`x\n++` is not postfix).
@@ -582,6 +708,7 @@ fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic
                 span: Span::new(start.start, tokens.span().start),
                 object: Box::new(Expr::This(start)),
                 property: MemberProp::Ident("target".to_string()),
+                optional: false,
             })));
         }
     }
@@ -606,6 +733,7 @@ fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic
                         span: Span::new(e.span().start, end.start),
                         object: Box::new(e),
                         property: prop,
+                        optional: false,
                     }));
                 }
                 TokenKind::Punctuator(Punctuator::LBracket) => {
@@ -616,6 +744,7 @@ fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic
                         span: Span::new(e.span().start, close.end),
                         object: Box::new(e),
                         property: MemberProp::Computed(Box::new(idx)),
+                        optional: false,
                     }));
                 }
                 _ => break,
@@ -755,6 +884,7 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
             span,
             object: Box::new(Expr::This(span)),
             property: MemberProp::Private(name),
+            optional: false,
         }))),
         TokenKind::Keyword(Keyword::This) => Ok(Expr::This(span)),
         TokenKind::Keyword(Keyword::Super) => Ok(Expr::Super(span)),
@@ -781,10 +911,41 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
             try_parse_async_arrow(tokens, span)
         }
         TokenKind::Keyword(Keyword::Class) => crate::class::parse_class_expr(tokens, span, Vec::new()),
+        TokenKind::Keyword(Keyword::Import) => parse_import_call_or_meta(tokens, span),
         TokenKind::Keyword(Keyword::Undefined) => Ok(Expr::Ident {
             span,
             name: "undefined".to_string(),
         }),
+        // `let` / `static` are contextual keywords — usable as identifier
+        // references in *sloppy* mode (`for (let in obj)`, `let = 1;`). Gated
+        // on the current strict context (directive-prologue strict mode makes
+        // them reserved, so they must not be identifiers there).
+        TokenKind::Keyword(Keyword::Let) if !tokens.current_ctx().is_strict => Ok(Expr::Ident {
+            span,
+            name: "let".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::Static) if !tokens.current_ctx().is_strict => Ok(Expr::Ident {
+            span,
+            name: "static".to_string(),
+        }),
+        // `await`/`yield` are plain identifier references outside async /
+        // generator contexts (sloppy mode).
+        TokenKind::Keyword(Keyword::Await) if !tokens.current_ctx().is_async => Ok(Expr::Ident {
+            span,
+            name: "await".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::Yield) if !tokens.current_ctx().is_generator => Ok(Expr::Ident {
+            span,
+            name: "yield".to_string(),
+        }),
+        // Pure contextual keywords — always usable as identifier references
+        // (`set.add`, `var of`, `obj.from`). They have no reserved-word
+        // meaning outside specific syntactic positions.
+        TokenKind::Keyword(Keyword::Get) => Ok(Expr::Ident { span, name: "get".to_string() }),
+        TokenKind::Keyword(Keyword::Set) => Ok(Expr::Ident { span, name: "set".to_string() }),
+        TokenKind::Keyword(Keyword::Of) => Ok(Expr::Ident { span, name: "of".to_string() }),
+        TokenKind::Keyword(Keyword::From) => Ok(Expr::Ident { span, name: "from".to_string() }),
+        TokenKind::Keyword(Keyword::As) => Ok(Expr::Ident { span, name: "as".to_string() }),
         TokenKind::Punctuator(Punctuator::LParen) => {
             let inner = parse_expression(tokens)?;
             let close = expect_punctuator(tokens, Punctuator::RParen)?;
@@ -803,6 +964,61 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
     }
 }
 
+/// `import` reached in expression position: `import.meta`, a dynamic import
+/// call `import(source)` / `import(source, options)`, or the phase forms
+/// `import.source(...)` / `import.defer(...)`.
+fn parse_import_call_or_meta(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+) -> Result<Expr, Vec<Diagnostic>> {
+    if tokens.eat_punctuator(Punctuator::Dot) {
+        // `import.meta` / `import.source(...)` / `import.defer(...)`.
+        let prop = tokens.bump();
+        return match prop.kind {
+            TokenKind::Ident(name) if name == "meta" => {
+                Ok(Expr::ImportMeta(Span::new(start.start, tokens.span().end)))
+            }
+            TokenKind::Ident(name) if name == "source" => {
+                parse_import_call_tail(tokens, start, ImportPhase::Source)
+            }
+            TokenKind::Ident(name) if name == "defer" => {
+                parse_import_call_tail(tokens, start, ImportPhase::Defer)
+            }
+            other => Err(vec![Diagnostic::error(
+                prop.span,
+                format!("expected `meta`, `source`, or `defer` after `import.`, found {:?}", other),
+            )]),
+        };
+    }
+    parse_import_call_tail(tokens, start, ImportPhase::Eval)
+}
+
+/// Parse `( AssignmentExpression [ , AssignmentExpression ] [,] )` after the
+/// `import` [`phase`] keyword(s).
+fn parse_import_call_tail(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+    phase: ImportPhase,
+) -> Result<Expr, Vec<Diagnostic>> {
+    expect_punctuator(tokens, Punctuator::LParen)?;
+    let source = parse_assignment(tokens)?;
+    let mut options = None;
+    if tokens.eat_punctuator(Punctuator::Comma) {
+        if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+            options = Some(Box::new(parse_assignment(tokens)?));
+        }
+        // Optional trailing comma after the (possibly absent) options argument.
+        tokens.eat_punctuator(Punctuator::Comma);
+    }
+    let close = expect_punctuator(tokens, Punctuator::RParen)?;
+    Ok(Expr::ImportCall {
+        span: Span::new(start.start, close.end),
+        phase,
+        source: Box::new(source),
+        options,
+    })
+}
+
 /// `new` consumed as a primary keyword token (rare; mainly guards re-entry).
 fn parse_new_from_primary(
     tokens: &mut ParserTokenStream,
@@ -816,6 +1032,7 @@ fn parse_new_from_primary(
             span: Span::new(start.start, tokens.span().start),
             object: Box::new(Expr::This(start)),
             property: MemberProp::Ident("target".to_string()),
+            optional: false,
         })));
     }
     parse_new_expr_after_keyword(tokens, start)
@@ -841,6 +1058,7 @@ fn parse_new_expr_after_keyword(
                     span: Span::new(callee.span().start, end.start),
                     object: Box::new(callee),
                     property: prop,
+                    optional: false,
                 }));
             }
             _ => break,
@@ -1103,6 +1321,13 @@ fn parse_property_key(tokens: &mut ParserTokenStream) -> Result<(PropKey, bool),
             let n = js_lexer::parse_number(&raw).unwrap_or(f64::NAN);
             Ok((PropKey::Number(n), false))
         }
+        TokenKind::Bigint(raw) => {
+            tokens.bump();
+            // Property keys may be BigInt literals; store the numeric value
+            // when it fits, else fall back to the raw string key.
+            let n = raw.parse::<f64>().unwrap_or(f64::NAN);
+            Ok((PropKey::Number(n), false))
+        }
         other => Err(vec![Diagnostic::error(
             tokens.span(),
             format!("expected property key, found {:?}", other),
@@ -1148,6 +1373,10 @@ fn parse_template(
     loop {
         let e = parse_expression(tokens)?;
         expressions.push(e);
+        // The lexer emits the substitution-closing `}` as a regular RBrace
+        // (kept separate from the template continuation chunk to avoid
+        // ambiguity with tagged-template literals).
+        expect_punctuator(tokens, Punctuator::RBrace)?;
         let nt = tokens.bump();
         match nt.kind {
             TokenKind::Template { raw, cooked, tail } => {
@@ -1210,14 +1439,16 @@ fn parse_function_expr(
 /// returning its spelling if so (`await` outside async, `yield` outside
 /// generators, the always-contextual words). Strict-mode-only reserved words
 /// (`let`, `static`, …) are excluded (need strict tracking).
-fn keyword_binding_name(kw: Keyword, ctx: crate::token_stream::FnCtx) -> Option<&'static str> {
+pub(crate) fn keyword_binding_name(kw: Keyword, ctx: crate::token_stream::FnCtx) -> Option<&'static str> {
     let allowed = match kw {
         Keyword::Await => !ctx.is_async,
         Keyword::Yield => !ctx.is_generator,
         // `let`/`static` are valid identifiers in sloppy mode, but accepting
-        // them without full directive-prologue strict tracking was net-negative
-        // (rejected valid strict negatives). Deferred until strict mode is
-        // tracked through the directive prologue.
+        // them as *bindings* is net-negative: directive-prologue strict mode
+        // (`"use strict"; var let;`) isn't known at parse time, so doing so
+        // produces false-accepts that outweigh the false-rejects it fixes.
+        // (Expression-position `let` is handled separately in parse_primary /
+        // for-head disambiguation.)
         Keyword::Async | Keyword::Of | Keyword::From | Keyword::As
         | Keyword::Get | Keyword::Set | Keyword::Undefined => true,
         _ => false,

@@ -10,7 +10,7 @@
 //! regex/backtracking disambiguation) are O(1).
 
 use js_diagnostics::Diagnostic;
-use js_lexer::tokenize;
+use js_lexer::{tokenize, Lexer};
 use js_syntax::keyword::Keyword;
 use js_syntax::source::Span;
 use js_syntax::token::{Token, TokenKind};
@@ -38,6 +38,10 @@ pub struct FnCtx {
 }
 
 pub struct ParserTokenStream {
+    /// The raw source, retained so an ambiguous `/` token can be re-lexed under
+    /// the grammar goal the parser demands (see [`Self::reslash_div`] /
+    /// [`Self::reslash_regex`]).
+    src: String,
     /// All non-trivia tokens, each tagged with whether a line terminator
     /// preceded it.
     tokens: Vec<Slot>,
@@ -50,9 +54,10 @@ pub struct ParserTokenStream {
 
 impl ParserTokenStream {
     pub fn new(src: &str) -> ParserTokenStream {
+        let src = src.to_string();
         let mut tokens = Vec::new();
         let mut pending_newline = false;
-        for tok in tokenize(src) {
+        for tok in tokenize(&src) {
             if tok.kind.is_trivia() {
                 if matches!(tok.kind, TokenKind::LineTerminator) {
                     pending_newline = true;
@@ -74,6 +79,7 @@ impl ParserTokenStream {
             preceded_by_newline: pending_newline,
         });
         ParserTokenStream {
+            src,
             tokens,
             pos: 0,
             ctx_stack: vec![FnCtx::default()],
@@ -133,6 +139,14 @@ impl ParserTokenStream {
         self.tokens[self.pos].preceded_by_newline
     }
 
+    /// Whether the token `n` positions ahead of the current one was preceded by
+    /// a line terminator (`0` == current). Used for `[no LineTerminator here]`
+    /// restricted productions like `let` disambiguation.
+    pub(crate) fn preceded_by_newline_at(&self, n: usize) -> bool {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        self.tokens[i].preceded_by_newline
+    }
+
     /// The token *after* the current one.
     pub fn peek2(&self) -> &Token {
         let i = (self.pos + 1).min(self.tokens.len() - 1);
@@ -142,6 +156,12 @@ impl ParserTokenStream {
     /// The token two after the current one (`peek3()`).
     pub fn peek3(&self) -> &Token {
         let i = (self.pos + 2).min(self.tokens.len() - 1);
+        &self.tokens[i].token
+    }
+
+    /// Peek the token `n` positions ahead of the current one (`0` == current).
+    pub fn peek_at(&self, n: usize) -> &Token {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i].token
     }
 
@@ -215,5 +235,91 @@ impl ParserTokenStream {
     /// Restore to a position from [`snapshot`](Self::snapshot).
     pub fn restore(&mut self, snap: usize) {
         self.pos = snap;
+    }
+
+    // ---- regex / division disambiguation (parser-driven re-lex) ------------
+    //
+    // The lexer decides whether a `/` is a regex or the division operator from
+    // the *previous* token (see `Lexer::update_regex_state`). That heuristic is
+    // correct for almost every token — except `}` (which may close a block ⇒
+    // regex follows, or a value-producing object/function expression ⇒ division
+    // follows) and `)` (block-header close ⇒ regex follows, vs. value close ⇒
+    // division). The lexer cannot tell these apart; the parser can.
+    //
+    // Rather than enumerate every value-`}` / header-`)` site (fragile), the
+    // parser re-lexes an ambiguous `/` at the two grammar positions where its
+    // intent is certain: at an *operand* start a `/` is always a regex, and at a
+    // *binary-operator* position a `/` is always division. Both are provably
+    // unambiguous (a division operator never begins an operand; a regex never
+    // serves as a binary operator), so a mis-classified `/` at either point is
+    // always the *other* goal. See `reslash_regex` / `reslash_div`.
+    //
+    // Both re-lex from the `/` *to end of input*: the lexer's only mistake is
+    // this single goal decision, and its downstream `regex_allowed` state
+    // (division ⇒ true, regex ⇒ false) diverges from there, so re-lexing the
+    // whole tail under the corrected goal reproduces exactly the tokenization a
+    // correct lexer would have produced. (Bounded re-lex would be wrong: a
+    // mis-scanned regex can run past a string-literal boundary, and the
+    // division interpretation of those same bytes may extend a string past the
+    // original token's end.)
+
+    /// Re-lex from byte offset `start` to end of input under the given
+    /// regex/division goal, producing non-trivia slots. `first_newline` is the
+    /// line-terminator context inherited by the first slot (preserving ASI).
+    fn lex_tail(&self, start: usize, regex_allowed: bool, first_newline: bool) -> Vec<Slot> {
+        let mut lexer = Lexer::new_at(&self.src, start, regex_allowed);
+        let mut out = Vec::new();
+        let mut pending_newline = first_newline;
+        loop {
+            let tok = lexer.advance_token();
+            if matches!(tok.kind, TokenKind::Eof) {
+                break;
+            }
+            if tok.kind.is_trivia() {
+                if matches!(tok.kind, TokenKind::LineTerminator)
+                    || matches!(tok.kind, TokenKind::Comment { is_block: true, has_newline: true })
+                {
+                    pending_newline = true;
+                }
+                continue;
+            }
+            let nl = std::mem::replace(&mut pending_newline, false);
+            out.push(Slot { token: tok, preceded_by_newline: nl });
+        }
+        out
+    }
+
+    /// The current token is a `/` (division / division-assign) but the parser is
+    /// at an operand start, so it must be a *regex literal*. Re-lex the tail from
+    /// its start under the regex goal, splicing the corrected tokens in place of
+    /// everything from the current position onward.
+    pub(crate) fn reslash_regex(&mut self) {
+        let start = self.tokens[self.pos].token.span.start.to_usize();
+        let first_nl = self.tokens[self.pos].preceded_by_newline;
+        let tail = self.lex_tail(start, true, first_nl);
+        self.splice_tail(tail);
+    }
+
+    /// The current token is a regex literal (or an `Unknown('/')` produced when
+    /// a regex scan ran past valid bounds) but the parser is at a binary-operator
+    /// position, so the `/` must be *division*. Re-lex the tail from its start
+    /// under the division goal, splicing the corrected tokens in.
+    pub(crate) fn reslash_div(&mut self) {
+        let start = self.tokens[self.pos].token.span.start.to_usize();
+        let first_nl = self.tokens[self.pos].preceded_by_newline;
+        let tail = self.lex_tail(start, false, first_nl);
+        self.splice_tail(tail);
+    }
+
+    /// Replace every slot from the current position onward with `tail`, then
+    /// re-append the EOF sentinel.
+    fn splice_tail(&mut self, tail: Vec<Slot>) {
+        let eof_nl = self.tokens.last().map_or(false, |s| s.preceded_by_newline);
+        self.tokens.truncate(self.pos);
+        self.tokens.extend(tail);
+        self.tokens.push(Slot {
+            token: Token::new(TokenKind::Eof, Span::DUMMY),
+            preceded_by_newline: eof_nl,
+        });
     }
 }
