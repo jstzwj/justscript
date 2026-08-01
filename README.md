@@ -47,6 +47,30 @@ acyclic dependencies (`js-syntax` is the leaf, `js-cli` is the root):
 | [`js-engine`](crates/js-engine) | Top-level `Engine` API, execution-mode pipeline. |
 | [`js-cli`](crates/js-cli) | REPL + file runner (`--interpret` / `--jit` / `--aot`). |
 
+### Diagnostics and execution failures
+
+Source identity and locations are retained through the complete pipeline:
+
+```text
+SourceFile -> tokens/AST Span -> DiagnosticReport
+                           \-> bytecode PC-to-Span map
+                                      \-> JsException | EngineFault + stack
+```
+
+The public engine API uses one failure taxonomy:
+
+- `EngineError::Compile` contains source-bound parser, early-error, or bytecode
+  diagnostics.
+- `EngineError::Exception` is an uncaught JavaScript value with its throw site
+  and JavaScript call stack. It is a language completion, not a compiler error.
+- `EngineError::Fault` represents a VM/backend bug or unsupported execution
+  path, also with its source location and stack.
+
+`Engine::run` returns this taxonomy as a `Result`; `Engine::execute` exposes the
+same error through `ExecutionOutcome` for hosts that prefer exhaustive matching.
+The planned multi-module extension is recorded in
+[`docs/multi-module-source-map.md`](docs/multi-module-source-map.md).
+
 ## Usage
 
 ```bash

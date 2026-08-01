@@ -2,8 +2,8 @@
 //! `--mode` flag selecting the execution backend.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use js_diagnostics::{BufferEmitter, Emitter};
-use js_engine::{Engine, EngineConfig, ExecutionMode};
+use js_engine::{Engine, EngineConfig, EngineError, ExecutionMode};
+use js_syntax::ProgramKind;
 
 #[derive(Parser)]
 #[command(
@@ -65,9 +65,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            run_once(&config, &src)
+            run_once(&config, &path, &src)
         }
-        Cmd::Eval { source } => run_once(&config, &source),
+        Cmd::Eval { source } => run_once(&config, "<eval>", &source),
         Cmd::Repl => {
             eprintln!("REPL not implemented yet (skeleton)");
             Ok(())
@@ -78,21 +78,15 @@ fn main() {
         }
     };
 
-    if let Err(diags) = result {
-        let mut buf = BufferEmitter::default();
-        for d in &diags {
-            buf.emit(d, None);
-        }
-        for line in &buf.messages {
-            eprintln!("{line}");
-        }
+    if let Err(error) = result {
+        eprintln!("{error}");
         std::process::exit(1);
     }
 }
 
-fn run_once(config: &EngineConfig, src: &str) -> Result<(), Vec<js_diagnostics::Diagnostic>> {
+fn run_once(config: &EngineConfig, name: &str, src: &str) -> Result<(), EngineError> {
     let mut engine = Engine::new(config.clone());
-    let result = engine.run(src)?;
+    let result = engine.run_named(name, src, ProgramKind::Script)?;
     println!("{:?}", result.value);
     Ok(())
 }

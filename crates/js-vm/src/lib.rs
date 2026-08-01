@@ -8,11 +8,13 @@
 //! opcode semantics land incrementally.
 
 pub mod builtins;
+pub mod error;
 pub mod frame;
 pub mod interp;
 pub mod regex;
 pub mod stack;
 
+pub use error::{EngineFault, JsException, RuntimeError, RuntimeFrame};
 pub use frame::CallFrame;
 pub use interp::{InterpError, Interpreter};
 pub use stack::OperandStack;

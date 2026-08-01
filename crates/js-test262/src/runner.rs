@@ -551,35 +551,51 @@ fn classify_outcome(
     exec: js_engine::ExecOutcome,
     expect: &Option<RuntimeExpect>,
 ) -> RuntimeOutcome {
-    use js_engine::ExecOutcome;
+    use js_engine::{EngineError, ExecutionOutcome};
     match expect {
         Some(RuntimeExpect::CleanRun) => match exec {
-            ExecOutcome::Ok(_) => RuntimeOutcome::Pass,
-            ExecOutcome::Threw(v) => {
-                let name = v.error_name().unwrap_or_else(|| "Error".into());
+            ExecutionOutcome::Completed(_) => RuntimeOutcome::Pass,
+            ExecutionOutcome::Failed(EngineError::Exception(error)) => {
+                let name = error.value.error_name().unwrap_or_else(|| "Error".into());
                 RuntimeOutcome::Fail(format!("threw {name}"))
             }
-            ExecOutcome::CompileError(diags) => RuntimeOutcome::Incomplete(format!(
-                "compile error: {}",
-                diags.first().map(|d| d.message.clone()).unwrap_or_default()
-            )),
-            ExecOutcome::Internal(msg) => RuntimeOutcome::Incomplete(format!("vm: {msg}")),
+            ExecutionOutcome::Failed(EngineError::Compile(report)) => {
+                RuntimeOutcome::Incomplete(format!(
+                    "compile error: {}",
+                    report
+                        .first()
+                        .map(|d| d.message.clone())
+                        .unwrap_or_default()
+                ))
+            }
+            ExecutionOutcome::Failed(EngineError::Fault(error)) => {
+                RuntimeOutcome::Incomplete(format!("vm: {}", error.message))
+            }
         },
         Some(RuntimeExpect::Throws(want)) => match exec {
-            ExecOutcome::Threw(v) => {
-                let got = v.error_name().unwrap_or_else(|| "Error".into());
+            ExecutionOutcome::Failed(EngineError::Exception(error)) => {
+                let got = error.value.error_name().unwrap_or_else(|| "Error".into());
                 if &got == want {
                     RuntimeOutcome::Pass
                 } else {
                     RuntimeOutcome::Fail(format!("expected {want}, threw {got}"))
                 }
             }
-            ExecOutcome::Ok(_) => RuntimeOutcome::Fail(format!("expected {want}, nothing thrown")),
-            ExecOutcome::CompileError(diags) => RuntimeOutcome::Incomplete(format!(
-                "compile error: {}",
-                diags.first().map(|d| d.message.clone()).unwrap_or_default()
-            )),
-            ExecOutcome::Internal(msg) => RuntimeOutcome::Incomplete(format!("vm: {msg}")),
+            ExecutionOutcome::Completed(_) => {
+                RuntimeOutcome::Fail(format!("expected {want}, nothing thrown"))
+            }
+            ExecutionOutcome::Failed(EngineError::Compile(report)) => {
+                RuntimeOutcome::Incomplete(format!(
+                    "compile error: {}",
+                    report
+                        .first()
+                        .map(|d| d.message.clone())
+                        .unwrap_or_default()
+                ))
+            }
+            ExecutionOutcome::Failed(EngineError::Fault(error)) => {
+                RuntimeOutcome::Incomplete(format!("vm: {}", error.message))
+            }
         },
         None => RuntimeOutcome::Skip("not a runtime test".into()),
     }

@@ -7,6 +7,7 @@
 //! recursion.
 
 use crate::frame::{new_cell, CallFrame};
+use crate::{EngineFault, JsException, RuntimeError, RuntimeFrame};
 use js_bytecode::{BytecodeFunction, BytecodeModule, Opcode};
 use js_diagnostics::DiagResult;
 use js_runtime::context::RealmContext;
@@ -143,6 +144,10 @@ pub struct Interpreter {
     /// (a VM bug or an infinite-loop test) terminates as `Internal` instead of
     /// hanging the conformance runner.
     steps: u64,
+    /// Frames already crossed by the currently propagating error. This is
+    /// needed for native callbacks, whose bytecode frames unwind before the
+    /// error returns to the outer dispatch loop.
+    error_trace: Vec<RuntimeFrame>,
 }
 
 /// Hard cap on instructions per program. Generous enough for legitimate
@@ -162,6 +167,7 @@ impl Interpreter {
             natives: default_natives(),
             pending_err: None,
             steps: 0,
+            error_trace: Vec::new(),
         };
         // Install the global builtins (console, Math, Object, JSON, parseInt, …).
         {
@@ -178,10 +184,29 @@ impl Interpreter {
 
     /// Execute a compiled module's top-level function.
     pub fn run_module(&mut self, module: &BytecodeModule) -> Result<Value, InterpError> {
+        self.error_trace.clear();
         let span = module.main.span;
         let frame = CallFrame::new(0, module.main.locals.slot_count(), span);
         self.frames.push(frame);
         self.dispatch(module)
+    }
+
+    /// Execute a module and retain source identity, throw location and the
+    /// JavaScript call stack when execution does not complete normally.
+    pub fn run_module_report(&mut self, module: &BytecodeModule) -> Result<Value, RuntimeError> {
+        match self.run_module(module) {
+            Ok(value) => Ok(value),
+            Err(InterpError::Throw(value)) => Err(RuntimeError::Exception(JsException {
+                value,
+                source: module.source.clone(),
+                stack: std::mem::take(&mut self.error_trace),
+            })),
+            Err(InterpError::Internal(message)) => Err(RuntimeError::Fault(EngineFault::new(
+                message,
+                module.source.clone(),
+                std::mem::take(&mut self.error_trace),
+            ))),
+        }
     }
 
     /// Main dispatch loop: runs instructions until the top-level frame returns.
@@ -192,7 +217,7 @@ impl Interpreter {
             match self.step(module) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(v)) => return Ok(v),
-                Err(e) => match self.handle_exception(e, 0) {
+                Err(e) => match self.handle_exception(module, e, 0) {
                     Ok(()) => {}
                     Err(e) => return Err(e),
                 },
@@ -204,10 +229,27 @@ impl Interpreter {
     /// has an active catch/finally to install; if none, propagate the exception
     /// (return `Err`). `dispatch` uses stop_depth 0; `call_value` uses its
     /// caller-depth target so it never touches the suspended caller frame.
-    fn handle_exception(&mut self, e: InterpError, stop_depth: usize) -> Result<(), InterpError> {
+    fn handle_exception(
+        &mut self,
+        module: &BytecodeModule,
+        e: InterpError,
+        stop_depth: usize,
+    ) -> Result<(), InterpError> {
         let thrown = match e {
             InterpError::Throw(v) => v,
-            other => return Err(other), // internal errors always propagate
+            other => {
+                // Internal errors are never catchable. Capture the intact stack
+                // once before returning it to the host.
+                if self.error_trace.is_empty() {
+                    self.error_trace = self
+                        .frames
+                        .iter()
+                        .rev()
+                        .map(|frame| runtime_frame(module, frame))
+                        .collect();
+                }
+                return Err(other);
+            }
         };
         while self.frames.len() > stop_depth {
             let handler = self.frames.last_mut().unwrap().try_stack.pop();
@@ -215,6 +257,10 @@ impl Interpreter {
                 Some(h) => {
                     let frame = self.frames.last_mut().unwrap();
                     if let Some(catch_pc) = h.catch_pc {
+                        // A catch handles this propagation. Any frames
+                        // accumulated while crossing a native callback no
+                        // longer describe an escaping exception.
+                        self.error_trace.clear();
                         frame.pc = catch_pc as usize;
                         frame.stack.push(thrown);
                         frame.pending_throw = None; // caught
@@ -225,6 +271,8 @@ impl Interpreter {
                     return Ok(());
                 }
                 None => {
+                    let frame = self.frames.last().unwrap();
+                    self.error_trace.push(runtime_frame(module, frame));
                     self.frames.pop(); // no handler here → unwind to caller
                 }
             }
@@ -251,10 +299,11 @@ impl Interpreter {
         let ins = {
             let frame = self.frames.last_mut().unwrap();
             let func = func_ref(module, frame.func_index);
-            match func.code.get(frame.pc) {
+            let pc = frame.pc;
+            match func.code.get(pc) {
                 Some(ins) => {
                     frame.pc += 1;
-                    frame.span = func.span;
+                    frame.span = func.source_span(pc);
                     *ins
                 }
                 None => {
@@ -722,7 +771,7 @@ impl Interpreter {
             match self.step(module) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(_)) => break,
-                Err(e) => match self.handle_exception(e, target) {
+                Err(e) => match self.handle_exception(module, e, target) {
                     Ok(()) => {}             // caught inside the callee
                     Err(e) => return Err(e), // escaped the callee → propagate
                 },
@@ -820,14 +869,23 @@ impl Interpreter {
         }
         // Native (builtin) function: run it and handle the result.
         if let Some(nid) = f.native {
+            // A native call made from `finally` must not erase the stack of an
+            // exception already propagating through that finally block. Give
+            // the native invocation a clean trace, then restore the prior one
+            // only when the native call completes normally.
+            let prior_trace = std::mem::take(&mut self.error_trace);
             // SAFETY: a native call never mutates `self.natives` (the table is
             // fixed after construction), so a `*const` borrow is stable for the
             // call's duration even though `self` is borrowed mutably inside it.
             let nf_ptr: *const dyn NativeFn = self.natives[nid as usize].as_ref();
             let result = unsafe { (&*nf_ptr).call(self, module, this, &f, args) };
             match result {
-                Ok(NativeResult::Value(v)) => self.top().stack.push(v),
+                Ok(NativeResult::Value(v)) => {
+                    self.error_trace = prior_trace;
+                    self.top().stack.push(v)
+                }
                 Ok(NativeResult::ResumeGenerator(gen, arg)) => {
+                    self.error_trace = prior_trace;
                     self.checkout_generator(gen, arg);
                 }
                 Err(e) => self.pending_err = Some(e),
@@ -979,6 +1037,13 @@ fn func_ref<'a>(module: &'a BytecodeModule, index: usize) -> &'a BytecodeFunctio
         &module.main
     } else {
         &module.functions[index - 1]
+    }
+}
+
+fn runtime_frame(module: &BytecodeModule, frame: &CallFrame) -> RuntimeFrame {
+    RuntimeFrame {
+        function: func_ref(module, frame.func_index).name.clone(),
+        span: frame.span,
     }
 }
 
@@ -1545,18 +1610,39 @@ fn obj_as_object(v: &Value) -> Option<&js_runtime::object::JsObject> {
     }
 }
 
-/// Run a module end-to-end, lifting [`InterpError`] into a `DiagResult` error.
+/// Run a module end-to-end, lifting structured runtime failures into the
+/// legacy `DiagResult` shape. New host integrations should prefer
+/// [`Interpreter::run_module_report`] so JavaScript exceptions remain distinct.
 pub fn run(module: &BytecodeModule, ctx: RealmContext) -> DiagResult<Value> {
-    match Interpreter::new(ctx).run_module(module) {
+    match Interpreter::new(ctx).run_module_report(module) {
         Ok(v) => Ok(v),
-        Err(InterpError::Internal(msg)) => Err(vec![js_diagnostics::Diagnostic::error(
-            js_syntax::Span::DUMMY,
-            msg,
-        )]),
-        Err(InterpError::Throw(v)) => Err(vec![js_diagnostics::Diagnostic::error(
-            js_syntax::Span::DUMMY,
-            format!("Uncaught {:?}", v),
-        )]),
+        Err(RuntimeError::Fault(error)) => {
+            let mut diagnostic = js_diagnostics::Diagnostic::new(
+                js_diagnostics::Severity::Bug,
+                error.span(),
+                error.message,
+            )
+            .with_phase(js_diagnostics::DiagnosticPhase::Internal)
+            .with_code("JS-INTERNAL");
+            for frame in error.stack.iter().skip(1) {
+                diagnostic =
+                    diagnostic.with_note(frame.span, format!("called from `{}`", frame.function));
+            }
+            Err(vec![diagnostic])
+        }
+        Err(RuntimeError::Exception(error)) => {
+            let mut diagnostic = js_diagnostics::Diagnostic::error(
+                error.span(),
+                format!("Uncaught {}", to_string(&error.value)),
+            )
+            .with_phase(js_diagnostics::DiagnosticPhase::Runtime)
+            .with_code("JS-RUNTIME");
+            for frame in error.stack.iter().skip(1) {
+                diagnostic =
+                    diagnostic.with_note(frame.span, format!("called from `{}`", frame.function));
+            }
+            Err(vec![diagnostic])
+        }
     }
 }
 

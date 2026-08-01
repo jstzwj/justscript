@@ -10,6 +10,6 @@ pub mod diagnostic;
 pub mod emitter;
 pub mod result;
 
-pub use diagnostic::{Diagnostic, Note, Severity};
+pub use diagnostic::{Diagnostic, DiagnosticPhase, Note, Severity};
 pub use emitter::{render, BufferEmitter, Emitter, StderrEmitter};
-pub use result::{DiagBag, DiagResult};
+pub use result::{DiagBag, DiagResult, DiagnosticReport};

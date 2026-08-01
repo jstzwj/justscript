@@ -20,9 +20,26 @@ use js_syntax::ast::op::{BinOp, UpdateOp};
 use js_syntax::ast::pat::Pat;
 use js_syntax::ast::stmt::{Decl, ForInit, ForTarget, Stmt};
 use js_syntax::ast::{AssignOp, FunctionDecl, Program};
+use js_syntax::SourceFile;
+use std::sync::Arc;
 
 /// Compile a parsed [`Program`] into a [`BytecodeModule`].
 pub fn compile_program(program: &Program) -> DiagResult<BytecodeModule> {
+    compile_program_inner(program, None)
+}
+
+/// Compile a program while retaining its source for runtime diagnostics.
+pub fn compile_program_with_source(
+    program: &Program,
+    source: Arc<SourceFile>,
+) -> DiagResult<BytecodeModule> {
+    compile_program_inner(program, Some(source))
+}
+
+fn compile_program_inner(
+    program: &Program,
+    source: Option<Arc<SourceFile>>,
+) -> DiagResult<BytecodeModule> {
     let mut ctx = CompilerCtx {
         constants: ConstantPool::new(),
         functions: Vec::new(),
@@ -53,12 +70,16 @@ pub fn compile_program(program: &Program) -> DiagResult<BytecodeModule> {
 
     // Top-level completion value: the last expression statement leaves its
     // value on the stack; `Return` pops it (or undefined if empty).
-    main.emit_bare(Opcode::Return);
+    main.emit_bare_at(Opcode::Return, program.span);
 
     if !ctx.errors.is_empty() {
+        for diagnostic in &mut ctx.errors {
+            diagnostic.classify(js_diagnostics::DiagnosticPhase::Compile, "JS-COMPILE");
+        }
         return Err(ctx.errors);
     }
     Ok(BytecodeModule {
+        source,
         constants: ctx.constants,
         main,
         functions: ctx.functions,
@@ -83,6 +104,7 @@ fn compile_block(
 }
 
 fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx, top_level: bool) {
+    let start_pc = func.code.len();
     match stmt {
         Stmt::Empty(_) | Stmt::Debugger(_) => {}
         Stmt::Block { body, .. } => {
@@ -293,9 +315,11 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
             ));
         }
     }
+    func.annotate_since(start_pc, stmt.span());
 }
 
 fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    let start_pc = func.code.len();
     match decl {
         Decl::Var {
             kind: _,
@@ -335,6 +359,7 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             ));
         }
     }
+    func.annotate_since(start_pc, decl.span());
 }
 
 fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
@@ -450,6 +475,7 @@ fn compile_function_value(
         .map(|b| b.spec)
         .collect();
     nested.upvalues = upvalues;
+    nested.annotate_since(0, span);
 
     ctx.scopes.pop();
     ctx.functions[id as usize - 1] = nested;
@@ -591,8 +617,9 @@ fn compile_class_value(
 
     // User constructor body.
     compile_stmt_list_body(&ctor_body, &mut ctor, ctx);
-    ctor.emit_bare(Opcode::LdaUndefined);
-    ctor.emit_bare(Opcode::Return);
+    ctor.emit_bare_at(Opcode::LdaUndefined, span);
+    ctor.emit_bare_at(Opcode::Return, span);
+    ctor.annotate_since(0, span);
 
     let upvalues = ctx
         .scopes
@@ -618,6 +645,7 @@ fn compile_stmt_list_body(body: &[Stmt], func: &mut BytecodeFunction, ctx: &mut 
 }
 
 fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    let start_pc = func.code.len();
     match expr {
         Expr::Lit(lit) => compile_lit(lit, func, ctx),
         Expr::Ident { name, .. } => load_ident(name, func, ctx),
@@ -655,6 +683,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     // ?? — not short-circuited here; fall back to evaluating both.
                     compile_expr(right, func, ctx);
                     func.emit_bare(Opcode::Pop);
+                    func.annotate_since(start_pc, expr.span());
                     return;
                 }
             };
@@ -706,6 +735,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     }
                 }
                 func.emit(Instruction::new(Opcode::NewArray, count));
+                func.annotate_since(start_pc, expr.span());
                 return;
             }
             // Spread path: build incrementally.
@@ -936,6 +966,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     "`yield*` delegation is not supported yet",
                 ));
                 func.emit_bare(Opcode::LdaUndefined);
+                func.annotate_since(start_pc, expr.span());
                 return;
             }
             // Push the value to yield (undefined if no operand), then suspend.
@@ -962,6 +993,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             func.emit_bare(Opcode::LdaUndefined);
         }
     }
+    func.annotate_since(start_pc, expr.span());
 }
 
 fn compile_lit(lit: &Lit, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {

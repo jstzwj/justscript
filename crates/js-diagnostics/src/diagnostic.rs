@@ -2,6 +2,21 @@
 
 use js_syntax::Span;
 
+/// The pipeline stage that produced a diagnostic.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum DiagnosticPhase {
+    /// The producer has not classified this diagnostic yet.
+    #[default]
+    Unspecified,
+    Lex,
+    Parse,
+    EarlyError,
+    Compile,
+    Runtime,
+    Backend,
+    Internal,
+}
+
 /// How severe a diagnostic is.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum Severity {
@@ -25,6 +40,7 @@ pub struct Note {
 #[derive(Clone, Debug, Default)]
 pub struct Diagnostic {
     pub severity: Severity,
+    pub phase: DiagnosticPhase,
     pub span: Span,
     /// A short stable code, e.g. `"E0001"`.
     pub code: Option<String>,
@@ -36,6 +52,7 @@ impl Diagnostic {
     pub fn new(severity: Severity, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
             severity,
+            phase: DiagnosticPhase::Unspecified,
             span,
             code: None,
             message: message.into(),
@@ -54,6 +71,22 @@ impl Diagnostic {
     pub fn with_code(mut self, code: impl Into<String>) -> Diagnostic {
         self.code = Some(code.into());
         self
+    }
+
+    pub fn with_phase(mut self, phase: DiagnosticPhase) -> Diagnostic {
+        self.phase = phase;
+        self
+    }
+
+    /// Assign a phase and general code when the producing layer did not
+    /// already provide more specific classification.
+    pub fn classify(&mut self, phase: DiagnosticPhase, code: &'static str) {
+        if self.phase == DiagnosticPhase::Unspecified {
+            self.phase = phase;
+        }
+        if self.code.is_none() {
+            self.code = Some(code.to_string());
+        }
     }
 
     pub fn with_note(mut self, span: Span, message: impl Into<String>) -> Diagnostic {

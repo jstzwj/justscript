@@ -1,6 +1,6 @@
 //! Diagnostic collection and rendering.
 
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::{Diagnostic, DiagnosticPhase, Severity};
 use js_syntax::{SourceFile, Span};
 
 /// A sink for diagnostics.
@@ -42,15 +42,25 @@ pub fn render(diag: &Diagnostic, source: Option<&SourceFile>) -> String {
     let code = diag
         .code
         .as_deref()
-        .map(|c| format!("[{}] ", c))
+        .map(|c| format!("[{}]", c))
         .unwrap_or_default();
+    let phase = match diag.phase {
+        DiagnosticPhase::Unspecified => "",
+        DiagnosticPhase::Lex => " (lex)",
+        DiagnosticPhase::Parse => " (parse)",
+        DiagnosticPhase::EarlyError => " (early-error)",
+        DiagnosticPhase::Compile => " (compile)",
+        DiagnosticPhase::Runtime => " (runtime)",
+        DiagnosticPhase::Backend => " (backend)",
+        DiagnosticPhase::Internal => " (internal)",
+    };
     let loc = source
         .map(|sf| {
             let (start, _) = sf.span_locs(diag.span);
             format!("{}:{}:{}: ", sf.name, start.line, start.column)
         })
         .unwrap_or_default();
-    let mut out = format!("{}{}: {}{}", loc, sev, code, diag.message);
+    let mut out = format!("{}{}{}{}: {}", loc, sev, code, phase, diag.message);
 
     // Include the covered source text when we have it.
     if let Some(sf) = source {
@@ -61,7 +71,20 @@ pub fn render(diag: &Diagnostic, source: Option<&SourceFile>) -> String {
         }
     }
     for note in &diag.notes {
-        out.push_str(&format!("\n   = note: {}", note.message));
+        let note_loc = source
+            .map(|sf| {
+                let (start, _) = sf.span_locs(note.span);
+                format!("{}:{}:{}: ", sf.name, start.line, start.column)
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("\n   = note: {}{}", note_loc, note.message));
+        if let Some(sf) = source {
+            if !note.span.is_dummy() && !note.span.is_empty() {
+                if let Some(snip) = note.span.snippet(&sf.src) {
+                    out.push_str(&format!("\n   | `{}`", snip));
+                }
+            }
+        }
     }
     out
 }

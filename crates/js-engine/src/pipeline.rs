@@ -2,12 +2,12 @@
 
 use crate::config::{EngineConfig, ExecutionMode};
 use crate::module::CompiledModule;
-use js_bytecode::BytecodeModule;
-use js_diagnostics::DiagResult;
+use js_diagnostics::DiagnosticReport;
 use js_runtime::context::RealmContext;
 use js_runtime::value::Value;
-use js_syntax::ast::Program;
-use js_syntax::ProgramKind;
+use js_syntax::{ProgramKind, SourceFile};
+use std::fmt;
+use std::sync::Arc;
 
 /// Opaque native artifact produced by the JIT/AOT backends.
 #[cfg(any(feature = "jit", feature = "aot"))]
@@ -23,23 +23,45 @@ pub struct RunResult {
     pub mode: ExecutionMode,
 }
 
-/// A structured execution outcome, distinguishing the failure modes the runtime
-/// conformance runner cares about: a parse/compile error (a *front-end* miss),
-/// a real JavaScript throw (a test assertion failure or an *expected* negative
-/// exception), or an internal VM limitation (an unimplemented opcode / VM bug —
-/// not a meaningful pass or fail).
+/// The single failure taxonomy used by every public execution API.
 #[derive(Debug)]
-pub enum ExecOutcome {
-    /// Ran to completion with this value.
-    Ok(Value),
-    /// Parse or bytecode-compile error (front-end rejected the source).
-    CompileError(Vec<js_diagnostics::Diagnostic>),
-    /// A JavaScript `throw` reached the top level (assertion failure, or the
-    /// expected exception of a `negative: runtime` test).
-    Threw(Value),
-    /// The VM could not execute the program (unimplemented feature / VM bug).
-    Internal(String),
+pub enum EngineError {
+    Compile(DiagnosticReport),
+    Exception(js_vm::JsException),
+    Fault(js_vm::EngineFault),
 }
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EngineError::Compile(report) => report.fmt(f),
+            EngineError::Exception(error) => error.fmt(f),
+            EngineError::Fault(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+impl From<js_vm::RuntimeError> for EngineError {
+    fn from(error: js_vm::RuntimeError) -> Self {
+        match error {
+            js_vm::RuntimeError::Exception(error) => EngineError::Exception(error),
+            js_vm::RuntimeError::Fault(error) => EngineError::Fault(error),
+        }
+    }
+}
+
+/// Structured execution outcome for hosts that prefer matching over `Result`.
+/// It carries exactly the same [`EngineError`] used by [`Engine::run`].
+#[derive(Debug)]
+pub enum ExecutionOutcome {
+    Completed(Value),
+    Failed(EngineError),
+}
+
+/// Backwards-compatible type name for the conformance runner and embedders.
+pub type ExecOutcome = ExecutionOutcome;
 
 /// The top-level engine handle.
 pub struct Engine {
@@ -64,29 +86,52 @@ impl Engine {
         &self.config
     }
 
-    /// Parse + compile a source string.
-    pub fn compile(&self, src: &str) -> DiagResult<CompiledModule> {
-        let program = parse(src, ProgramKind::Script)?;
-        let bytecode = js_bytecode::compile_program(&program)?;
-        Ok(CompiledModule::new(bytecode))
+    /// Parse + compile a classic script from an in-memory source.
+    pub fn compile(&self, src: &str) -> Result<CompiledModule, DiagnosticReport> {
+        self.compile_named("<eval>", src, ProgramKind::Script)
+    }
+
+    /// Parse + compile while retaining the source name and syntactic goal.
+    pub fn compile_named(
+        &self,
+        name: impl Into<String>,
+        src: &str,
+        kind: ProgramKind,
+    ) -> Result<CompiledModule, DiagnosticReport> {
+        let source = Arc::new(SourceFile::new(name, Arc::<str>::from(src)));
+        let sess = js_parser::ParseSess::from_shared(source.clone());
+        let program = js_parser::Parser::new(&sess)
+            .parse(kind)
+            .map_err(|diagnostics| DiagnosticReport::new(source.clone(), diagnostics))?;
+        let bytecode = js_bytecode::compile_program_with_source(&program, source.clone())
+            .map_err(|diagnostics| DiagnosticReport::new(source.clone(), diagnostics))?;
+        Ok(CompiledModule::new(source, bytecode))
     }
 
     /// Parse + compile + run.
-    pub fn run(&mut self, src: &str) -> DiagResult<RunResult> {
-        let compiled = self.compile(src)?;
+    pub fn run(&mut self, src: &str) -> Result<RunResult, EngineError> {
+        self.run_named("<eval>", src, ProgramKind::Script)
+    }
+
+    pub fn run_named(
+        &mut self,
+        name: impl Into<String>,
+        src: &str,
+        kind: ProgramKind,
+    ) -> Result<RunResult, EngineError> {
+        let compiled = self
+            .compile_named(name, src, kind)
+            .map_err(EngineError::Compile)?;
         let value = match self.config.mode {
             ExecutionMode::Interpret | ExecutionMode::AstWalk => {
                 let mut interp = js_vm::Interpreter::new(self.ctx_realm_clone());
-                interp.run_module(&compiled.bytecode).map_err(|e| {
-                    vec![js_diagnostics::Diagnostic::error(
-                        js_syntax::Span::DUMMY,
-                        format!("{e}"),
-                    )]
-                })?
+                interp
+                    .run_module_report(&compiled.bytecode)
+                    .map_err(EngineError::from)?
             }
-            ExecutionMode::Jit => self.run_jit(&compiled.bytecode)?,
+            ExecutionMode::Jit => self.run_jit(&compiled)?,
             ExecutionMode::Aot => {
-                self.run_aot(&compiled.bytecode)?;
+                self.run_aot(&compiled)?;
                 Value::undefined()
             }
         };
@@ -104,19 +149,23 @@ impl Engine {
         js_vm::builtins::install_test262_harness(&mut realm.globals);
     }
 
-    /// Parse + compile + execute, returning a structured outcome that separates
-    /// compile errors, JavaScript throws, and internal VM limitations. Drives
-    /// the interpret backend only (JIT/AOT don't run programs yet).
-    pub fn execute(&mut self, src: &str) -> ExecOutcome {
-        let compiled = match self.compile(src) {
-            Ok(c) => c,
-            Err(diags) => return ExecOutcome::CompileError(diags),
-        };
-        let mut interp = js_vm::Interpreter::new(self.ctx_realm_clone());
-        match interp.run_module(&compiled.bytecode) {
-            Ok(v) => ExecOutcome::Ok(v),
-            Err(js_vm::InterpError::Throw(v)) => ExecOutcome::Threw(v),
-            Err(js_vm::InterpError::Internal(msg)) => ExecOutcome::Internal(msg),
+    /// Parse + compile + execute with the same failure taxonomy as [`Self::run`].
+    pub fn execute(&mut self, src: &str) -> ExecutionOutcome {
+        match self.run(src) {
+            Ok(result) => ExecutionOutcome::Completed(result.value),
+            Err(error) => ExecutionOutcome::Failed(error),
+        }
+    }
+
+    pub fn execute_named(
+        &mut self,
+        name: impl Into<String>,
+        src: &str,
+        kind: ProgramKind,
+    ) -> ExecutionOutcome {
+        match self.run_named(name, src, kind) {
+            Ok(result) => ExecutionOutcome::Completed(result.value),
+            Err(error) => ExecutionOutcome::Failed(error),
         }
     }
 
@@ -128,27 +177,24 @@ impl Engine {
         }
     }
 
-    fn run_jit(&self, _module: &BytecodeModule) -> DiagResult<Value> {
+    fn run_jit(&self, compiled: &CompiledModule) -> Result<Value, EngineError> {
         #[cfg(feature = "jit")]
         {
             let compiler = js_codegen::JitCompiler::for_host();
-            let _jit = compiler.compile(_module).map_err(|e| {
-                vec![js_diagnostics::Diagnostic::error(
-                    js_syntax::Span::DUMMY,
-                    format!("{e:?}"),
-                )]
-            })?;
+            let _jit = compiler
+                .compile(&compiled.bytecode)
+                .map_err(|e| self.backend_fault(compiled, format!("{e:?}")))?;
             // TODO: invoke the native entry for `<main>` with a runtime trampoline.
             return Ok(Value::undefined());
         }
         #[cfg(not(feature = "jit"))]
-        Err(vec![js_diagnostics::Diagnostic::error(
-            js_syntax::Span::DUMMY,
+        Err(self.backend_fault(
+            compiled,
             "JIT backend not enabled (rebuild with `--features jit`)",
-        )])
+        ))
     }
 
-    fn run_aot(&self, module: &BytecodeModule) -> DiagResult<()> {
+    fn run_aot(&self, compiled: &CompiledModule) -> Result<(), EngineError> {
         #[cfg(feature = "aot")]
         {
             let triple = self
@@ -157,35 +203,33 @@ impl Engine {
                 .clone()
                 .unwrap_or_else(|| std::env::consts::ARCH.to_string());
             let compiler = js_codegen::AotCompiler::new(triple);
-            let artifact = compiler.compile(module).map_err(|e| {
-                vec![js_diagnostics::Diagnostic::error(
-                    js_syntax::Span::DUMMY,
-                    format!("{e:?}"),
-                )]
-            })?;
-            let _bytes = artifact.finish().map_err(|e| {
-                vec![js_diagnostics::Diagnostic::error(
-                    js_syntax::Span::DUMMY,
-                    format!("{e:?}"),
-                )]
-            })?;
+            let artifact = compiler
+                .compile(&compiled.bytecode)
+                .map_err(|e| self.backend_fault(compiled, format!("{e:?}")))?;
+            let _bytes = artifact
+                .finish()
+                .map_err(|e| self.backend_fault(compiled, format!("{e:?}")))?;
             return Ok(());
         }
         #[cfg(not(feature = "aot"))]
         {
-            let _ = module;
-            Err(vec![js_diagnostics::Diagnostic::error(
-                js_syntax::Span::DUMMY,
+            Err(self.backend_fault(
+                compiled,
                 "AOT backend not enabled (rebuild with `--features aot`)",
-            )])
+            ))
         }
     }
-}
 
-fn parse(src: &str, kind: ProgramKind) -> DiagResult<Program> {
-    match kind {
-        ProgramKind::Script => js_parser::parse_script(src),
-        ProgramKind::Module => js_parser::parse_module(src),
+    fn backend_fault(&self, compiled: &CompiledModule, message: impl Into<String>) -> EngineError {
+        let span = compiled.bytecode.main.span;
+        EngineError::Fault(js_vm::EngineFault::new(
+            message,
+            Some(compiled.source.clone()),
+            vec![js_vm::RuntimeFrame {
+                function: compiled.bytecode.main.name.clone(),
+                span,
+            }],
+        ))
     }
 }
 

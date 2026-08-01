@@ -7,7 +7,7 @@
 use crate::sess::ParseSess;
 use crate::stmt::StmtParser;
 use crate::token_stream::ParserTokenStream;
-use js_diagnostics::DiagResult;
+use js_diagnostics::{DiagResult, DiagnosticPhase};
 use js_syntax::ast::Program;
 use js_syntax::ast::ProgramKind;
 use js_syntax::source::SourceFile;
@@ -39,7 +39,10 @@ impl Parser {
         while !stmt.is_eof() {
             match stmt.parse_program_item() {
                 Ok(item) => body.push(item),
-                Err(diags) => {
+                Err(mut diags) => {
+                    for diagnostic in &mut diags {
+                        diagnostic.classify(DiagnosticPhase::Parse, "JS-PARSE");
+                    }
                     errors.extend(diags);
                     // Error recovery: advance past the failed statement so the
                     // loop always makes progress (otherwise a single bad token
@@ -57,7 +60,10 @@ impl Parser {
 
         // Semantic early errors (strict-mode + spec constraints) — only worth
         // running once the syntactic parse succeeded cleanly.
-        let early = crate::early_errors::check(&program);
+        let mut early = crate::early_errors::check(&program);
+        for diagnostic in &mut early {
+            diagnostic.classify(DiagnosticPhase::EarlyError, "JS-EARLY");
+        }
         if !early.is_empty() {
             return Err(early);
         }

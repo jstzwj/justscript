@@ -3,7 +3,9 @@
 use crate::constant::ConstantPool;
 use crate::local::LocalTable;
 use crate::opcode::Instruction;
+use js_syntax::SourceFile;
 use js_syntax::Span;
+use std::sync::Arc;
 
 /// A compiled description of one captured variable (closure upvalue).
 ///
@@ -28,6 +30,8 @@ pub struct BytecodeFunction {
     pub param_count: u16,
     /// The flat instruction list. Jump operands are indices into this vec.
     pub code: Vec<Instruction>,
+    /// Source span for each instruction in [`Self::code`].
+    pub source_map: Vec<Span>,
     /// Local slot table (names → slot index).
     pub locals: LocalTable,
     /// Upvalue descriptors, in capture order; indexed by `LdaUpvalue`/`StaUpvalue`.
@@ -58,6 +62,7 @@ impl BytecodeFunction {
             name: name.into(),
             param_count,
             code: Vec::new(),
+            source_map: Vec::new(),
             locals: LocalTable::new(param_count),
             upvalues: Vec::new(),
             is_arrow: false,
@@ -68,11 +73,37 @@ impl BytecodeFunction {
 
     pub fn emit(&mut self, ins: Instruction) {
         self.code.push(ins);
+        self.source_map.push(Span::DUMMY);
+    }
+
+    /// Emit an instruction with an explicit source location.
+    pub fn emit_at(&mut self, ins: Instruction, span: Span) {
+        self.code.push(ins);
+        self.source_map.push(span);
     }
 
     /// Emit a bare (no-operand) instruction.
     pub fn emit_bare(&mut self, op: crate::opcode::Opcode) {
         self.emit(Instruction::bare(op));
+    }
+
+    pub fn emit_bare_at(&mut self, op: crate::opcode::Opcode, span: Span) {
+        self.emit_at(Instruction::bare(op), span);
+    }
+
+    /// Associate unannotated instructions emitted since `start_pc` with
+    /// `span`. Nested compiler calls annotate their own instructions first, so
+    /// their more precise spans are preserved.
+    pub fn annotate_since(&mut self, start_pc: usize, span: Span) {
+        for mapped in &mut self.source_map[start_pc..] {
+            if mapped.is_dummy() {
+                *mapped = span;
+            }
+        }
+    }
+
+    pub fn source_span(&self, pc: usize) -> Span {
+        self.source_map.get(pc).copied().unwrap_or(self.span)
     }
 
     /// Current instruction index — useful to backpatch jump targets.
@@ -84,6 +115,8 @@ impl BytecodeFunction {
 /// A compiled module: top-level function + nested functions + shared constants.
 #[derive(Debug, Default)]
 pub struct BytecodeModule {
+    /// The source this module was compiled from, retained for runtime reports.
+    pub source: Option<Arc<SourceFile>>,
     /// Constant pool shared across all functions in the module.
     pub constants: ConstantPool,
     /// The top-level (script-body) function.
@@ -95,6 +128,7 @@ pub struct BytecodeModule {
 impl BytecodeModule {
     pub fn new(constants: ConstantPool, main: BytecodeFunction) -> BytecodeModule {
         BytecodeModule {
+            source: None,
             constants,
             main,
             functions: Vec::new(),
