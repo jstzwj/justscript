@@ -16,6 +16,9 @@ pub struct Cursor<'a> {
     start: usize,
     /// Byte offset of the *start* of the next char to be consumed.
     pos: usize,
+    /// Byte offset immediately after the source. Tracking this separately from
+    /// the lookahead sentinel lets source text contain an actual U+0000.
+    end: usize,
     /// The next char (`peek`), or `EOF_CHAR` at end of input.
     ahead: [char; 2],
 }
@@ -29,6 +32,7 @@ impl<'a> Cursor<'a> {
             chars,
             start: src.as_ptr() as usize,
             pos: 0,
+            end: src.len(),
             ahead: [c0, c1],
         }
     }
@@ -48,6 +52,7 @@ impl<'a> Cursor<'a> {
             chars,
             start: src.as_ptr() as usize,
             pos: byte_offset,
+            end: src.len(),
             ahead: [c0, c1],
         }
     }
@@ -81,7 +86,7 @@ impl<'a> Cursor<'a> {
     /// Whether the cursor is at end of input.
     #[inline]
     pub fn is_eof(&self) -> bool {
-        self.first() == EOF_CHAR
+        self.pos >= self.end
     }
 
     /// Byte offset of [`first`](Self::first) — i.e. of the next char to consume.
@@ -93,7 +98,7 @@ impl<'a> Cursor<'a> {
     /// Consume and return the current char. Advances by one char.
     pub fn bump(&mut self) -> char {
         let c = self.ahead[0];
-        if c != EOF_CHAR {
+        if !self.is_eof() {
             self.pos += c.len_utf8();
             // Slide the lookahead window forward.
             self.ahead[0] = self.ahead[1];
@@ -115,7 +120,7 @@ impl<'a> Cursor<'a> {
 
     /// Consume the next char only if it satisfies `pred`.
     pub fn eat_while<F: Fn(char) -> bool>(&mut self, pred: F) {
-        while pred(self.first()) && self.first() != EOF_CHAR {
+        while !self.is_eof() && pred(self.first()) {
             self.bump();
         }
     }
@@ -149,5 +154,14 @@ mod tests {
         let mut c = Cursor::new("é"); // 2 bytes
         assert_eq!(c.bump(), 'é');
         assert_eq!(c.byte_offset(), BytePos(2));
+    }
+
+    #[test]
+    fn nul_is_source_text_not_eof() {
+        let mut c = Cursor::new("\0x");
+        assert!(!c.is_eof());
+        assert_eq!(c.bump(), '\0');
+        assert_eq!(c.bump(), 'x');
+        assert!(c.is_eof());
     }
 }

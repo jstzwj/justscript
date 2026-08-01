@@ -1,7 +1,10 @@
-//! Minimal test262 frontmatter reader.
+//! Test262 YAML frontmatter reader.
 //!
 //! The test262 frontmatter is a YAML block delimited by `/*---` ... `---*/`.
-//! We don't pull in a YAML crate; we parse just the fields the runner needs.
+//! Unknown fields are intentionally ignored; malformed metadata is reported by
+//! [`FrontMatter::parse_result`] instead of silently changing test semantics.
+
+use serde::Deserialize;
 
 /// The phase of a `negative` test.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,79 +29,60 @@ impl FrontMatter {
     /// Parse the frontmatter out of a test file's source. Returns `None` if no
     /// frontmatter block is present.
     pub fn parse(src: &str) -> Option<FrontMatter> {
-        let start = src.find("/*---")?;
+        Self::parse_result(src).ok().flatten()
+    }
+
+    pub fn parse_result(src: &str) -> Result<Option<FrontMatter>, String> {
+        let Some(start) = src.find("/*---") else {
+            return Ok(None);
+        };
         let after_start = &src[start + "/*---".len()..];
-        let end_rel = after_start.find("---*/")?;
+        let Some(end_rel) = after_start.find("---*/") else {
+            return Err("unterminated test262 frontmatter".into());
+        };
         let body = &after_start[..end_rel];
-
-        let mut fm = FrontMatter::default();
-        let mut in_negative = false;
-        for raw_line in body.lines() {
-            let line = raw_line.trim_end();
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Indentation determines whether we're inside a nested block.
-            let indented = line.starts_with(' ') || line.starts_with('\t');
-
-            if !indented {
-                in_negative = false;
-            }
-
-            let (key, rest) = match trimmed.split_once(':') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => continue,
-            };
-
-            match key {
-                "flags" | "features" | "includes" => {
-                    let items = parse_list(rest);
-                    match key {
-                        "flags" => fm.flags = items,
-                        "features" => fm.features = items,
-                        "includes" => fm.includes = items,
-                        _ => {}
-                    }
-                }
-                "negative" => {
-                    in_negative = true;
-                }
-                "phase" if in_negative => {
-                    fm.negative_phase = Some(match rest {
-                        "parse" => NegativePhase::Parse,
-                        "early" => NegativePhase::Early,
-                        "resolution" => NegativePhase::Resolution,
-                        "runtime" => NegativePhase::Runtime,
-                        other => NegativePhase::Other(other.to_string()),
-                    });
-                }
-                "type" if in_negative => {
-                    fm.negative_type = Some(strip_quotes(rest));
-                }
-                _ => {}
-            }
-        }
-        Some(fm)
+        let raw: RawFrontMatter = serde_yaml::from_str(body).map_err(|e| e.to_string())?;
+        let (negative_phase, negative_type) = match raw.negative {
+            Some(n) => (n.phase.map(NegativePhase::from), n.kind),
+            None => (None, None),
+        };
+        Ok(Some(FrontMatter {
+            flags: raw.flags,
+            features: raw.features,
+            includes: raw.includes,
+            negative_phase,
+            negative_type,
+        }))
     }
 }
 
-fn parse_list(s: &str) -> Vec<String> {
-    let s = s.trim();
-    let s = s.strip_prefix('[').unwrap_or(s);
-    let s = s.strip_suffix(']').unwrap_or(s);
-    s.split(',')
-        .map(|p| strip_quotes(p.trim()))
-        .filter(|p| !p.is_empty())
-        .collect()
+#[derive(Default, Deserialize)]
+struct RawFrontMatter {
+    #[serde(default)]
+    flags: Vec<String>,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    includes: Vec<String>,
+    negative: Option<RawNegative>,
 }
 
-fn strip_quotes(s: &str) -> String {
-    let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+#[derive(Deserialize)]
+struct RawNegative {
+    phase: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+impl From<String> for NegativePhase {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "parse" => NegativePhase::Parse,
+            "early" => NegativePhase::Early,
+            "resolution" => NegativePhase::Resolution,
+            "runtime" => NegativePhase::Runtime,
+            _ => NegativePhase::Other(value),
+        }
     }
 }
 
@@ -113,5 +97,15 @@ mod tests {
         assert_eq!(fm.flags, vec!["module".to_string()]);
         assert_eq!(fm.negative_phase, Some(NegativePhase::Parse));
         assert_eq!(fm.negative_type.as_deref(), Some("SyntaxError"));
+    }
+
+    #[test]
+    fn parses_multiline_lists() {
+        let src =
+            "/*---\nflags:\n  - onlyStrict\nincludes:\n  - assert.js\nfeatures:\n  - Symbol\n---*/";
+        let fm = FrontMatter::parse_result(src).unwrap().unwrap();
+        assert_eq!(fm.flags, ["onlyStrict"]);
+        assert_eq!(fm.includes, ["assert.js"]);
+        assert_eq!(fm.features, ["Symbol"]);
     }
 }

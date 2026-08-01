@@ -61,7 +61,13 @@ impl ParserTokenStream {
             if tok.kind.is_trivia() {
                 if matches!(tok.kind, TokenKind::LineTerminator) {
                     pending_newline = true;
-                } else if matches!(tok.kind, TokenKind::Comment { is_block: true, has_newline: true }) {
+                } else if matches!(
+                    tok.kind,
+                    TokenKind::Comment {
+                        is_block: true,
+                        has_newline: true
+                    }
+                ) {
                     // A block comment containing a line terminator acts as one.
                     pending_newline = true;
                 }
@@ -100,6 +106,13 @@ impl ParserTokenStream {
         self.ctx_stack.last().copied().unwrap_or_default()
     }
 
+    /// Whether statements are currently being parsed inside a function body.
+    /// The bottom context represents the script/module body; every additional
+    /// frame is installed before parsing a function, method, or arrow body.
+    pub fn in_function(&self) -> bool {
+        self.ctx_stack.len() > 1
+    }
+
     /// Push a new function context (entered a function/arrow/method body).
     pub fn push_ctx(&mut self, ctx: FnCtx) {
         self.ctx_stack.push(ctx);
@@ -108,12 +121,20 @@ impl ParserTokenStream {
     /// Enter a function body, inheriting strict-ness from the enclosing context.
     pub fn enter_fn(&mut self, is_async: bool, is_generator: bool) {
         let is_strict = self.current_ctx().is_strict;
-        self.ctx_stack.push(FnCtx { is_async, is_generator, is_strict });
+        self.ctx_stack.push(FnCtx {
+            is_async,
+            is_generator,
+            is_strict,
+        });
     }
 
     /// Enter a class-member body (class elements are always strict-mode).
     pub fn enter_strict_fn(&mut self, is_async: bool, is_generator: bool) {
-        self.ctx_stack.push(FnCtx { is_async, is_generator, is_strict: true });
+        self.ctx_stack.push(FnCtx {
+            is_async,
+            is_generator,
+            is_strict: true,
+        });
     }
 
     /// Pop a function context (must match a prior `push_ctx`).
@@ -145,6 +166,33 @@ impl ParserTokenStream {
     pub(crate) fn preceded_by_newline_at(&self, n: usize) -> bool {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         self.tokens[i].preceded_by_newline
+    }
+
+    /// Whether the current identifier/keyword token was written using a
+    /// Unicode escape. Contextual grammar terminals such as class `static` and
+    /// method `async` must be present literally even though both spellings have
+    /// the same cooked token value.
+    pub(crate) fn current_token_contains_escape(&self) -> bool {
+        self.token_span_contains_escape(self.tokens[self.pos].token.span)
+    }
+
+    /// Whether the token `n` positions ahead is the literal spelling of a
+    /// keyword terminal. Contextual grammar terminals do not match when any of
+    /// their source characters are supplied by a Unicode escape.
+    pub(crate) fn is_unescaped_keyword_at(&self, n: usize, keyword: Keyword) -> bool {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        matches!(self.tokens[i].token.kind, TokenKind::Keyword(k) if k == keyword)
+            && !self.token_span_contains_escape(self.tokens[i].token.span)
+    }
+
+    /// The same raw-spelling check for a token that has already been consumed.
+    pub(crate) fn token_span_contains_escape(&self, span: js_syntax::Span) -> bool {
+        span.snippet(&self.src)
+            .is_some_and(|raw| raw.contains('\\'))
+    }
+
+    pub(crate) fn token_span_snippet(&self, span: js_syntax::Span) -> Option<&str> {
+        span.snippet(&self.src)
     }
 
     /// The token *after* the current one.
@@ -277,14 +325,23 @@ impl ParserTokenStream {
             }
             if tok.kind.is_trivia() {
                 if matches!(tok.kind, TokenKind::LineTerminator)
-                    || matches!(tok.kind, TokenKind::Comment { is_block: true, has_newline: true })
+                    || matches!(
+                        tok.kind,
+                        TokenKind::Comment {
+                            is_block: true,
+                            has_newline: true
+                        }
+                    )
                 {
                     pending_newline = true;
                 }
                 continue;
             }
             let nl = std::mem::replace(&mut pending_newline, false);
-            out.push(Slot { token: tok, preceded_by_newline: nl });
+            out.push(Slot {
+                token: tok,
+                preceded_by_newline: nl,
+            });
         }
         out
     }

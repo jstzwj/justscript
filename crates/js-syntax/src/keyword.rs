@@ -52,6 +52,7 @@ pub enum Keyword {
     Async,
     Await,
     Yield,
+    Enum,
     // Modifiers
     Static,
     Get,
@@ -106,6 +107,7 @@ impl Keyword {
         ("async", Keyword::Async),
         ("await", Keyword::Await),
         ("yield", Keyword::Yield),
+        ("enum", Keyword::Enum),
         ("static", Keyword::Static),
         ("get", Keyword::Get),
         ("set", Keyword::Set),

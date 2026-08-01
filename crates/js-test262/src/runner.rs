@@ -2,10 +2,64 @@
 //! and aggregates results.
 
 use crate::frontmatter::{FrontMatter, NegativePhase};
+use serde::Serialize;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Variant {
+    Sloppy,
+    Strict,
+    Module,
+    Raw,
+}
+
+impl Variant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Sloppy => "sloppy",
+            Variant::Strict => "strict",
+            Variant::Module => "module",
+            Variant::Raw => "raw",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sloppy" => Some(Variant::Sloppy),
+            "strict" => Some(Variant::Strict),
+            "module" => Some(Variant::Module),
+            "raw" => Some(Variant::Raw),
+            _ => None,
+        }
+    }
+
+    fn source<'a>(self, src: &'a str) -> Cow<'a, str> {
+        match self {
+            Variant::Strict => Cow::Owned(format!("\"use strict\";\n{src}")),
+            _ => Cow::Borrowed(src),
+        }
+    }
+}
+
+pub fn variants(fm: &FrontMatter) -> Vec<Variant> {
+    if fm.flags.iter().any(|f| f == "module") {
+        vec![Variant::Module]
+    } else if fm.flags.iter().any(|f| f == "raw") {
+        vec![Variant::Raw]
+    } else if fm.flags.iter().any(|f| f == "onlyStrict") {
+        vec![Variant::Strict]
+    } else if fm.flags.iter().any(|f| f == "noStrict") {
+        vec![Variant::Sloppy]
+    } else {
+        vec![Variant::Sloppy, Variant::Strict]
+    }
+}
+
 /// What we expect the parser to do for a given test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Expect {
     /// Source must parse without error.
     Ok,
@@ -16,29 +70,37 @@ pub enum Expect {
 }
 
 /// The outcome for a single test.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
 pub enum Outcome {
     /// Expectation met.
     Pass,
     /// Expectation violated — an actionable result.
     Fail { reason: String },
-    /// Skipped (early-error, or unsupported flag).
+    /// The parser or runner could not produce a meaningful conformance result.
+    Incomplete { reason: String },
+    /// Skipped because the case is outside the selected phase.
     Skip(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TestResult {
     pub path: PathBuf,
+    pub variant: Variant,
+    pub features: Vec<String>,
     pub expect: Expect,
     pub outcome: Outcome,
 }
 
 /// Aggregated statistics.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 pub struct Stats {
+    pub files: usize,
+    /// Number of strict/sloppy/module/raw variants that were judged.
     pub total: usize,
     pub pass: usize,
     pub fail: usize,
+    pub incomplete: usize,
     pub skip: usize,
     /// False accepts: we returned Ok but the test demanded a parse error.
     pub false_accept: usize,
@@ -46,103 +108,128 @@ pub struct Stats {
     pub false_reject: usize,
 }
 
-/// Walk `root`, classify and run every `.js` test, returning per-test results
-/// and aggregate stats. `prefix` is stripped from reported paths for brevity.
+/// Walk `root`, expand each file into its Test262 variants, and run the parser.
 pub fn run(root: &Path) -> (Vec<TestResult>, Stats) {
     let mut results = Vec::new();
     let mut stats = Stats::default();
     let mut files: Vec<PathBuf> = Vec::new();
     collect_js(root, &mut files);
     files.sort();
-    stats.total = files.len();
+    stats.files = files.len();
 
     for path in files {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
                 stats.skip += 1;
+                stats.total += 1;
                 results.push(TestResult {
                     path,
+                    variant: Variant::Sloppy,
+                    features: Vec::new(),
                     expect: Expect::Skip,
                     outcome: Outcome::Skip("unreadable".into()),
                 });
                 continue;
             }
         };
-        let fm = FrontMatter::parse(&src);
-        let expect = classify(&fm);
-
-        let outcome = match expect {
-            Expect::Skip => {
-                stats.skip += 1;
-                Outcome::Skip("early-error phase (not implemented)".into())
-            }
-            Expect::Ok | Expect::Err => {
-                let is_module = fm.as_ref().map(|f| f.flags.contains(&"module".to_string())).unwrap_or(false);
-                // Run parsing under catch_unwind so a panic in one test (e.g. a
-                // parser bug) is recorded instead of aborting the whole run.
-                let parse_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if is_module {
-                        js_parser::parse_module(&src)
-                    } else {
-                        js_parser::parse(&src)
-                    }
-                }));
-                // `parse_ok` + the first diagnostic message (for false-reject
-                // root-cause clustering in the CLI).
-                let (parse_ok, reason): (bool, String) = match parse_res {
-                    Ok(Ok(_)) => (true, String::new()),
-                    Ok(Err(diags)) => {
-                        let msg = diags
-                            .first()
-                            .map(|d| d.message.clone())
-                            .unwrap_or_else(|| "(no diagnostic)".into());
-                        (false, msg)
-                    }
-                    Err(_) => (false, "parser PANICKED".into()),
-                };
-                match (expect, parse_ok) {
-                    (Expect::Ok, true) | (Expect::Err, false) => {
-                        stats.pass += 1;
-                        Outcome::Pass
-                    }
-                    (Expect::Ok, false) => {
-                        stats.fail += 1;
-                        stats.false_reject += 1;
-                        Outcome::Fail {
-                            reason: format!("parse Err: {}", reason),
-                        }
-                    }
-                    (Expect::Err, true) => {
-                        stats.fail += 1;
-                        stats.false_accept += 1;
-                        Outcome::Fail {
-                            reason: "expected parse Err (invalid syntax), got Ok".into(),
-                        }
-                    }
-                    (Expect::Skip, _) => unreachable!(),
-                }
+        let fm = match FrontMatter::parse_result(&src) {
+            Ok(fm) => fm.unwrap_or_default(),
+            Err(reason) => {
+                stats.total += 1;
+                stats.incomplete += 1;
+                results.push(TestResult {
+                    path,
+                    variant: Variant::Sloppy,
+                    features: Vec::new(),
+                    expect: Expect::Skip,
+                    outcome: Outcome::Incomplete {
+                        reason: format!("metadata: {reason}"),
+                    },
+                });
+                continue;
             }
         };
-
-        results.push(TestResult {
-            path,
-            expect,
-            outcome,
-        });
+        let expect = classify(&fm);
+        for variant in variants(&fm) {
+            stats.total += 1;
+            let outcome = run_parse_variant(&src, variant, expect, &mut stats);
+            results.push(TestResult {
+                path: path.clone(),
+                variant,
+                features: fm.features.clone(),
+                expect,
+                outcome,
+            });
+        }
     }
 
     (results, stats)
 }
 
-fn classify(fm: &Option<FrontMatter>) -> Expect {
-    match fm {
-        None => Expect::Ok,
-        Some(f) => match &f.negative_phase {
-            Some(NegativePhase::Parse) => Expect::Err,
-            Some(NegativePhase::Early) => Expect::Skip,
-            _ => Expect::Ok,
-        },
+fn run_parse_variant(src: &str, variant: Variant, expect: Expect, stats: &mut Stats) -> Outcome {
+    if expect == Expect::Skip {
+        stats.skip += 1;
+        return Outcome::Skip("not a parse-phase test".into());
+    }
+    let source = variant.source(src);
+    let parse_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if variant == Variant::Module {
+            js_parser::parse_module(&source)
+        } else {
+            js_parser::parse(&source)
+        }
+    }));
+    let parse_ok = match parse_res {
+        Ok(Ok(_)) => true,
+        Ok(Err(diags)) => {
+            let reason = diags
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "(no diagnostic)".into());
+            return match expect {
+                Expect::Err => {
+                    stats.pass += 1;
+                    Outcome::Pass
+                }
+                Expect::Ok => {
+                    stats.fail += 1;
+                    stats.false_reject += 1;
+                    Outcome::Fail {
+                        reason: format!("parse Err: {reason}"),
+                    }
+                }
+                Expect::Skip => unreachable!(),
+            };
+        }
+        Err(_) => {
+            stats.incomplete += 1;
+            return Outcome::Incomplete {
+                reason: "parser PANICKED".into(),
+            };
+        }
+    };
+    debug_assert!(parse_ok);
+    match expect {
+        Expect::Ok => {
+            stats.pass += 1;
+            Outcome::Pass
+        }
+        Expect::Err => {
+            stats.fail += 1;
+            stats.false_accept += 1;
+            Outcome::Fail {
+                reason: "expected parse Err (invalid syntax), got Ok".into(),
+            }
+        }
+        Expect::Skip => unreachable!(),
+    }
+}
+
+fn classify(fm: &FrontMatter) -> Expect {
+    match &fm.negative_phase {
+        Some(NegativePhase::Parse | NegativePhase::Early) => Expect::Err,
+        _ => Expect::Ok,
     }
 }
 
@@ -160,7 +247,12 @@ fn collect_js(dir: &Path, out: &mut Vec<PathBuf>) {
                 continue;
             }
             collect_js(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+        } else if path.extension().and_then(|e| e.to_str()) == Some("js")
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_FIXTURE.js"))
+        {
             out.push(path);
         }
     }
@@ -169,7 +261,8 @@ fn collect_js(dir: &Path, out: &mut Vec<PathBuf>) {
 // ---- runtime (execution) phase -------------------------------------------
 
 /// A runtime-phase expectation derived from the frontmatter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", content = "error", rename_all = "lowercase")]
 pub enum RuntimeExpect {
     /// Run to completion without throwing.
     CleanRun,
@@ -178,8 +271,10 @@ pub enum RuntimeExpect {
 }
 
 /// Aggregated runtime statistics.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 pub struct RuntimeStats {
+    pub files: usize,
+    /// Number of expanded Test262 variants.
     pub total: usize,
     /// Tests that were actually executed (not skipped up front).
     pub executed: usize,
@@ -192,14 +287,17 @@ pub struct RuntimeStats {
 }
 
 /// Per-test runtime outcome.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RuntimeResult {
     pub path: PathBuf,
+    pub variant: Variant,
+    pub features: Vec<String>,
     pub expect: Option<RuntimeExpect>,
     pub outcome: RuntimeOutcome,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", content = "reason", rename_all = "lowercase")]
 pub enum RuntimeOutcome {
     Pass,
     Fail(String),
@@ -224,44 +322,63 @@ pub fn run_runtime(root: &Path) -> (Vec<RuntimeResult>, RuntimeStats) {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_js(&root, &mut files);
     files.sort();
-    stats.total = files.len();
+    stats.files = files.len();
 
     for path in files {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
                 stats.skip += 1;
+                stats.total += 1;
                 results.push(RuntimeResult {
                     path,
+                    variant: Variant::Sloppy,
+                    features: Vec::new(),
                     expect: None,
                     outcome: RuntimeOutcome::Skip("unreadable".into()),
                 });
                 continue;
             }
         };
-        let fm = FrontMatter::parse(&src);
-        let (expect, skip_reason) = classify_runtime(&fm);
-        let outcome = match skip_reason {
-            Some(reason) => {
-                stats.skip += 1;
-                RuntimeOutcome::Skip(reason)
-            }
-            None => {
-                stats.executed += 1;
-                spawn_execute_one(&exe, &root, &path)
+        let fm = match FrontMatter::parse_result(&src) {
+            Ok(fm) => fm.unwrap_or_default(),
+            Err(reason) => {
+                stats.total += 1;
+                stats.incomplete += 1;
+                results.push(RuntimeResult {
+                    path,
+                    variant: Variant::Sloppy,
+                    features: Vec::new(),
+                    expect: None,
+                    outcome: RuntimeOutcome::Incomplete(format!("metadata: {reason}")),
+                });
+                continue;
             }
         };
-        match &outcome {
-            RuntimeOutcome::Pass => stats.pass += 1,
-            RuntimeOutcome::Fail(_) => stats.fail += 1,
-            RuntimeOutcome::Incomplete(_) => stats.incomplete += 1,
-            RuntimeOutcome::Skip(_) => {}
+        let (expect, skip_reason) = classify_runtime(&Some(fm.clone()));
+        for variant in variants(&fm) {
+            stats.total += 1;
+            let outcome = match &skip_reason {
+                Some(reason) => RuntimeOutcome::Skip(reason.clone()),
+                None => {
+                    stats.executed += 1;
+                    spawn_execute_one(&exe, &root, &path, variant)
+                }
+            };
+            match &outcome {
+                RuntimeOutcome::Pass => stats.pass += 1,
+                RuntimeOutcome::Fail(_) => stats.fail += 1,
+                RuntimeOutcome::Incomplete(_) => stats.incomplete += 1,
+                RuntimeOutcome::Skip(_) => stats.skip += 1,
+            }
+            results.push(RuntimeResult {
+                path: path.clone(),
+                variant,
+                features: fm.features.clone(),
+                expect: expect.clone(),
+                outcome,
+            });
         }
-        results.push(RuntimeResult {
-            path,
-            expect,
-            outcome,
-        });
     }
 
     (results, stats)
@@ -270,7 +387,7 @@ pub fn run_runtime(root: &Path) -> (Vec<RuntimeResult>, RuntimeStats) {
 /// Spawn `<exe> execute-one <root> <relpath>` with a per-test timeout, and parse
 /// its single-line outcome. A crash, timeout, or malformed reply is an
 /// `Incomplete` — never a panic in the parent.
-fn spawn_execute_one(exe: &Path, root: &Path, path: &Path) -> RuntimeOutcome {
+fn spawn_execute_one(exe: &Path, root: &Path, path: &Path, variant: Variant) -> RuntimeOutcome {
     let relpath = match path.strip_prefix(root) {
         Ok(r) => r.to_path_buf(),
         Err(_) => path.to_path_buf(),
@@ -279,6 +396,7 @@ fn spawn_execute_one(exe: &Path, root: &Path, path: &Path) -> RuntimeOutcome {
     cmd.arg("execute-one")
         .arg(root)
         .arg(&relpath)
+        .arg(variant.as_str())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -374,7 +492,10 @@ pub fn classify_runtime(fm: &Option<FrontMatter>) -> (Option<RuntimeExpect>, Opt
             return (None, Some("early-error negative (not implemented)".into()))
         }
         Some(NegativePhase::Resolution) => {
-            return (None, Some("resolution-phase negative (module linker)".into()))
+            return (
+                None,
+                Some("resolution-phase negative (module linker)".into()),
+            )
         }
         _ => {}
     }
@@ -383,8 +504,7 @@ pub fn classify_runtime(fm: &Option<FrontMatter>) -> (Option<RuntimeExpect>, Opt
         match flag.as_str() {
             "module" => return (None, Some("module (no linker)".into())),
             "async" => return (None, Some("async (no Promise scheduling)".into())),
-            "raw" => return (None, Some("raw harness flag".into())),
-            "onlyStrict" | "noStrict" => { /* handled below via a second pass */ }
+            "raw" | "onlyStrict" | "noStrict" => {}
             _ => {}
         }
     }
@@ -408,11 +528,18 @@ pub fn classify_runtime(fm: &Option<FrontMatter>) -> (Option<RuntimeExpect>, Opt
 /// installed (in this process). A panic is caught and surfaced as `Incomplete`.
 /// Stack-overflow / OOM aborts cannot be caught here — the runtime runner calls
 /// this inside a dedicated child process so such crashes are isolated.
-pub fn execute_test_source(src: &str, expect: &Option<RuntimeExpect>) -> RuntimeOutcome {
+pub fn execute_test_source(
+    src: &str,
+    expect: &Option<RuntimeExpect>,
+    variant: Variant,
+) -> RuntimeOutcome {
+    let source = variant.source(src);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = js_engine::Engine::default_interpreter();
-        engine.install_test262_harness();
-        engine.execute(src)
+        if variant != Variant::Raw {
+            engine.install_test262_harness();
+        }
+        engine.execute(&source)
     }));
     match outcome {
         Ok(exec) => classify_outcome(exec, expect),
@@ -420,7 +547,10 @@ pub fn execute_test_source(src: &str, expect: &Option<RuntimeExpect>) -> Runtime
     }
 }
 
-fn classify_outcome(exec: js_engine::ExecOutcome, expect: &Option<RuntimeExpect>) -> RuntimeOutcome {
+fn classify_outcome(
+    exec: js_engine::ExecOutcome,
+    expect: &Option<RuntimeExpect>,
+) -> RuntimeOutcome {
     use js_engine::ExecOutcome;
     match expect {
         Some(RuntimeExpect::CleanRun) => match exec {
@@ -444,9 +574,7 @@ fn classify_outcome(exec: js_engine::ExecOutcome, expect: &Option<RuntimeExpect>
                     RuntimeOutcome::Fail(format!("expected {want}, threw {got}"))
                 }
             }
-            ExecOutcome::Ok(_) => {
-                RuntimeOutcome::Fail(format!("expected {want}, nothing thrown"))
-            }
+            ExecOutcome::Ok(_) => RuntimeOutcome::Fail(format!("expected {want}, nothing thrown")),
             ExecOutcome::CompileError(diags) => RuntimeOutcome::Incomplete(format!(
                 "compile error: {}",
                 diags.first().map(|d| d.message.clone()).unwrap_or_default()
@@ -454,5 +582,50 @@ fn classify_outcome(exec: js_engine::ExecOutcome, expect: &Option<RuntimeExpect>
             ExecOutcome::Internal(msg) => RuntimeOutcome::Incomplete(format!("vm: {msg}")),
         },
         None => RuntimeOutcome::Skip("not a runtime test".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fm(flags: &[&str]) -> FrontMatter {
+        FrontMatter {
+            flags: flags.iter().map(|f| f.to_string()).collect(),
+            ..FrontMatter::default()
+        }
+    }
+
+    #[test]
+    fn expands_test262_variants() {
+        assert_eq!(variants(&fm(&[])), [Variant::Sloppy, Variant::Strict]);
+        assert_eq!(variants(&fm(&["onlyStrict"])), [Variant::Strict]);
+        assert_eq!(variants(&fm(&["noStrict"])), [Variant::Sloppy]);
+        assert_eq!(variants(&fm(&["module"])), [Variant::Module]);
+        assert_eq!(variants(&fm(&["raw"])), [Variant::Raw]);
+    }
+
+    #[test]
+    fn early_phase_is_a_parse_error_expectation() {
+        let metadata = FrontMatter {
+            negative_phase: Some(NegativePhase::Early),
+            ..FrontMatter::default()
+        };
+        assert_eq!(classify(&metadata), Expect::Err);
+    }
+
+    #[test]
+    fn fixture_files_are_not_collected() {
+        let dir = std::env::temp_dir().join(format!("justscript-test262-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("case.js"), "").unwrap();
+        std::fs::write(dir.join("dep_FIXTURE.js"), "").unwrap();
+
+        let mut files = Vec::new();
+        collect_js(&dir, &mut files);
+        assert_eq!(files, [dir.join("case.js")]);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

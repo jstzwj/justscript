@@ -29,10 +29,10 @@ enum Ast {
     NotWordBoundary,                // \B
     Concat(Vec<Ast>),
     Alt(Vec<Ast>),
-    Star(Box<Ast>, bool),           // greedy?
+    Star(Box<Ast>, bool), // greedy?
     Plus(Box<Ast>, bool),
     Quest(Box<Ast>, bool),
-    Group(Box<Ast>, usize),         // (capturing group number; 0 = non-capturing)
+    Group(Box<Ast>, usize), // (capturing group number; 0 = non-capturing)
     /// `(?=)`/`(?!)`/`(?<=)`/`(?<!)`: `(ahead, positive)`.
     Look(Box<Ast>, bool, bool),
     /// `\1` / `\k<name>`: backreference to a numbered capture group.
@@ -46,10 +46,10 @@ pub enum Insn {
     Char(char),
     Class(Vec<(char, char)>, bool),
     Dot,
-    Start,   // ^ (checks position)
-    End,     // $ (checks position)
-    WordB,   // \b
-    NotWordB,// \B
+    Start,    // ^ (checks position)
+    End,      // $ (checks position)
+    WordB,    // \b
+    NotWordB, // \B
     Jmp(usize),
     Split(usize, usize),
     Save(usize),
@@ -88,9 +88,9 @@ impl RegexMatch {
 
     /// Text of a capture group (group 0 = whole match), if it participated.
     pub fn group<'a>(&self, input: &'a str, n: usize) -> Option<&'a str> {
-        self.captures.get(n).and_then(|c| {
-            c.and_then(|(s, e)| input.get(s..e))
-        })
+        self.captures
+            .get(n)
+            .and_then(|c| c.and_then(|(s, e)| input.get(s..e)))
     }
 }
 
@@ -106,7 +106,12 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn parse(pattern: &'a str) -> Result<(Ast, usize, Vec<(String, usize)>), String> {
         let chars: Vec<char> = pattern.chars().collect();
-        let mut p = Parser { chars: &chars, pos: 0, group_count: 0, names: Vec::new() };
+        let mut p = Parser {
+            chars: &chars,
+            pos: 0,
+            group_count: 0,
+            names: Vec::new(),
+        };
         let ast = p.parse_alt()?;
         if p.pos < p.chars.len() {
             return Err(format!("unexpected '{}' at {}", p.chars[p.pos], p.pos));
@@ -114,14 +119,24 @@ impl<'a> Parser<'a> {
         Ok((ast, p.group_count, p.names))
     }
 
-    fn peek(&self) -> Option<char> { self.chars.get(self.pos).copied() }
-    fn peek2(&self) -> Option<char> { self.chars.get(self.pos + 1).copied() }
-    fn bump(&mut self) -> Option<char> { let c = self.peek()?; self.pos += 1; Some(c) }
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+    fn peek2(&self) -> Option<char> {
+        self.chars.get(self.pos + 1).copied()
+    }
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += 1;
+        Some(c)
+    }
 
     /// alternation: concat ('|' concat)*
     fn parse_alt(&mut self) -> Result<Ast, String> {
         let first = self.parse_concat()?;
-        if self.peek() != Some('|') { return Ok(first); }
+        if self.peek() != Some('|') {
+            return Ok(first);
+        }
         let mut alts = vec![first];
         while self.peek() == Some('|') {
             self.bump();
@@ -139,24 +154,51 @@ impl<'a> Parser<'a> {
                 _ => parts.push(self.parse_quant()?),
             }
         }
-        if parts.len() == 1 { Ok(parts.pop().unwrap()) }
-        else if parts.is_empty() { Ok(Ast::Empty) }
-        else { Ok(Ast::Concat(parts)) }
+        if parts.len() == 1 {
+            Ok(parts.pop().unwrap())
+        } else if parts.is_empty() {
+            Ok(Ast::Empty)
+        } else {
+            Ok(Ast::Concat(parts))
+        }
     }
 
     /// quantified: atom ('*' | '+' | '?' | '{n,m}') ('?')?
     fn parse_quant(&mut self) -> Result<Ast, String> {
         let atom = self.parse_atom()?;
         match self.peek() {
-            Some('*') => { self.bump(); let lazy = self.peek() == Some('?'); if lazy { self.bump(); } Ok(Ast::Star(Box::new(atom), !lazy)) }
-            Some('+') => { self.bump(); let lazy = self.peek() == Some('?'); if lazy { self.bump(); } Ok(Ast::Plus(Box::new(atom), !lazy)) }
-            Some('?') => { self.bump(); let lazy = self.peek() == Some('?'); if lazy { self.bump(); } Ok(Ast::Quest(Box::new(atom), !lazy)) }
+            Some('*') => {
+                self.bump();
+                let lazy = self.peek() == Some('?');
+                if lazy {
+                    self.bump();
+                }
+                Ok(Ast::Star(Box::new(atom), !lazy))
+            }
+            Some('+') => {
+                self.bump();
+                let lazy = self.peek() == Some('?');
+                if lazy {
+                    self.bump();
+                }
+                Ok(Ast::Plus(Box::new(atom), !lazy))
+            }
+            Some('?') => {
+                self.bump();
+                let lazy = self.peek() == Some('?');
+                if lazy {
+                    self.bump();
+                }
+                Ok(Ast::Quest(Box::new(atom), !lazy))
+            }
             Some('{') => {
                 let save = self.pos;
                 self.bump(); // {
                 if let Some((min, max)) = self.try_braces() {
                     let greedy = self.peek() != Some('?');
-                    if !greedy { self.bump(); }
+                    if !greedy {
+                        self.bump();
+                    }
                     Ok(expand_repeat(atom, min, max, greedy))
                 } else {
                     // Not a valid `{n,m}` — treat '{' as a literal.
@@ -170,20 +212,43 @@ impl<'a> Parser<'a> {
 
     fn try_braces(&mut self) -> Option<(usize, Option<usize>)> {
         let start = self.pos;
-        while self.peek().map_or(false, |c| c.is_ascii_digit()) { self.bump(); }
-        if self.pos == start { return None; }
-        let min: usize = self.chars[start..self.pos].iter().collect::<String>().parse().ok()?;
+        while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+            self.bump();
+        }
+        if self.pos == start {
+            return None;
+        }
+        let min: usize = self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
         let max = if self.peek() == Some(',') {
             self.bump();
             let s = self.pos;
-            while self.peek().map_or(false, |c| c.is_ascii_digit()) { self.bump(); }
-            if s == self.pos { None } else {
-                Some(self.chars[s..self.pos].iter().collect::<String>().parse().ok()?)
+            while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                self.bump();
+            }
+            if s == self.pos {
+                None
+            } else {
+                Some(
+                    self.chars[s..self.pos]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .ok()?,
+                )
             }
         } else {
             Some(min)
         };
-        if self.peek() == Some('}') { self.bump(); Some((min, max)) } else { None }
+        if self.peek() == Some('}') {
+            self.bump();
+            Some((min, max))
+        } else {
+            None
+        }
     }
 
     /// atom: literal | '.' | '[' ... ']' | '(' ... ')' | '\' escape | '^' | '$'
@@ -204,12 +269,39 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('?') {
             self.bump();
             match self.peek() {
-                Some(':') => { self.bump(); let inner = self.parse_alt()?; self.expect_close()?; Ok(inner) }
-                Some('=') => { self.bump(); let inner = self.parse_alt()?; self.expect_close()?; Ok(Ast::Look(Box::new(inner), true, true)) }
-                Some('!') => { self.bump(); let inner = self.parse_alt()?; self.expect_close()?; Ok(Ast::Look(Box::new(inner), true, false)) }
+                Some(':') => {
+                    self.bump();
+                    let inner = self.parse_alt()?;
+                    self.expect_close()?;
+                    Ok(inner)
+                }
+                Some('=') => {
+                    self.bump();
+                    let inner = self.parse_alt()?;
+                    self.expect_close()?;
+                    Ok(Ast::Look(Box::new(inner), true, true))
+                }
+                Some('!') => {
+                    self.bump();
+                    let inner = self.parse_alt()?;
+                    self.expect_close()?;
+                    Ok(Ast::Look(Box::new(inner), true, false))
+                }
                 Some('<') => match self.peek2() {
-                    Some('=') => { self.bump(); self.bump(); let inner = self.parse_alt()?; self.expect_close()?; Ok(Ast::Look(Box::new(inner), false, true)) }
-                    Some('!') => { self.bump(); self.bump(); let inner = self.parse_alt()?; self.expect_close()?; Ok(Ast::Look(Box::new(inner), false, false)) }
+                    Some('=') => {
+                        self.bump();
+                        self.bump();
+                        let inner = self.parse_alt()?;
+                        self.expect_close()?;
+                        Ok(Ast::Look(Box::new(inner), false, true))
+                    }
+                    Some('!') => {
+                        self.bump();
+                        self.bump();
+                        let inner = self.parse_alt()?;
+                        self.expect_close()?;
+                        Ok(Ast::Look(Box::new(inner), false, false))
+                    }
                     _ => {
                         // named capturing group: (?<name>...)
                         self.bump(); // consume '<'
@@ -224,7 +316,8 @@ impl<'a> Parser<'a> {
                 },
                 Some('P') if self.peek2() == Some('<') => {
                     // Python-style named group (?P<name>...)
-                    self.bump(); self.bump(); // P <
+                    self.bump();
+                    self.bump(); // P <
                     let name = self.read_group_name()?;
                     self.group_count += 1;
                     let num = self.group_count;
@@ -245,42 +338,70 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_close(&mut self) -> Result<(), String> {
-        if self.peek() == Some(')') { self.bump(); Ok(()) } else { Err("missing )".into()) }
+        if self.peek() == Some(')') {
+            self.bump();
+            Ok(())
+        } else {
+            Err("missing )".into())
+        }
     }
 
     /// Read a group name terminated by '>' (after `(?<` / `\k<`).
     fn read_group_name(&mut self) -> Result<String, String> {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            if c == '>' { break; }
-            if c == ')' || c == '(' { return Err("bad group name".into()); }
+            if c == '>' {
+                break;
+            }
+            if c == ')' || c == '(' {
+                return Err("bad group name".into());
+            }
             self.bump();
         }
-        if self.peek() != Some('>') { return Err("unterminated group name".into()); }
+        if self.peek() != Some('>') {
+            return Err("unterminated group name".into());
+        }
         let name: String = self.chars[start..self.pos].iter().collect();
-        if name.is_empty() { return Err("empty group name".into()); }
+        if name.is_empty() {
+            return Err("empty group name".into());
+        }
         self.bump(); // '>'
         Ok(name)
     }
 
     fn parse_class(&mut self) -> Result<Ast, String> {
         let negated = self.peek() == Some('^');
-        if negated { self.bump(); }
+        if negated {
+            self.bump();
+        }
         let mut ranges = Vec::new();
         let first = self.peek() == Some(']');
-        if first { self.bump(); ranges.push((']', ']')); }
+        if first {
+            self.bump();
+            ranges.push((']', ']'));
+        }
         loop {
             match self.peek() {
                 None => return Err("unterminated class".into()),
-                Some(']') => { self.bump(); break; }
+                Some(']') => {
+                    self.bump();
+                    break;
+                }
                 Some('\\') => {
                     self.bump();
                     let c = self.class_escape_char()?;
                     if self.peek() == Some('-') && self.chars.get(self.pos + 1) != Some(&']') {
                         self.bump();
-                        let end = if self.peek() == Some('\\') { self.bump(); self.class_escape_char()? } else { self.bump().unwrap_or('\0') };
+                        let end = if self.peek() == Some('\\') {
+                            self.bump();
+                            self.class_escape_char()?
+                        } else {
+                            self.bump().unwrap_or('\0')
+                        };
                         ranges.push((c, end));
-                    } else { ranges.push((c, c)); }
+                    } else {
+                        ranges.push((c, c));
+                    }
                 }
                 Some(c) => {
                     self.bump();
@@ -299,7 +420,12 @@ impl<'a> Parser<'a> {
 
     fn class_escape_char(&mut self) -> Result<char, String> {
         let c = self.bump().ok_or("bad class escape")?;
-        Ok(match c { 'n' => '\n', 't' => '\t', 'r' => '\r', _ => c })
+        Ok(match c {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            _ => c,
+        })
     }
 
     fn parse_escape(&mut self) -> Result<Ast, String> {
@@ -307,10 +433,29 @@ impl<'a> Parser<'a> {
         match c {
             'd' => Ok(Ast::Class(vec![('0', '9')], false)),
             'D' => Ok(Ast::Class(vec![('0', '9')], true)),
-            'w' => Ok(Ast::Class(vec![('a','z'),('A','Z'),('0','9'),('_','_')], false)),
-            'W' => Ok(Ast::Class(vec![('a','z'),('A','Z'),('0','9'),('_','_')], true)),
-            's' => Ok(Ast::Class(vec![(' ',' '),('\t','\t'),('\n','\n'),('\r','\r'),('\u{000B}','\u{000B}'),('\u{000C}','\u{000C}')], false)),
-            'S' => Ok(Ast::Class(vec![(' ',' '),('\t','\t'),('\n','\n'),('\r','\r')], true)),
+            'w' => Ok(Ast::Class(
+                vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+                false,
+            )),
+            'W' => Ok(Ast::Class(
+                vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+                true,
+            )),
+            's' => Ok(Ast::Class(
+                vec![
+                    (' ', ' '),
+                    ('\t', '\t'),
+                    ('\n', '\n'),
+                    ('\r', '\r'),
+                    ('\u{000B}', '\u{000B}'),
+                    ('\u{000C}', '\u{000C}'),
+                ],
+                false,
+            )),
+            'S' => Ok(Ast::Class(
+                vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
+                true,
+            )),
             'b' => Ok(Ast::WordBoundary),
             'B' => Ok(Ast::NotWordBoundary),
             'n' => Ok(Ast::Char('\n')),
@@ -319,14 +464,21 @@ impl<'a> Parser<'a> {
             'k' => {
                 // named backreference: \k<name> or \k'name'
                 let name = self.read_backref_name()?;
-                let num = self.lookup_name(&name).ok_or_else(|| format!("unknown group name '{}'", name))?;
+                let num = self
+                    .lookup_name(&name)
+                    .ok_or_else(|| format!("unknown group name '{}'", name))?;
                 Ok(Ast::Backref(num))
             }
             ch if ch.is_ascii_digit() && ch != '0' => {
                 // numeric backreference \1..\9 (possibly multi-digit, take greedy)
                 let mut digits = String::from(ch);
                 while let Some(d) = self.peek() {
-                    if d.is_ascii_digit() { digits.push(d); self.bump(); } else { break; }
+                    if d.is_ascii_digit() {
+                        digits.push(d);
+                        self.bump();
+                    } else {
+                        break;
+                    }
                 }
                 let num: usize = digits.parse().unwrap();
                 Ok(Ast::Backref(num))
@@ -337,12 +489,22 @@ impl<'a> Parser<'a> {
 
     fn read_backref_name(&mut self) -> Result<String, String> {
         match self.peek() {
-            Some('<') => { self.bump(); self.read_group_name() }
+            Some('<') => {
+                self.bump();
+                self.read_group_name()
+            }
             Some('\'') => {
                 self.bump();
                 let start = self.pos;
-                while let Some(c) = self.peek() { if c == '\'' { break; } self.bump(); }
-                if self.peek() != Some('\'') { return Err("unterminated backref name".into()); }
+                while let Some(c) = self.peek() {
+                    if c == '\'' {
+                        break;
+                    }
+                    self.bump();
+                }
+                if self.peek() != Some('\'') {
+                    return Err("unterminated backref name".into());
+                }
                 let name: String = self.chars[start..self.pos].iter().collect();
                 self.bump();
                 Ok(name)
@@ -364,12 +526,16 @@ impl<'a> Parser<'a> {
 /// - `{min,max}` → `atom` × min, then `(max - min)` optional `atom`
 fn expand_repeat(atom: Ast, min: usize, max: Option<usize>, greedy: bool) -> Ast {
     let mut parts = Vec::new();
-    for _ in 0..min { parts.push(atom.clone()); }
+    for _ in 0..min {
+        parts.push(atom.clone());
+    }
     match max {
         None => parts.push(Ast::Star(Box::new(atom), greedy)),
         Some(mx) => {
             let optional = mx.saturating_sub(min);
-            for _ in 0..optional { parts.push(Ast::Quest(Box::new(atom.clone()), greedy)); }
+            for _ in 0..optional {
+                parts.push(Ast::Quest(Box::new(atom.clone()), greedy));
+            }
         }
     }
     match parts.len() {
@@ -384,8 +550,14 @@ fn expand_repeat(atom: Ast, min: usize, max: Option<usize>, greedy: bool) -> Ast
 fn needs_backtrack(ast: &Ast) -> bool {
     match ast {
         Ast::Look(..) | Ast::Backref(_) => true,
-        Ast::Empty | Ast::Char(_) | Ast::Dot | Ast::Class(_, _)
-        | Ast::Start | Ast::End | Ast::WordBoundary | Ast::NotWordBoundary => false,
+        Ast::Empty
+        | Ast::Char(_)
+        | Ast::Dot
+        | Ast::Class(_, _)
+        | Ast::Start
+        | Ast::End
+        | Ast::WordBoundary
+        | Ast::NotWordBoundary => false,
         Ast::Concat(xs) | Ast::Alt(xs) => xs.iter().any(needs_backtrack),
         Ast::Star(x, _) | Ast::Plus(x, _) | Ast::Quest(x, _) => needs_backtrack(x),
         Ast::Group(x, _) => needs_backtrack(x),
@@ -399,22 +571,48 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn new() -> Self { Compiler { insns: Vec::new() } }
+    fn new() -> Self {
+        Compiler { insns: Vec::new() }
+    }
 
-    fn emit(&mut self, insn: Insn) -> usize { let i = self.insns.len(); self.insns.push(insn); i }
-    fn here(&self) -> usize { self.insns.len() }
+    fn emit(&mut self, insn: Insn) -> usize {
+        let i = self.insns.len();
+        self.insns.push(insn);
+        i
+    }
+    fn here(&self) -> usize {
+        self.insns.len()
+    }
 
     fn compile(&mut self, ast: &Ast) {
         match ast {
             Ast::Empty => {}
-            Ast::Char(c) => { self.emit(Insn::Char(*c)); }
-            Ast::Dot => { self.emit(Insn::Dot); }
-            Ast::Class(r, n) => { self.emit(Insn::Class(r.clone(), *n)); }
-            Ast::Start => { self.emit(Insn::Start); }
-            Ast::End => { self.emit(Insn::End); }
-            Ast::WordBoundary => { self.emit(Insn::WordB); }
-            Ast::NotWordBoundary => { self.emit(Insn::NotWordB); }
-            Ast::Concat(parts) => { for p in parts { self.compile(p); } }
+            Ast::Char(c) => {
+                self.emit(Insn::Char(*c));
+            }
+            Ast::Dot => {
+                self.emit(Insn::Dot);
+            }
+            Ast::Class(r, n) => {
+                self.emit(Insn::Class(r.clone(), *n));
+            }
+            Ast::Start => {
+                self.emit(Insn::Start);
+            }
+            Ast::End => {
+                self.emit(Insn::End);
+            }
+            Ast::WordBoundary => {
+                self.emit(Insn::WordB);
+            }
+            Ast::NotWordBoundary => {
+                self.emit(Insn::NotWordB);
+            }
+            Ast::Concat(parts) => {
+                for p in parts {
+                    self.compile(p);
+                }
+            }
             Ast::Alt(alts) => {
                 let mut jumps = Vec::new();
                 for (i, alt) in alts.iter().enumerate() {
@@ -430,7 +628,9 @@ impl Compiler {
                     }
                 }
                 let end = self.here();
-                for j in jumps { self.insns[j] = Insn::Jmp(end); }
+                for j in jumps {
+                    self.insns[j] = Insn::Jmp(end);
+                }
             }
             Ast::Star(body, greedy) => {
                 let l1 = self.here();
@@ -439,21 +639,33 @@ impl Compiler {
                 self.compile(body);
                 self.emit(Insn::Jmp(l1));
                 let l3 = self.here();
-                self.insns[split] = if *greedy { Insn::Split(l2, l3) } else { Insn::Split(l3, l2) };
+                self.insns[split] = if *greedy {
+                    Insn::Split(l2, l3)
+                } else {
+                    Insn::Split(l3, l2)
+                };
             }
             Ast::Plus(body, greedy) => {
                 let l1 = self.here();
                 self.compile(body);
                 let split = self.emit(Insn::Split(0, 0));
                 let l3 = self.here();
-                self.insns[split] = if *greedy { Insn::Split(l1, l3) } else { Insn::Split(l3, l1) };
+                self.insns[split] = if *greedy {
+                    Insn::Split(l1, l3)
+                } else {
+                    Insn::Split(l3, l1)
+                };
             }
             Ast::Quest(body, greedy) => {
                 let split = self.emit(Insn::Split(0, 0));
                 let l1 = self.here();
                 self.compile(body);
                 let l2 = self.here();
-                self.insns[split] = if *greedy { Insn::Split(l1, l2) } else { Insn::Split(l2, l1) };
+                self.insns[split] = if *greedy {
+                    Insn::Split(l1, l2)
+                } else {
+                    Insn::Split(l2, l1)
+                };
             }
             Ast::Group(body, n) => {
                 self.emit(Insn::Save(2 * n));
@@ -523,7 +735,11 @@ impl RegexProgram {
                         e
                     } else {
                         // zero-width match: step one char forward
-                        input[s..].char_indices().nth(1).map(|(off, _)| s + off).unwrap_or(input.len())
+                        input[s..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(off, _)| s + off)
+                            .unwrap_or(input.len())
                     };
                 }
             }
@@ -534,10 +750,16 @@ impl RegexProgram {
     fn start_char_index(input: &str, start: usize) -> usize {
         let mut byte = 0;
         for (i, c) in input.chars().enumerate() {
-            if byte >= start { return i; }
+            if byte >= start {
+                return i;
+            }
             byte += c.len_utf8();
         }
-        if byte >= start { input.chars().count() } else { 0 }
+        if byte >= start {
+            input.chars().count()
+        } else {
+            0
+        }
     }
 
     // ---- Pike VM (linear path) ---------------------------------------------
@@ -556,7 +778,12 @@ impl RegexProgram {
     fn pike_chars(&self, chars: &[char], start: usize, input: &str) -> Option<RegexMatch> {
         let n = chars.len();
         let num_slots = (self.num_groups + 1) * 2;
-        let vm = VmCtx { insns: &self.insns, chars, n, multiline: self.multiline };
+        let vm = VmCtx {
+            insns: &self.insns,
+            chars,
+            n,
+            multiline: self.multiline,
+        };
 
         let mut clist: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
         let mut nlist: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
@@ -564,7 +791,14 @@ impl RegexProgram {
         let mut nvisited = vec![false; self.insns.len()];
         let mut matched: Option<Vec<Option<usize>>> = None;
 
-        vm.add(0, vec![None; num_slots], &mut clist, &mut cvisited, start, &mut matched);
+        vm.add(
+            0,
+            vec![None; num_slots],
+            &mut clist,
+            &mut cvisited,
+            start,
+            &mut matched,
+        );
 
         for pos in start..n {
             let c = chars[pos];
@@ -572,17 +806,38 @@ impl RegexProgram {
                 match &self.insns[pc] {
                     Insn::Char(ch) => {
                         if char_eq(c, *ch, self.ignore_case) {
-                            vm.add(pc + 1, caps.clone(), &mut nlist, &mut nvisited, pos + 1, &mut matched);
+                            vm.add(
+                                pc + 1,
+                                caps.clone(),
+                                &mut nlist,
+                                &mut nvisited,
+                                pos + 1,
+                                &mut matched,
+                            );
                         }
                     }
                     Insn::Class(ranges, neg) => {
                         if class_matches(c, ranges, *neg, self.ignore_case) {
-                            vm.add(pc + 1, caps.clone(), &mut nlist, &mut nvisited, pos + 1, &mut matched);
+                            vm.add(
+                                pc + 1,
+                                caps.clone(),
+                                &mut nlist,
+                                &mut nvisited,
+                                pos + 1,
+                                &mut matched,
+                            );
                         }
                     }
                     Insn::Dot => {
                         if self.dotall || c != '\n' {
-                            vm.add(pc + 1, caps.clone(), &mut nlist, &mut nvisited, pos + 1, &mut matched);
+                            vm.add(
+                                pc + 1,
+                                caps.clone(),
+                                &mut nlist,
+                                &mut nvisited,
+                                pos + 1,
+                                &mut matched,
+                            );
                         }
                     }
                     _ => {}
@@ -592,7 +847,9 @@ impl RegexProgram {
             nlist.clear();
             std::mem::swap(&mut cvisited, &mut nvisited);
             nvisited.fill(false);
-            if clist.is_empty() { break; }
+            if clist.is_empty() {
+                break;
+            }
         }
 
         for &(pc, ref caps) in &clist {
@@ -645,31 +902,62 @@ impl RegexProgram {
         match node {
             Ast::Empty => cont(pos, caps),
             Ast::Char(c) => {
-                if pos < chars.len() && char_eq(chars[pos], *c, self.ignore_case) { cont(pos + 1, caps) } else { None }
+                if pos < chars.len() && char_eq(chars[pos], *c, self.ignore_case) {
+                    cont(pos + 1, caps)
+                } else {
+                    None
+                }
             }
             Ast::Dot => {
-                if pos < chars.len() && (self.dotall || chars[pos] != '\n') { cont(pos + 1, caps) } else { None }
+                if pos < chars.len() && (self.dotall || chars[pos] != '\n') {
+                    cont(pos + 1, caps)
+                } else {
+                    None
+                }
             }
             Ast::Class(r, neg) => {
-                if pos < chars.len() && class_matches(chars[pos], r, *neg, self.ignore_case) { cont(pos + 1, caps) } else { None }
+                if pos < chars.len() && class_matches(chars[pos], r, *neg, self.ignore_case) {
+                    cont(pos + 1, caps)
+                } else {
+                    None
+                }
             }
             Ast::Start => {
-                if pos == 0 || (self.multiline && pos > 0 && chars[pos - 1] == '\n') { cont(pos, caps) } else { None }
+                if pos == 0 || (self.multiline && pos > 0 && chars[pos - 1] == '\n') {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
             Ast::End => {
-                if pos == chars.len() || (self.multiline && pos < chars.len() && chars[pos] == '\n') { cont(pos, caps) } else { None }
+                if pos == chars.len() || (self.multiline && pos < chars.len() && chars[pos] == '\n')
+                {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
             Ast::WordBoundary => {
-                if is_boundary(chars, pos) { cont(pos, caps) } else { None }
+                if is_boundary(chars, pos) {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
             Ast::NotWordBoundary => {
-                if !is_boundary(chars, pos) { cont(pos, caps) } else { None }
+                if !is_boundary(chars, pos) {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
             Ast::Concat(parts) => self.m_concat(parts, 0, chars, pos, caps, cont),
             Ast::Alt(alts) => {
                 for a in alts {
                     let saved = caps.clone();
-                    if let Some(p) = self.match_at(a, chars, pos, caps, cont) { return Some(p); }
+                    if let Some(p) = self.match_at(a, chars, pos, caps, cont) {
+                        return Some(p);
+                    }
                     *caps = saved;
                 }
                 None
@@ -678,17 +966,25 @@ impl RegexProgram {
             Ast::Plus(body, greedy) => {
                 // One required copy, then a star — guard against empty matches.
                 self.match_at(body, chars, pos, caps, &|p, c| {
-                    if p > pos { self.m_star(body, *greedy, chars, p, c, cont) } else { cont(p, c) }
+                    if p > pos {
+                        self.m_star(body, *greedy, chars, p, c, cont)
+                    } else {
+                        cont(p, c)
+                    }
                 })
             }
             Ast::Quest(body, greedy) => {
                 let saved = caps.clone();
                 if *greedy {
-                    if let Some(p) = self.match_at(body, chars, pos, caps, cont) { return Some(p); }
+                    if let Some(p) = self.match_at(body, chars, pos, caps, cont) {
+                        return Some(p);
+                    }
                     *caps = saved;
                     cont(pos, caps)
                 } else {
-                    if let Some(p) = cont(pos, caps) { return Some(p); }
+                    if let Some(p) = cont(pos, caps) {
+                        return Some(p);
+                    }
                     *caps = saved;
                     self.match_at(body, chars, pos, caps, cont)
                 }
@@ -696,16 +992,27 @@ impl RegexProgram {
             Ast::Group(inner, n) => {
                 let slot = 2 * n;
                 let save_start = caps.get(slot).copied().flatten();
-                if slot < caps.len() { caps[slot] = Some(pos); }
+                if slot < caps.len() {
+                    caps[slot] = Some(pos);
+                }
                 let result = self.match_at(inner, chars, pos, caps, &|p, c| {
                     let save_end = c.get(slot + 1).copied().flatten();
-                    if slot + 1 < c.len() { c[slot + 1] = Some(p); }
+                    if slot + 1 < c.len() {
+                        c[slot + 1] = Some(p);
+                    }
                     match cont(p, c) {
                         Some(r) => Some(r),
-                        None => { if slot + 1 < c.len() { c[slot + 1] = save_end; } None }
+                        None => {
+                            if slot + 1 < c.len() {
+                                c[slot + 1] = save_end;
+                            }
+                            None
+                        }
                     }
                 });
-                if result.is_none() && slot < caps.len() { caps[slot] = save_start; }
+                if result.is_none() && slot < caps.len() {
+                    caps[slot] = save_start;
+                }
                 result
             }
             Ast::Look(inner, ahead, positive) => {
@@ -713,13 +1020,20 @@ impl RegexProgram {
             }
             Ast::Backref(n) => {
                 let slot = 2 * n;
-                if slot + 1 >= caps.len() { return None; }
-                match (caps.get(slot).copied().flatten(), caps.get(slot + 1).copied().flatten()) {
+                if slot + 1 >= caps.len() {
+                    return None;
+                }
+                match (
+                    caps.get(slot).copied().flatten(),
+                    caps.get(slot + 1).copied().flatten(),
+                ) {
                     (Some(s), Some(e)) => {
                         let glen = e - s;
                         if pos + glen <= chars.len() && chars[pos..pos + glen] == chars[s..e] {
                             cont(pos + glen, caps)
-                        } else { None }
+                        } else {
+                            None
+                        }
                     }
                     _ => {
                         // Unmatched group: a backreference matches the empty string.
@@ -739,7 +1053,9 @@ impl RegexProgram {
         caps: &mut Vec<Option<usize>>,
         cont: &dyn Fn(usize, &mut Vec<Option<usize>>) -> Option<usize>,
     ) -> Option<usize> {
-        if i == parts.len() { return cont(pos, caps); }
+        if i == parts.len() {
+            return cont(pos, caps);
+        }
         self.match_at(&parts[i], chars, pos, caps, &|p, c| {
             self.m_concat(parts, i + 1, chars, p, c, cont)
         })
@@ -759,17 +1075,29 @@ impl RegexProgram {
         if greedy {
             let saved = caps.clone();
             let more = self.match_at(body, chars, pos, caps, &|p, c| {
-                if p > pos { self.m_star(body, true, chars, p, c, cont) } else { None }
+                if p > pos {
+                    self.m_star(body, true, chars, p, c, cont)
+                } else {
+                    None
+                }
             });
-            if more.is_some() { return more; }
+            if more.is_some() {
+                return more;
+            }
             *caps = saved;
             cont(pos, caps)
         } else {
             let saved = caps.clone();
-            if let Some(p) = cont(pos, caps) { return Some(p); }
+            if let Some(p) = cont(pos, caps) {
+                return Some(p);
+            }
             *caps = saved;
             self.match_at(body, chars, pos, caps, &|p, c| {
-                if p > pos { self.m_star(body, false, chars, p, c, cont) } else { None }
+                if p > pos {
+                    self.m_star(body, false, chars, p, c, cont)
+                } else {
+                    None
+                }
             })
         }
     }
@@ -802,7 +1130,11 @@ impl RegexProgram {
             } else {
                 // Negative lookahead: inner must NOT match; discard its captures.
                 *caps = saved;
-                if matched.is_none() { cont(pos, caps) } else { None }
+                if matched.is_none() {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
         } else {
             // lookbehind: find a start `sp` such that inner matches ending
@@ -825,11 +1157,18 @@ impl RegexProgram {
                 for sp in 0..=pos {
                     let saved = caps.clone();
                     if let Some(ep) = self.match_at(inner, chars, sp, caps, &accept) {
-                        if ep == pos { any = true; break; }
+                        if ep == pos {
+                            any = true;
+                            break;
+                        }
                     }
                     *caps = saved;
                 }
-                if !any { cont(pos, caps) } else { None }
+                if !any {
+                    cont(pos, caps)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -841,8 +1180,17 @@ fn build_match(input: &str, chars: &[char], caps: &[Option<usize>]) -> RegexMatc
     let mut byte_of = Vec::with_capacity(chars.len() + 1);
     byte_of.push(0);
     let mut b = 0;
-    for c in chars { b += c.len_utf8(); byte_of.push(b); }
-    let to_byte = |ci: usize| if ci < byte_of.len() { byte_of[ci] } else { input.len() };
+    for c in chars {
+        b += c.len_utf8();
+        byte_of.push(b);
+    }
+    let to_byte = |ci: usize| {
+        if ci < byte_of.len() {
+            byte_of[ci]
+        } else {
+            input.len()
+        }
+    };
 
     let captures = caps
         .chunks(2)
@@ -874,10 +1222,14 @@ impl<'a> VmCtx<'a> {
         matched: &mut Option<Vec<Option<usize>>>,
     ) {
         loop {
-            if pc >= self.insns.len() || visited[pc] { break; }
+            if pc >= self.insns.len() || visited[pc] {
+                break;
+            }
             visited[pc] = true;
             match &self.insns[pc] {
-                Insn::Jmp(x) => { pc = *x; }
+                Insn::Jmp(x) => {
+                    pc = *x;
+                }
                 Insn::Split(a, b) => {
                     let caps_b = caps.clone();
                     self.add(*a, caps, list, visited, pos, matched);
@@ -885,7 +1237,9 @@ impl<'a> VmCtx<'a> {
                     return;
                 }
                 Insn::Save(slot) => {
-                    if *slot < caps.len() { caps[*slot] = Some(pos); }
+                    if *slot < caps.len() {
+                        caps[*slot] = Some(pos);
+                    }
                     pc += 1;
                 }
                 Insn::Match => {
@@ -895,20 +1249,36 @@ impl<'a> VmCtx<'a> {
                 Insn::Start => {
                     if pos == 0 || (self.multiline && pos > 0 && self.chars[pos - 1] == '\n') {
                         pc += 1;
-                    } else { return; }
+                    } else {
+                        return;
+                    }
                 }
                 Insn::End => {
-                    if pos == self.n || (self.multiline && pos < self.n && self.chars[pos] == '\n') {
+                    if pos == self.n || (self.multiline && pos < self.n && self.chars[pos] == '\n')
+                    {
                         pc += 1;
-                    } else { return; }
+                    } else {
+                        return;
+                    }
                 }
                 Insn::WordB => {
-                    if is_boundary(self.chars, pos) { pc += 1; } else { return; }
+                    if is_boundary(self.chars, pos) {
+                        pc += 1;
+                    } else {
+                        return;
+                    }
                 }
                 Insn::NotWordB => {
-                    if !is_boundary(self.chars, pos) { pc += 1; } else { return; }
+                    if !is_boundary(self.chars, pos) {
+                        pc += 1;
+                    } else {
+                        return;
+                    }
                 }
-                _ => { list.push((pc, caps)); return; }
+                _ => {
+                    list.push((pc, caps));
+                    return;
+                }
             }
         }
     }
@@ -927,20 +1297,30 @@ fn is_word_char(c: char) -> bool {
 }
 
 fn char_eq(a: char, b: char, ignore_case: bool) -> bool {
-    if a == b { return true; }
+    if a == b {
+        return true;
+    }
     if ignore_case {
         a.to_ascii_lowercase() == b.to_ascii_lowercase()
-    } else { false }
+    } else {
+        false
+    }
 }
 
 fn class_matches(c: char, ranges: &[(char, char)], negated: bool, ignore_case: bool) -> bool {
     let mut found = false;
     for &(lo, hi) in ranges {
-        if c >= lo && c <= hi { found = true; break; }
+        if c >= lo && c <= hi {
+            found = true;
+            break;
+        }
         if ignore_case {
             let cl = c.to_ascii_lowercase();
             let cu = c.to_ascii_uppercase();
-            if (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi) { found = true; break; }
+            if (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi) {
+                found = true;
+                break;
+            }
         }
     }
     found != negated

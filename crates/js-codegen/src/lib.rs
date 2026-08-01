@@ -16,16 +16,16 @@
 //!
 //! [Cranelift]: https://github.com/bytecodealliance/wasmtime/tree/main/cranelift
 
+#[cfg(feature = "aot")]
+pub mod aot;
 #[cfg(any(feature = "jit", feature = "aot"))]
 pub mod isa;
 #[cfg(feature = "jit")]
 pub mod jit;
-#[cfg(feature = "aot")]
-pub mod aot;
 
 pub mod lower;
 
-#[cfg(feature = "jit")]
-pub use jit::{JitCompiler, JitError, JitModule};
 #[cfg(feature = "aot")]
 pub use aot::{AotCompiler, AotError, ObjectArtifact};
+#[cfg(feature = "jit")]
+pub use jit::{JitCompiler, JitError, JitModule};

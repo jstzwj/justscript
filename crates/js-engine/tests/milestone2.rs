@@ -163,9 +163,7 @@ fn method_this_binding() {
 #[test]
 fn arrow_inherits_this() {
     // Arrow inside a method captures the method's `this`.
-    match run(
-        "var o = { x: 5, get: function(){ var f = () => this.x; return f() } }; o.get()",
-    ) {
+    match run("var o = { x: 5, get: function(){ var f = () => this.x; return f() } }; o.get()") {
         ValueData::Integer(5) => {}
         v => panic!("expected Integer(5), got {:?}", v),
     }
@@ -346,17 +344,28 @@ fn array_push_join() {
 
 #[test]
 fn array_slice_concat_indexof() {
-    assert!(matches!(run("[5,4,3,2,1].slice(1,3).join(',')"), ValueData::String(s) if s.as_str()=="4,3"));
+    assert!(
+        matches!(run("[5,4,3,2,1].slice(1,3).join(',')"), ValueData::String(s) if s.as_str()=="4,3")
+    );
     assert!(matches!(run("[1,2,3].indexOf(2)"), ValueData::Integer(1)));
-    assert!(matches!(run("[1,2,3].includes(5)"), ValueData::Boolean(false)));
-    assert!(matches!(run("[1,2].concat([3,4]).length"), ValueData::Integer(4)));
+    assert!(matches!(
+        run("[1,2,3].includes(5)"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("[1,2].concat([3,4]).length"),
+        ValueData::Integer(4)
+    ));
 }
 
 #[test]
 fn string_methods() {
     assert!(matches!(run("'hello'.toUpperCase()"), ValueData::String(s) if s.as_str()=="HELLO"));
     assert!(matches!(run("'  hi  '.trim()"), ValueData::String(s) if s.as_str()=="hi"));
-    assert!(matches!(run("'a,b,c'.split(',').length"), ValueData::Integer(3)));
+    assert!(matches!(
+        run("'a,b,c'.split(',').length"),
+        ValueData::Integer(3)
+    ));
     assert!(matches!(run("'hello'.slice(1,3)"), ValueData::String(s) if s.as_str()=="el"));
     assert!(matches!(run("'abc'.repeat(3)"), ValueData::String(s) if s.as_str()=="abcabcabc"));
     assert!(matches!(run("'hello'.charAt(1)"), ValueData::String(s) if s.as_str()=="e"));
@@ -374,56 +383,95 @@ fn array_pop_shift() {
 
 #[test]
 fn array_map() {
-    assert!(matches!(run("[1,2,3].map(x => x * 2).join(',')"), ValueData::String(s) if s.as_str()=="2,4,6"));
+    assert!(
+        matches!(run("[1,2,3].map(x => x * 2).join(',')"), ValueData::String(s) if s.as_str()=="2,4,6")
+    );
 }
 
 #[test]
 fn array_filter() {
-    assert!(matches!(run("[1,2,3,4].filter(x => x % 2 == 0).join(',')"), ValueData::String(s) if s.as_str()=="2,4"));
+    assert!(
+        matches!(run("[1,2,3,4].filter(x => x % 2 == 0).join(',')"), ValueData::String(s) if s.as_str()=="2,4")
+    );
 }
 
 #[test]
 fn array_reduce() {
-    assert!(matches!(run("[1,2,3,4].reduce((a, b) => a + b, 0)"), ValueData::Integer(10)));
-    assert!(matches!(run("[1,2,3,4].reduce((a, b) => a + b)"), ValueData::Integer(10)));
+    assert!(matches!(
+        run("[1,2,3,4].reduce((a, b) => a + b, 0)"),
+        ValueData::Integer(10)
+    ));
+    assert!(matches!(
+        run("[1,2,3,4].reduce((a, b) => a + b)"),
+        ValueData::Integer(10)
+    ));
 }
 
 #[test]
 fn array_foreach_and_find() {
-    assert!(matches!(run("var s = 0; [10,20,30].forEach(x => s = s + x); s"), ValueData::Integer(60)));
-    assert!(matches!(run("[1,2,3,4].find(x => x > 2)"), ValueData::Integer(3)));
+    assert!(matches!(
+        run("var s = 0; [10,20,30].forEach(x => s = s + x); s"),
+        ValueData::Integer(60)
+    ));
+    assert!(matches!(
+        run("[1,2,3,4].find(x => x > 2)"),
+        ValueData::Integer(3)
+    ));
 }
 
 #[test]
 fn array_some_every() {
-    assert!(matches!(run("[1,2,3].some(x => x > 2)"), ValueData::Boolean(true)));
-    assert!(matches!(run("[1,2,3].every(x => x > 0)"), ValueData::Boolean(true)));
-    assert!(matches!(run("[1,2,3].every(x => x > 1)"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("[1,2,3].some(x => x > 2)"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("[1,2,3].every(x => x > 0)"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("[1,2,3].every(x => x > 1)"),
+        ValueData::Boolean(false)
+    ));
 }
 
 #[test]
 fn array_map_captures_closure_and_index() {
     // Callback arrow captures an outer var AND uses the index argument.
-    assert!(matches!(run("var scale = 10; [1,2,3].map((x, i) => x * scale + i).join(',')"), ValueData::String(s) if s.as_str()=="10,21,32"));
+    assert!(
+        matches!(run("var scale = 10; [1,2,3].map((x, i) => x * scale + i).join(',')"), ValueData::String(s) if s.as_str()=="10,21,32")
+    );
 }
 
 // ---- global builtins ----
 
 #[test]
 fn math_max_min() {
-    assert!(matches!(run("Math.max(3, 7, 2) + Math.min(8, 2)"), ValueData::Integer(9)));
+    assert!(matches!(
+        run("Math.max(3, 7, 2) + Math.min(8, 2)"),
+        ValueData::Integer(9)
+    ));
     assert!(matches!(run("Math.floor(Math.PI)"), ValueData::Number(_)));
 }
 
 #[test]
 fn object_keys_values() {
-    assert!(matches!(run("Object.keys({a:1,b:2}).length"), ValueData::Integer(2)));
-    assert!(matches!(run("Object.values({a:1,b:2}).reduce((x,y)=>x+y,0)"), ValueData::Integer(3)));
+    assert!(matches!(
+        run("Object.keys({a:1,b:2}).length"),
+        ValueData::Integer(2)
+    ));
+    assert!(matches!(
+        run("Object.values({a:1,b:2}).reduce((x,y)=>x+y,0)"),
+        ValueData::Integer(3)
+    ));
 }
 
 #[test]
 fn parse_int_and_coercion() {
-    assert!(matches!(run("parseInt('42') + parseInt('ff', 16)"), ValueData::Integer(297)));
+    assert!(matches!(
+        run("parseInt('42') + parseInt('ff', 16)"),
+        ValueData::Integer(297)
+    ));
     assert!(matches!(run("Number('3.5')"), ValueData::Number(_)));
     assert!(matches!(run("String(42) + 'x'"), ValueData::String(s) if s.as_str()=="42x"));
     assert!(matches!(run("Boolean(0)"), ValueData::Boolean(false)));
@@ -431,9 +479,14 @@ fn parse_int_and_coercion() {
 
 #[test]
 fn array_isarray_and_json() {
-    assert!(matches!(run("Array.isArray([1])"), ValueData::Boolean(true)));
+    assert!(matches!(
+        run("Array.isArray([1])"),
+        ValueData::Boolean(true)
+    ));
     assert!(matches!(run("Array.isArray(5)"), ValueData::Boolean(false)));
-    assert!(matches!(run("JSON.stringify({a: [1,2]})"), ValueData::String(s) if s.contains("\"a\":[1,2]")));
+    assert!(
+        matches!(run("JSON.stringify({a: [1,2]})"), ValueData::String(s) if s.contains("\"a\":[1,2]"))
+    );
 }
 
 #[test]
@@ -447,14 +500,22 @@ fn string_array_to_string_join() {
 #[test]
 fn array_sort_default_and_comparator() {
     assert!(matches!(run("[3,1,2].sort().join(',')"), ValueData::String(s) if s.as_str()=="1,2,3"));
-    assert!(matches!(run("[3,1,2].sort((a,b)=>a-b).join(',')"), ValueData::String(s) if s.as_str()=="1,2,3"));
-    assert!(matches!(run("[3,1,2].sort((a,b)=>b-a).join(',')"), ValueData::String(s) if s.as_str()=="3,2,1"));
+    assert!(
+        matches!(run("[3,1,2].sort((a,b)=>a-b).join(',')"), ValueData::String(s) if s.as_str()=="1,2,3")
+    );
+    assert!(
+        matches!(run("[3,1,2].sort((a,b)=>b-a).join(',')"), ValueData::String(s) if s.as_str()=="3,2,1")
+    );
 }
 
 #[test]
 fn array_flat_fill_at() {
-    assert!(matches!(run("[1,[2,[3]]].flat().join(',')"), ValueData::String(s) if s.as_str()=="1,2,3"));
-    assert!(matches!(run("[1,2,3].fill(7).join(',')"), ValueData::String(s) if s.as_str()=="7,7,7"));
+    assert!(
+        matches!(run("[1,[2,[3]]].flat().join(',')"), ValueData::String(s) if s.as_str()=="1,2,3")
+    );
+    assert!(
+        matches!(run("[1,2,3].fill(7).join(',')"), ValueData::String(s) if s.as_str()=="7,7,7")
+    );
     assert!(matches!(run("[10,20,30].at(-1)"), ValueData::Integer(30)));
 }
 
@@ -462,8 +523,14 @@ fn array_flat_fill_at() {
 fn string_pad_starts_replace() {
     assert!(matches!(run("'5'.padStart(3,'0')"), ValueData::String(s) if s.as_str()=="005"));
     assert!(matches!(run("'hi'.padEnd(4,'.')"), ValueData::String(s) if s.as_str()=="hi.."));
-    assert!(matches!(run("'hello'.startsWith('he')"), ValueData::Boolean(true)));
-    assert!(matches!(run("'hello'.endsWith('lo')"), ValueData::Boolean(true)));
+    assert!(matches!(
+        run("'hello'.startsWith('he')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("'hello'.endsWith('lo')"),
+        ValueData::Boolean(true)
+    ));
     assert!(matches!(run("'hello'.replace('l','L')"), ValueData::String(s) if s.as_str()=="heLlo"));
     assert!(matches!(run("'abc'.at(-1)"), ValueData::String(s) if s.as_str()=="c"));
 }
@@ -472,85 +539,115 @@ fn string_pad_starts_replace() {
 
 #[test]
 fn throw_catch_binding() {
-    assert!(matches!(run("var r; try { throw 42 } catch(e) { r = e } r"), ValueData::Integer(42)));
+    assert!(matches!(
+        run("var r; try { throw 42 } catch(e) { r = e } r"),
+        ValueData::Integer(42)
+    ));
 }
 
 #[test]
 fn try_normal_no_catch() {
-    assert!(matches!(run("var r=0; try { r=1 } catch(e){ r=2 } r"), ValueData::Integer(1)));
+    assert!(matches!(
+        run("var r=0; try { r=1 } catch(e){ r=2 } r"),
+        ValueData::Integer(1)
+    ));
 }
 
 #[test]
 fn throw_propagates_across_call() {
-    assert!(matches!(run("var r; function f(){ throw 'boom' } try { f() } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="boom"));
+    assert!(
+        matches!(run("var r; function f(){ throw 'boom' } try { f() } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="boom")
+    );
 }
 
 #[test]
 fn throw_in_callback_caught_outside() {
     // map's native drives the callback via call_value; its throw propagates out.
-    assert!(matches!(run("var r; try { [1,2].map(x => { throw 'inmap' }) } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="inmap"));
+    assert!(
+        matches!(run("var r; try { [1,2].map(x => { throw 'inmap' }) } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="inmap")
+    );
 }
 
 #[test]
 fn try_finally_runs_and_rethrows() {
     // Inner try/finally re-throws after running finally; outer catch catches it.
-    assert!(matches!(run("var s=''; try { try { throw 'a' } finally { s+='F' } } catch(e){ s+=e } s"), ValueData::String(s) if s.as_str()=="Fa"));
+    assert!(
+        matches!(run("var s=''; try { try { throw 'a' } finally { s+='F' } } catch(e){ s+=e } s"), ValueData::String(s) if s.as_str()=="Fa")
+    );
 }
 
 #[test]
 fn catch_then_finally() {
-    assert!(matches!(run("var s=''; try { throw 1 } catch(e){ s+='C' } finally { s+='F' } s"), ValueData::String(s) if s.as_str()=="CF"));
+    assert!(
+        matches!(run("var s=''; try { throw 1 } catch(e){ s+='C' } finally { s+='F' } s"), ValueData::String(s) if s.as_str()=="CF")
+    );
 }
 
 #[test]
 fn nested_catch() {
-    assert!(matches!(run("var r; try { try { throw 'x' } catch(e){ throw 'y' } } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="y"));
+    assert!(
+        matches!(run("var r; try { try { throw 'x' } catch(e){ throw 'y' } } catch(e){ r=e } r"), ValueData::String(s) if s.as_str()=="y")
+    );
 }
 
 // ---- Error + instanceof ----
 
 #[test]
 fn throw_new_error_catch_instanceof() {
-    assert!(matches!(run("var r; try { throw new TypeError('bad') } catch(e) { r = e instanceof TypeError } r"),
-        ValueData::Boolean(true)));
+    assert!(matches!(
+        run("var r; try { throw new TypeError('bad') } catch(e) { r = e instanceof TypeError } r"),
+        ValueData::Boolean(true)
+    ));
 }
 
 #[test]
 fn instanceof_error_base() {
-    assert!(matches!(run("var r; try { throw new RangeError('oob') } catch(e) { r = e instanceof Error } r"),
-        ValueData::Boolean(true)));
+    assert!(matches!(
+        run("var r; try { throw new RangeError('oob') } catch(e) { r = e instanceof Error } r"),
+        ValueData::Boolean(true)
+    ));
 }
 
 #[test]
 fn instanceof_wrong_type() {
-    assert!(matches!(run("var r; try { throw new TypeError('x') } catch(e) { r = e instanceof RangeError } r"),
-        ValueData::Boolean(false)));
+    assert!(matches!(
+        run("var r; try { throw new TypeError('x') } catch(e) { r = e instanceof RangeError } r"),
+        ValueData::Boolean(false)
+    ));
 }
 
 #[test]
 fn error_message_and_name() {
-    assert!(matches!(run("var r; try { throw new SyntaxError('oops') } catch(e) { r = e.name + ':' + e.message } r"),
-        ValueData::String(s) if s.as_str()=="SyntaxError:oops"));
+    assert!(
+        matches!(run("var r; try { throw new SyntaxError('oops') } catch(e) { r = e.name + ':' + e.message } r"),
+        ValueData::String(s) if s.as_str()=="SyntaxError:oops")
+    );
 }
 
 #[test]
 fn error_without_new() {
-    assert!(matches!(run("var e = Error('hi'); e.name + ':' + e.message"),
-        ValueData::String(s) if s.as_str()=="Error:hi"));
+    assert!(
+        matches!(run("var e = Error('hi'); e.name + ':' + e.message"),
+        ValueData::String(s) if s.as_str()=="Error:hi")
+    );
 }
 
 // ---- JSON.parse + Number/String methods ----
 
 #[test]
 fn json_parse_roundtrip() {
-    assert!(matches!(run("var o = JSON.parse('{\"a\":1,\"b\":[2,3]}'); o.a + o.b[0] + o.b[1]"),
-        ValueData::Integer(6)));
+    assert!(matches!(
+        run("var o = JSON.parse('{\"a\":1,\"b\":[2,3]}'); o.a + o.b[0] + o.b[1]"),
+        ValueData::Integer(6)
+    ));
 }
 
 #[test]
 fn json_parse_stringify_roundtrip() {
-    assert!(matches!(run("var s = JSON.stringify({x: 1, y: 'z'}); var o = JSON.parse(s); o.x + o.y"),
-        ValueData::String(ref s) if s.as_str() == "1z"));
+    assert!(
+        matches!(run("var s = JSON.stringify({x: 1, y: 'z'}); var o = JSON.parse(s); o.x + o.y"),
+        ValueData::String(ref s) if s.as_str() == "1z")
+    );
 }
 
 #[test]
@@ -561,8 +658,14 @@ fn number_tofixed() {
 
 #[test]
 fn number_statics() {
-    assert!(matches!(run("Number.isInteger(42)"), ValueData::Boolean(true)));
-    assert!(matches!(run("Number.isInteger(3.14)"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("Number.isInteger(42)"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("Number.isInteger(3.14)"),
+        ValueData::Boolean(false)
+    ));
     assert!(matches!(run("Number.isNaN(NaN)"), ValueData::Boolean(true)));
 }
 
@@ -577,35 +680,57 @@ fn string_extras() {
 
 #[test]
 fn regex_test() {
-    assert!(matches!(run("/abc/.test('xabcx')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/abc/.test('xyz')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/abc/.test('xabcx')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/abc/.test('xyz')"),
+        ValueData::Boolean(false)
+    ));
 }
 
 #[test]
 fn regex_digit_class() {
-    assert!(matches!(run("/\\d+/.test('a1b')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/\\d+/.test('abc')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/\\d+/.test('a1b')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/\\d+/.test('abc')"),
+        ValueData::Boolean(false)
+    ));
 }
 
 #[test]
 fn regex_exec_captures() {
-    assert!(matches!(run("var m = /(\\d+)-(\\d+)/.exec('12-34'); m[0] + ',' + m[1] + ',' + m[2]"),
-        ValueData::String(s) if s.as_str()=="12-34,12,34"));
+    assert!(
+        matches!(run("var m = /(\\d+)-(\\d+)/.exec('12-34'); m[0] + ',' + m[1] + ',' + m[2]"),
+        ValueData::String(s) if s.as_str()=="12-34,12,34")
+    );
 }
 
 #[test]
 fn string_match() {
-    assert!(matches!(run("'hello world'.match(/\\w+/)[0]"), ValueData::String(s) if s.as_str()=="hello"));
+    assert!(
+        matches!(run("'hello world'.match(/\\w+/)[0]"), ValueData::String(s) if s.as_str()=="hello")
+    );
 }
 
 #[test]
 fn string_search() {
-    assert!(matches!(run("'hello world'.search(/world/)"), ValueData::Integer(6)));
+    assert!(matches!(
+        run("'hello world'.search(/world/)"),
+        ValueData::Integer(6)
+    ));
 }
 
 #[test]
 fn regex_case_insensitive() {
-    assert!(matches!(run("/hello/i.test('HELLO')"), ValueData::Boolean(true)));
+    assert!(matches!(
+        run("/hello/i.test('HELLO')"),
+        ValueData::Boolean(true)
+    ));
 }
 
 #[test]
@@ -617,12 +742,30 @@ fn regex_flags() {
 #[test]
 fn regex_bounded_quantifier() {
     // {n}, {n,m}, {n,} — still on the linear Pike-VM path.
-    assert!(matches!(run("/a{3}/.test('aaa')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/a{3}/.test('aa')"), ValueData::Boolean(false)));
-    assert!(matches!(run("/a{2,4}/.test('aaa')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/a{2,4}/.test('a')"), ValueData::Boolean(false)));
-    assert!(matches!(run("/a{2,}/.test('aaaaa')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/a{2,}/.test('a')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/a{3}/.test('aaa')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/a{3}/.test('aa')"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("/a{2,4}/.test('aaa')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/a{2,4}/.test('a')"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("/a{2,}/.test('aaaaa')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/a{2,}/.test('a')"),
+        ValueData::Boolean(false)
+    ));
     // {n,m} applies to a group, with capture.
     assert!(matches!(
         run("var m = /(ab){2}/.exec('abab'); m[1]"),
@@ -633,15 +776,39 @@ fn regex_bounded_quantifier() {
 #[test]
 fn regex_lookahead_lookbehind() {
     // lookahead: consume 'a' only if followed by 'b'
-    assert!(matches!(run("/a(?=b)/.test('ab')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/a(?=b)/.test('ac')"), ValueData::Boolean(false)));
-    assert!(matches!(run("/a(?!b)/.test('ac')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/a(?!b)/.test('ab')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/a(?=b)/.test('ab')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/a(?=b)/.test('ac')"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("/a(?!b)/.test('ac')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/a(?!b)/.test('ab')"),
+        ValueData::Boolean(false)
+    ));
     // lookbehind
-    assert!(matches!(run("/(?<=a)b/.test('ab')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/(?<=a)b/.test('xb')"), ValueData::Boolean(false)));
-    assert!(matches!(run("/(?<!a)b/.test('xb')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/(?<!a)b/.test('ab')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/(?<=a)b/.test('ab')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/(?<=a)b/.test('xb')"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("/(?<!a)b/.test('xb')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/(?<!a)b/.test('ab')"),
+        ValueData::Boolean(false)
+    ));
     // capture inside lookahead is preserved
     assert!(matches!(
         run("/(?=(\\d+))/.exec('x42')[1]"),
@@ -652,11 +819,23 @@ fn regex_lookahead_lookbehind() {
 #[test]
 fn regex_backreferences() {
     // numeric backreference: a repeated word
-    assert!(matches!(run("/(\\w+) \\1/.test('hi hi')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/(\\w+) \\1/.test('hi ho')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/(\\w+) \\1/.test('hi hi')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/(\\w+) \\1/.test('hi ho')"),
+        ValueData::Boolean(false)
+    ));
     // named backreference
-    assert!(matches!(run("/(?<w>\\w+)-\\k<w>/.test('go-go')"), ValueData::Boolean(true)));
-    assert!(matches!(run("/(?<w>\\w+)-\\k<w>/.test('go-stop')"), ValueData::Boolean(false)));
+    assert!(matches!(
+        run("/(?<w>\\w+)-\\k<w>/.test('go-go')"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("/(?<w>\\w+)-\\k<w>/.test('go-stop')"),
+        ValueData::Boolean(false)
+    ));
 }
 
 #[test]

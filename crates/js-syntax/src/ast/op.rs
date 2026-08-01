@@ -104,7 +104,7 @@ pub enum AssignOp {
     Shl,
     Shr,
     Ushr,
-    And, // &&=
-    Or,  // ||=
+    And,     // &&=
+    Or,      // ||=
     Nullish, // ??=
 }

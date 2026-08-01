@@ -46,9 +46,17 @@ pub enum Stmt {
         finalizer: Option<Vec<Stmt>>,
     },
     /// A `while (test) body` loop.
-    While { span: Span, test: Box<Expr>, body: Box<Stmt> },
+    While {
+        span: Span,
+        test: Box<Expr>,
+        body: Box<Stmt>,
+    },
     /// A `do body while (test);` loop.
-    DoWhile { span: Span, body: Box<Stmt>, test: Box<Expr> },
+    DoWhile {
+        span: Span,
+        body: Box<Stmt>,
+        test: Box<Expr>,
+    },
     /// A `for (init; test; update) body` loop.
     For {
         span: Span,
@@ -73,9 +81,17 @@ pub enum Stmt {
         is_async: bool,
     },
     /// A labelled statement `label: stmt`.
-    Labeled { span: Span, label: String, body: Box<Stmt> },
+    Labeled {
+        span: Span,
+        label: String,
+        body: Box<Stmt>,
+    },
     /// `with (obj) stmt` (sloppy mode only).
-    With { span: Span, obj: Box<Expr>, body: Box<Stmt> },
+    With {
+        span: Span,
+        obj: Box<Expr>,
+        body: Box<Stmt>,
+    },
 }
 
 impl Stmt {
@@ -114,17 +130,21 @@ pub enum Decl {
     Function(Box<FunctionDecl>),
     Class(Box<ClassDecl>),
     /// An `import` declaration (modules only).
-    Import { span: Span, spec: ImportSpec },
+    Import {
+        span: Span,
+        spec: ImportSpec,
+    },
     /// An `export` declaration (modules only).
-    Export { span: Span, spec: ExportSpec },
+    Export {
+        span: Span,
+        spec: ExportSpec,
+    },
 }
 
 impl Decl {
     pub fn span(&self) -> Span {
         match self {
-            Decl::Var { span, .. }
-            | Decl::Import { span, .. }
-            | Decl::Export { span, .. } => *span,
+            Decl::Var { span, .. } | Decl::Import { span, .. } | Decl::Export { span, .. } => *span,
             Decl::Function(f) => f.span,
             Decl::Class(c) => c.span,
         }
@@ -193,7 +213,10 @@ pub enum ImportSpec {
     /// `import * as ns from "mod"`
     Namespace { ns: String, source: String },
     /// `import { a, b as c } from "mod"`
-    Named { items: Vec<ImportItem>, source: String },
+    Named {
+        items: Vec<ImportItem>,
+        source: String,
+    },
     /// `import def from "mod"` / `import def, { a } from "mod"`
     Default {
         local: String,
@@ -217,7 +240,10 @@ pub enum ExportSpec {
     /// `export * from "mod"`
     All { source: String },
     /// `export { a } from "mod"`
-    ReExport { items: Vec<ExportItem>, source: String },
+    ReExport {
+        items: Vec<ExportItem>,
+        source: String,
+    },
     /// `export function/class/let/const ...`
     Decl(Box<Decl>),
 }

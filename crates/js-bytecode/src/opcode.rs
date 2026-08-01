@@ -182,7 +182,7 @@ impl Opcode {
             Shr => Opcode::Shr,
             Ushr => Opcode::Shr, // TODO: unsigned variant
             In => Opcode::Nop,
-        Instanceof => Opcode::Instanceof,
+            Instanceof => Opcode::Instanceof,
         }
     }
 

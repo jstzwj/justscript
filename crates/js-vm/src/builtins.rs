@@ -5,7 +5,10 @@
 //! implements [`NativeFn`] and matches on the id. Callback-taking methods
 //! (`map`/`filter`/`forEach`) are deferred — they need native→JS sub-dispatch.
 
-use crate::interp::{array_get, array_len, eq_strict, make_array, to_string, InterpError, Interpreter, NativeFn, NativeResult};
+use crate::interp::{
+    array_get, array_len, eq_strict, make_array, to_string, InterpError, Interpreter, NativeFn,
+    NativeResult,
+};
 use js_bytecode::BytecodeModule;
 use js_runtime::value::{JsFunction, Value, ValueData};
 
@@ -272,7 +275,11 @@ impl NativeFn for Builtin {
             MATH_CEIL => Value::number(arg_f64(&args, 0).unwrap_or(f64::NAN).ceil()),
             MATH_ROUND => Value::number(math_round(arg_f64(&args, 0).unwrap_or(f64::NAN))),
             MATH_SQRT => Value::number(arg_f64(&args, 0).unwrap_or(f64::NAN).sqrt()),
-            MATH_POW => Value::number(arg_f64(&args, 0).unwrap_or(0.0).powf(arg_f64(&args, 1).unwrap_or(0.0))),
+            MATH_POW => Value::number(
+                arg_f64(&args, 0)
+                    .unwrap_or(0.0)
+                    .powf(arg_f64(&args, 1).unwrap_or(0.0)),
+            ),
             MATH_SIGN => math_sign(arg_f64(&args, 0).unwrap_or(f64::NAN)),
             OBJECT_KEYS => object_keys(&args),
             OBJECT_VALUES => object_values(&args),
@@ -286,17 +293,33 @@ impl NativeFn for Builtin {
             NUMBER_FN => to_number(&args),
             STRING_FN => Value::string(args.get(0).map(to_string).unwrap_or_default()),
             BOOLEAN_FN => Value::boolean(args.get(0).map(|v| is_truthy(v)).unwrap_or(false)),
-            ARRAY_IS_ARRAY => Value::boolean(matches!(args.get(0).map(|v| v.data().clone()), Some(ValueData::Object(o)) if o.borrow().is_exotic_array)),
+            ARRAY_IS_ARRAY => Value::boolean(
+                matches!(args.get(0).map(|v| v.data().clone()), Some(ValueData::Object(o)) if o.borrow().is_exotic_array),
+            ),
             ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "Error"))),
-            TYPE_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "TypeError"))),
-            RANGE_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "RangeError"))),
-            SYNTAX_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "SyntaxError"))),
-            REF_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "ReferenceError"))),
+            TYPE_ERROR_CTOR => {
+                return Ok(NativeResult::Value(error_ctor(&this, &args, "TypeError")))
+            }
+            RANGE_ERROR_CTOR => {
+                return Ok(NativeResult::Value(error_ctor(&this, &args, "RangeError")))
+            }
+            SYNTAX_ERROR_CTOR => {
+                return Ok(NativeResult::Value(error_ctor(&this, &args, "SyntaxError")))
+            }
+            REF_ERROR_CTOR => {
+                return Ok(NativeResult::Value(error_ctor(
+                    &this,
+                    &args,
+                    "ReferenceError",
+                )))
+            }
             JSON_PARSE => return json_parse(&args),
             NUM_TO_FIXED => return num_to_fixed(&this, &args),
             NUM_TO_STRING => return num_to_string(&this, &args),
             NUM_IS_INTEGER => Value::boolean(num_is_integer(&args)),
-            NUM_IS_FINITE => Value::boolean(arg_f64(&args, 0).map(|n| n.is_finite()).unwrap_or(false)),
+            NUM_IS_FINITE => {
+                Value::boolean(arg_f64(&args, 0).map(|n| n.is_finite()).unwrap_or(false))
+            }
             NUM_IS_NAN => Value::boolean(arg_f64(&args, 0).map(|n| n.is_nan()).unwrap_or(true)),
             NUM_PARSE_INT => parse_int(&args),
             NUM_PARSE_FLOAT => parse_float(&args),
@@ -309,7 +332,13 @@ impl NativeFn for Builtin {
             STR_MATCH => return str_match(&this, &args),
             STR_SEARCH => Value::integer(str_search(&this, &args) as i32),
             // ---- test262 harness ----
-            TEST262_ERROR_CTOR => return Ok(NativeResult::Value(error_ctor(&this, &args, "Test262Error"))),
+            TEST262_ERROR_CTOR => {
+                return Ok(NativeResult::Value(error_ctor(
+                    &this,
+                    &args,
+                    "Test262Error",
+                )))
+            }
             ASSERT_SAME_VALUE => return assert_same_value(&args, false),
             ASSERT_NOT_SAME_VALUE => return assert_same_value(&args, true),
             ASSERT_THROWS => return assert_throws(interp, module, &args),
@@ -561,7 +590,11 @@ fn str_substring(this: &Value, args: Vec<Value>) -> Value {
         if start > end {
             std::mem::swap(&mut start, &mut end);
         }
-        return Value::string(chars[start as usize..end as usize].iter().collect::<String>());
+        return Value::string(
+            chars[start as usize..end as usize]
+                .iter()
+                .collect::<String>(),
+        );
     }
     Value::undefined()
 }
@@ -595,7 +628,12 @@ fn str_split(this: &Value, args: Vec<Value>) -> Value {
     if let ValueData::String(s) = this.data() {
         if sep.is_empty() {
             // Split into characters.
-            return make_array(s.as_str().chars().map(|c| Value::string(c.to_string())).collect());
+            return make_array(
+                s.as_str()
+                    .chars()
+                    .map(|c| Value::string(c.to_string()))
+                    .collect(),
+            );
         }
         let parts: Vec<Value> = s.as_str().split(&sep).map(Value::string).collect();
         return make_array(parts);
@@ -688,7 +726,9 @@ fn arr_fill(this: &Value, args: Vec<Value>) -> Value {
     let value = args.get(0).cloned().unwrap_or_else(Value::undefined);
     let len = array_len(this);
     let start = arg_int(&args, 1).unwrap_or(0).max(0) as usize;
-    let end = arg_int(&args, 2).map(|e| (e.max(0) as usize).min(len)).unwrap_or(len);
+    let end = arg_int(&args, 2)
+        .map(|e| (e.max(0) as usize).min(len))
+        .unwrap_or(len);
     if let ValueData::Object(o) = this.data() {
         let mut b = o.borrow_mut();
         for i in start..end {
@@ -717,7 +757,10 @@ fn arr_at(this: &Value, args: Vec<Value>) -> Value {
 fn str_pad(this: &Value, args: Vec<Value>, is_start: bool) -> Value {
     if let ValueData::String(s) = this.data() {
         let target = arg_int(&args, 0).unwrap_or(0).max(0) as usize;
-        let pad = args.get(1).map(to_string).unwrap_or_else(|| " ".to_string());
+        let pad = args
+            .get(1)
+            .map(to_string)
+            .unwrap_or_else(|| " ".to_string());
         let chars: Vec<char> = s.as_str().chars().collect();
         let mut chars = chars;
         if chars.len() >= target || pad.is_empty() {
@@ -837,7 +880,9 @@ fn str_replace(
             )?;
             to_string(&r)
         } else {
-            let m = crate::regex::RegexMatch { captures: vec![Some((idx, end))] };
+            let m = crate::regex::RegexMatch {
+                captures: vec![Some((idx, end))],
+            };
             substitute_replacement(&to_string(&repl), &s, &m, &[])
         };
         let mut out = String::with_capacity(s.len() + replacement.len());
@@ -869,19 +914,48 @@ fn substitute_replacement(
     let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] != '$' { out.push(chars[i]); i += 1; continue; }
-        if i + 1 >= chars.len() { out.push('$'); i += 1; continue; }
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= chars.len() {
+            out.push('$');
+            i += 1;
+            continue;
+        }
         let n = chars[i + 1];
         match n {
-            '$' => { out.push('$'); i += 2; }
-            '&' => { if let Some((s, e)) = m.full_match() { out.push_str(&input[s..e]); } i += 2; }
-            '`' => { if let Some((s, _)) = m.full_match() { out.push_str(&input[..s]); } i += 2; }
-            '\'' => { if let Some((_, e)) = m.full_match() { out.push_str(&input[e..]); } i += 2; }
+            '$' => {
+                out.push('$');
+                i += 2;
+            }
+            '&' => {
+                if let Some((s, e)) = m.full_match() {
+                    out.push_str(&input[s..e]);
+                }
+                i += 2;
+            }
+            '`' => {
+                if let Some((s, _)) = m.full_match() {
+                    out.push_str(&input[..s]);
+                }
+                i += 2;
+            }
+            '\'' => {
+                if let Some((_, e)) = m.full_match() {
+                    out.push_str(&input[e..]);
+                }
+                i += 2;
+            }
             '<' => {
                 // named group $<name>
                 let mut j = i + 2;
                 let mut name = String::new();
-                while j < chars.len() && chars[j] != '>' { name.push(chars[j]); j += 1; }
+                while j < chars.len() && chars[j] != '>' {
+                    name.push(chars[j]);
+                    j += 1;
+                }
                 if j < chars.len() {
                     if let Some((_, g)) = names.iter().find(|(nm, _)| nm == &name) {
                         if let Some((s, e)) = m.captures.get(*g).copied().flatten() {
@@ -889,30 +963,49 @@ fn substitute_replacement(
                         }
                     }
                     i = j + 1;
-                } else { out.push('$'); i += 1; }
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
             }
             d if d.is_ascii_digit() => {
                 // Greedily collect digits, prefer the longest existing group number.
                 let mut j = i + 1;
-                while j < chars.len() && chars[j].is_ascii_digit() { j += 1; }
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
                 let digits = &chars[i + 1..j];
                 let parsed: String = digits.iter().collect();
                 let two: Option<usize> = if parsed.len() >= 2 {
-                    parsed[..2].parse::<usize>().ok().filter(|&g| g < m.captures.len() && m.captures[g].is_some())
-                } else { None };
+                    parsed[..2]
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&g| g < m.captures.len() && m.captures[g].is_some())
+                } else {
+                    None
+                };
                 if let Some(g) = two {
-                    if let Some((s, e)) = m.captures.get(g).copied().flatten() { out.push_str(&input[s..e]); }
+                    if let Some((s, e)) = m.captures.get(g).copied().flatten() {
+                        out.push_str(&input[s..e]);
+                    }
                     i += 3;
                 } else if let Ok(one) = parsed[..1].parse::<usize>() {
                     if one < m.captures.len() {
-                        if let Some((s, e)) = m.captures.get(one).copied().flatten() { out.push_str(&input[s..e]); }
+                        if let Some((s, e)) = m.captures.get(one).copied().flatten() {
+                            out.push_str(&input[s..e]);
+                        }
                     }
                     i += 2;
                 } else {
-                    out.push('$'); i += 1;
+                    out.push('$');
+                    i += 1;
                 }
             }
-            _ => { out.push('$'); out.push(n); i += 2; }
+            _ => {
+                out.push('$');
+                out.push(n);
+                i += 2;
+            }
         }
     }
     out
@@ -1101,7 +1194,10 @@ fn namespace(props: Vec<(&str, Value)>) -> Value {
     {
         let mut b = o.borrow_mut();
         for (k, v) in props {
-            b.properties.insert(k.to_string(), js_runtime::object::PropertyDescriptor::data(v));
+            b.properties.insert(
+                k.to_string(),
+                js_runtime::object::PropertyDescriptor::data(v),
+            );
         }
     }
     Value::object(o)
@@ -1168,7 +1264,10 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
     );
 
     globals.insert("parseInt".to_string(), native_fn("parseInt", PARSE_INT));
-    globals.insert("parseFloat".to_string(), native_fn("parseFloat", PARSE_FLOAT));
+    globals.insert(
+        "parseFloat".to_string(),
+        native_fn("parseFloat", PARSE_FLOAT),
+    );
     globals.insert("isNaN".to_string(), native_fn("isNaN", IS_NAN));
     globals.insert("isFinite".to_string(), native_fn("isFinite", IS_FINITE));
     globals.insert("Number".to_string(), native_fn("Number", NUMBER_FN));
@@ -1176,10 +1275,22 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
     globals.insert("Boolean".to_string(), native_fn("Boolean", BOOLEAN_FN));
     // Error constructors.
     globals.insert("Error".to_string(), native_fn("Error", ERROR_CTOR));
-    globals.insert("TypeError".to_string(), native_fn("TypeError", TYPE_ERROR_CTOR));
-    globals.insert("RangeError".to_string(), native_fn("RangeError", RANGE_ERROR_CTOR));
-    globals.insert("SyntaxError".to_string(), native_fn("SyntaxError", SYNTAX_ERROR_CTOR));
-    globals.insert("ReferenceError".to_string(), native_fn("ReferenceError", REF_ERROR_CTOR));
+    globals.insert(
+        "TypeError".to_string(),
+        native_fn("TypeError", TYPE_ERROR_CTOR),
+    );
+    globals.insert(
+        "RangeError".to_string(),
+        native_fn("RangeError", RANGE_ERROR_CTOR),
+    );
+    globals.insert(
+        "SyntaxError".to_string(),
+        native_fn("SyntaxError", SYNTAX_ERROR_CTOR),
+    );
+    globals.insert(
+        "ReferenceError".to_string(),
+        native_fn("ReferenceError", REF_ERROR_CTOR),
+    );
 }
 
 fn math_min_max(args: Vec<Value>, is_min: bool) -> Value {
@@ -1205,7 +1316,11 @@ fn math_min_max(args: Vec<Value>, is_min: bool) -> Value {
             Value::integer(n as i32)
         }
         Some(n) => Value::number(n),
-        None => Value::number(if is_min { f64::INFINITY } else { f64::NEG_INFINITY }),
+        None => Value::number(if is_min {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        }),
     }
 }
 
@@ -1218,7 +1333,13 @@ fn math_sign(n: f64) -> Value {
     if n.is_nan() {
         return Value::number(f64::NAN);
     }
-    Value::integer(if n > 0.0 { 1 } else if n < 0.0 { -1 } else { 0 })
+    Value::integer(if n > 0.0 {
+        1
+    } else if n < 0.0 {
+        -1
+    } else {
+        0
+    })
 }
 
 fn object_keys(args: &[Value]) -> Value {
@@ -1227,12 +1348,19 @@ fn object_keys(args: &[Value]) -> Value {
         ValueData::Object(o) => {
             let b = o.borrow();
             if b.is_exotic_array {
-                (0..array_len(&target)).map(|i| Value::string(i.to_string())).collect()
+                (0..array_len(&target))
+                    .map(|i| Value::string(i.to_string()))
+                    .collect()
             } else {
-                b.properties.keys().map(|k| Value::string(k.clone())).collect()
+                b.properties
+                    .keys()
+                    .map(|k| Value::string(k.clone()))
+                    .collect()
             }
         }
-        ValueData::String(s) => (0..s.chars().count()).map(|i| Value::string(i.to_string())).collect(),
+        ValueData::String(s) => (0..s.chars().count())
+            .map(|i| Value::string(i.to_string()))
+            .collect(),
         _ => Vec::new(),
     };
     make_array(keys)
@@ -1244,12 +1372,16 @@ fn object_values(args: &[Value]) -> Value {
         ValueData::Object(o) => {
             let b = o.borrow();
             if b.is_exotic_array {
-                (0..array_len(&target)).map(|i| array_get(&target, i)).collect()
+                (0..array_len(&target))
+                    .map(|i| array_get(&target, i))
+                    .collect()
             } else {
                 b.properties
                     .values()
                     .filter_map(|d| match d {
-                        js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
+                        js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                            Some(value.clone())
+                        }
                         _ => None,
                     })
                     .collect()
@@ -1446,20 +1578,28 @@ fn json_str(v: &Value) -> Option<String> {
                     .properties
                     .get("length")
                     .and_then(|d| match d {
-                        js_runtime::object::PropertyDescriptor::Data { value, .. } => match value.data() {
-                            ValueData::Integer(i) => Some(*i as usize),
-                            ValueData::Number(n) => Some(*n as usize),
-                            _ => None,
-                        },
+                        js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                            match value.data() {
+                                ValueData::Integer(i) => Some(*i as usize),
+                                ValueData::Number(n) => Some(*n as usize),
+                                _ => None,
+                            }
+                        }
                         _ => None,
                     })
                     .unwrap_or(0);
                 let mut parts = Vec::new();
                 for i in 0..len {
-                    let elt = b.properties.get(&i.to_string()).and_then(|d| match d {
-                        js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
-                        _ => None,
-                    }).unwrap_or_else(Value::undefined);
+                    let elt = b
+                        .properties
+                        .get(&i.to_string())
+                        .and_then(|d| match d {
+                            js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                                Some(value.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(Value::undefined);
                     parts.push(json_str(&elt).unwrap_or_else(|| "null".to_string()));
                 }
                 Some(format!("[{}]", parts.join(",")))
@@ -1515,7 +1655,11 @@ pub fn error_ctor(this: &Value, args: &[Value], name: &str) -> Value {
         Value::object(js_runtime::object::ObjectData::new_handle())
     };
     crate::interp::set_property(&obj, &Value::string("name"), Value::string(name));
-    let msg = args.get(0).map(to_string).filter(|s| !s.is_empty()).unwrap_or_default();
+    let msg = args
+        .get(0)
+        .map(to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
     crate::interp::set_property(&obj, &Value::string("message"), Value::string(msg));
     obj
 }
@@ -1566,7 +1710,9 @@ fn assert_same_value(args: &[Value], negate: bool) -> Result<NativeResult, Inter
         return Ok(NativeResult::Value(Value::undefined()));
     }
     let op = if negate { "not " } else { "" };
-    let detail = args.get(2).filter(|v| matches!(v.data(), ValueData::String(_)));
+    let detail = args
+        .get(2)
+        .filter(|v| matches!(v.data(), ValueData::String(_)));
     let msg = match detail {
         Some(v) => to_string(v),
         None => format!(
@@ -1662,9 +1808,7 @@ fn thrown_name(v: &Value) -> Option<String> {
 /// supported, but synchronous `$DONE(value)` rejection paths still matter.)
 fn done(args: &[Value]) -> Result<NativeResult, InterpError> {
     match args.get(0) {
-        Some(v) if !matches!(v.data(), ValueData::Undefined) => {
-            Err(InterpError::Throw(v.clone()))
-        }
+        Some(v) if !matches!(v.data(), ValueData::Undefined) => Err(InterpError::Throw(v.clone())),
         _ => Ok(NativeResult::Value(Value::undefined())),
     }
 }
@@ -1678,7 +1822,10 @@ pub fn install_test262_harness(globals: &mut std::collections::HashMap<String, V
         "assert".to_string(),
         namespace(vec![
             ("sameValue", native_fn("sameValue", ASSERT_SAME_VALUE)),
-            ("notSameValue", native_fn("notSameValue", ASSERT_NOT_SAME_VALUE)),
+            (
+                "notSameValue",
+                native_fn("notSameValue", ASSERT_NOT_SAME_VALUE),
+            ),
             ("throws", native_fn("throws", ASSERT_THROWS)),
         ]),
     );
@@ -1720,9 +1867,14 @@ pub fn instanceof_check(a: &Value, b: &Value) -> bool {
 
 fn json_parse(args: &[Value]) -> Result<NativeResult, InterpError> {
     let s = args.get(0).map(to_string).unwrap_or_default();
-    let mut parser = JsonParser { chars: s.chars().collect(), pos: 0 };
+    let mut parser = JsonParser {
+        chars: s.chars().collect(),
+        pos: 0,
+    };
     parser.skip_ws();
-    let val = parser.parse_value().map_err(|e| InterpError::Internal(format!("JSON.parse: {}", e)))?;
+    let val = parser
+        .parse_value()
+        .map_err(|e| InterpError::Internal(format!("JSON.parse: {}", e)))?;
     parser.skip_ws();
     if parser.pos < parser.chars.len() {
         return Err(InterpError::Internal("JSON.parse: trailing content".into()));
@@ -1745,7 +1897,10 @@ impl JsonParser {
         Some(c)
     }
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\n') | Some('\r')) {
+        while matches!(
+            self.peek(),
+            Some(' ') | Some('\t') | Some('\n') | Some('\r')
+        ) {
             self.pos += 1;
         }
     }
@@ -1772,18 +1927,37 @@ impl JsonParser {
     }
     fn parse_number(&mut self) -> Result<Value, String> {
         let start = self.pos;
-        if self.peek() == Some('-') { self.bump(); }
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) { self.bump(); }
-        if self.peek() == Some('.') { self.bump(); while matches!(self.peek(), Some(c) if c.is_ascii_digit()) { self.bump(); } }
+        if self.peek() == Some('-') {
+            self.bump();
+        }
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.bump();
+        }
+        if self.peek() == Some('.') {
+            self.bump();
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.bump();
+            }
+        }
         if matches!(self.peek(), Some('e') | Some('E')) {
             self.bump();
-            if matches!(self.peek(), Some('+') | Some('-')) { self.bump(); }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) { self.bump(); }
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.bump();
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.bump();
+            }
         }
         let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>().map(|n| {
-            if n.fract() == 0.0 && n.is_finite() && n.abs() < i32::MAX as f64 { Value::integer(n as i32) } else { Value::number(n) }
-        }).map_err(|_| "invalid number".into())
+        s.parse::<f64>()
+            .map(|n| {
+                if n.fract() == 0.0 && n.is_finite() && n.abs() < i32::MAX as f64 {
+                    Value::integer(n as i32)
+                } else {
+                    Value::number(n)
+                }
+            })
+            .map_err(|_| "invalid number".into())
     }
     fn parse_string(&mut self) -> Result<String, String> {
         self.bump(); // opening quote
@@ -1793,16 +1967,23 @@ impl JsonParser {
                 None => return Err("unterminated string".into()),
                 Some('"') => break,
                 Some('\\') => match self.bump() {
-                    Some('n') => out.push('\n'), Some('t') => out.push('\t'), Some('r') => out.push('\r'),
-                    Some('"') => out.push('"'), Some('\\') => out.push('\\'), Some('/') => out.push('/'),
-                    Some('b') => out.push('\u{0008}'), Some('f') => out.push('\u{000C}'),
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some('/') => out.push('/'),
+                    Some('b') => out.push('\u{0008}'),
+                    Some('f') => out.push('\u{000C}'),
                     Some('u') => {
                         let mut code = 0u32;
                         for _ in 0..4 {
                             let c = self.bump().ok_or("bad unicode escape")?;
                             code = code * 16 + c.to_digit(16).ok_or("bad hex")?;
                         }
-                        if let Some(ch) = char::from_u32(code) { out.push(ch); }
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                        }
                     }
                     _ => return Err("bad escape".into()),
                 },
@@ -1815,12 +1996,17 @@ impl JsonParser {
         self.bump(); // [
         self.skip_ws();
         let mut items = Vec::new();
-        if self.peek() == Some(']') { self.bump(); return Ok(make_array(items)); }
+        if self.peek() == Some(']') {
+            self.bump();
+            return Ok(make_array(items));
+        }
         loop {
             items.push(self.parse_value()?);
             self.skip_ws();
             match self.bump() {
-                Some(',') => { self.skip_ws(); }
+                Some(',') => {
+                    self.skip_ws();
+                }
                 Some(']') => break,
                 _ => return Err("expected , or ]".into()),
             }
@@ -1831,12 +2017,17 @@ impl JsonParser {
         self.bump(); // {
         self.skip_ws();
         let obj = Value::object(js_runtime::object::ObjectData::new_handle());
-        if self.peek() == Some('}') { self.bump(); return Ok(obj); }
+        if self.peek() == Some('}') {
+            self.bump();
+            return Ok(obj);
+        }
         loop {
             self.skip_ws();
             let key = self.parse_string()?;
             self.skip_ws();
-            if self.bump() != Some(':') { return Err("expected :".into()); }
+            if self.bump() != Some(':') {
+                return Err("expected :".into());
+            }
             let val = self.parse_value()?;
             crate::interp::set_property(&obj, &Value::string(key), val);
             self.skip_ws();
@@ -1855,7 +2046,10 @@ impl JsonParser {
 fn num_to_fixed(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> {
     let n = arg_f64(&[this.clone()], 0).unwrap_or(f64::NAN);
     let digits = arg_int(args, 0).unwrap_or(0).max(0) as usize;
-    Ok(NativeResult::Value(Value::string(format!("{:.*}", digits, n))))
+    Ok(NativeResult::Value(Value::string(format!(
+        "{:.*}",
+        digits, n
+    ))))
 }
 
 fn num_to_string(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> {
@@ -1865,15 +2059,24 @@ fn num_to_string(this: &Value, args: &[Value]) -> Result<NativeResult, InterpErr
         return Ok(NativeResult::Value(Value::string(format_number_simple(n))));
     }
     if !(2..=36).contains(&radix) {
-        return Err(InterpError::Internal("toString() radix must be 2..36".into()));
+        return Err(InterpError::Internal(
+            "toString() radix must be 2..36".into(),
+        ));
     }
     let int_part = n.trunc() as i64;
     let frac = n - n.trunc();
-    let int_str = if int_part == 0 { "0".to_string() } else {
+    let int_str = if int_part == 0 {
+        "0".to_string()
+    } else {
         let mut s = String::new();
         let mut v = int_part.abs();
-        while v > 0 { s.push(char::from_digit((v % radix as i64) as u32, radix as u32).unwrap()); v /= radix as i64; }
-        if int_part < 0 { s.push('-'); }
+        while v > 0 {
+            s.push(char::from_digit((v % radix as i64) as u32, radix as u32).unwrap());
+            v /= radix as i64;
+        }
+        if int_part < 0 {
+            s.push('-');
+        }
         s.chars().rev().collect()
     };
     let frac_str = if frac > 0.0 {
@@ -1884,17 +2087,28 @@ fn num_to_string(this: &Value, args: &[Value]) -> Result<NativeResult, InterpErr
             let d = f.trunc() as u32;
             s.push(char::from_digit(d, radix as u32).unwrap_or('0'));
             f -= d as f64;
-            if f < 1e-10 { break; }
+            if f < 1e-10 {
+                break;
+            }
         }
         s
-    } else { String::new() };
-    Ok(NativeResult::Value(Value::string(format!("{}{}", int_str, frac_str))))
+    } else {
+        String::new()
+    };
+    Ok(NativeResult::Value(Value::string(format!(
+        "{}{}",
+        int_str, frac_str
+    ))))
 }
 
 fn format_number_simple(n: f64) -> String {
-    if n.is_nan() { "NaN".into() }
-    else if n.fract() == 0.0 && n.abs() < 1e21 { format!("{}", n as i64) }
-    else { format!("{}", n) }
+    if n.is_nan() {
+        "NaN".into()
+    } else if n.fract() == 0.0 && n.abs() < 1e21 {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
 }
 
 fn num_is_integer(args: &[Value]) -> bool {
@@ -1911,7 +2125,9 @@ fn str_from_char_code(args: &[Value]) -> Result<NativeResult, InterpError> {
     let mut out = String::new();
     for a in args {
         if let Some(code) = arg_f64(&[a.clone()], 0) {
-            if let Some(c) = char::from_u32(code as u32) { out.push(c); }
+            if let Some(c) = char::from_u32(code as u32) {
+                out.push(c);
+            }
         }
     }
     Ok(NativeResult::Value(Value::string(out)))
@@ -1931,11 +2147,17 @@ fn str_code_point_at(this: &Value, args: &[Value]) -> Result<NativeResult, Inter
 
 /// Extract source+flags from a RegExp object and compile.
 fn compile_regex_obj(obj: &Value) -> Option<crate::regex::RegexProgram> {
-    let src = match crate::interp::get_property(obj, &Value::string("source")).data().clone() {
+    let src = match crate::interp::get_property(obj, &Value::string("source"))
+        .data()
+        .clone()
+    {
         ValueData::String(s) => s.as_str().to_string(),
         _ => return None,
     };
-    let flags = match crate::interp::get_property(obj, &Value::string("flags")).data().clone() {
+    let flags = match crate::interp::get_property(obj, &Value::string("flags"))
+        .data()
+        .clone()
+    {
         ValueData::String(s) => s.as_str().to_string(),
         _ => String::new(),
     };
@@ -1943,13 +2165,19 @@ fn compile_regex_obj(obj: &Value) -> Option<crate::regex::RegexProgram> {
 }
 
 fn regex_test(this: &Value, args: &[Value]) -> Value {
-    let prog = match compile_regex_obj(this) { Some(p) => p, None => return Value::boolean(false) };
+    let prog = match compile_regex_obj(this) {
+        Some(p) => p,
+        None => return Value::boolean(false),
+    };
     let input = args.get(0).map(to_string).unwrap_or_default();
     Value::boolean(prog.run(&input, 0).is_some())
 }
 
 fn regex_exec(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> {
-    let prog = match compile_regex_obj(this) { Some(p) => p, None => return Ok(NativeResult::Value(Value::null())) };
+    let prog = match compile_regex_obj(this) {
+        Some(p) => p,
+        None => return Ok(NativeResult::Value(Value::null())),
+    };
     let input = args.get(0).map(to_string).unwrap_or_default();
     match prog.run(&input, 0) {
         Some(m) => {
@@ -1965,7 +2193,11 @@ fn regex_exec(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError>
             // Set .index and .input on the result array.
             let arr = make_array(items);
             if let Some((start, _)) = m.full_match() {
-                crate::interp::set_property(&arr, &Value::string("index"), Value::integer(start as i32));
+                crate::interp::set_property(
+                    &arr,
+                    &Value::string("index"),
+                    Value::integer(start as i32),
+                );
             }
             crate::interp::set_property(&arr, &Value::string("input"), Value::string(input));
             Ok(NativeResult::Value(arr))
@@ -2002,10 +2234,13 @@ fn str_search(this: &Value, args: &[Value]) -> isize {
     } else {
         let pat = to_string(&re);
         let o = js_runtime::object::ObjectData::new_handle();
-        { let mut b = o.borrow_mut(); b.class = "RegExp";
-          let pd = |v: Value| js_runtime::object::PropertyDescriptor::data(v);
-          b.properties.insert("source".into(), pd(Value::string(pat)));
-          b.properties.insert("flags".into(), pd(Value::string(""))); }
+        {
+            let mut b = o.borrow_mut();
+            b.class = "RegExp";
+            let pd = |v: Value| js_runtime::object::PropertyDescriptor::data(v);
+            b.properties.insert("source".into(), pd(Value::string(pat)));
+            b.properties.insert("flags".into(), pd(Value::string("")));
+        }
         Value::object(o)
     };
     match compile_regex_obj(&re_obj) {

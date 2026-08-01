@@ -8,70 +8,70 @@
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Punctuator {
     // Punctuation / delimiters
-    LBrace,    // {
-    RBrace,    // }
-    LParen,    // (
-    RParen,    // )
-    LBracket,  // [
-    RBracket,  // ]
-    Dot,       // .
-    Spread,    // ...
-    Semicolon, // ;
-    Comma,     // ,
-    Colon,     // :
-    Arrow,     // =>
-    QuestionMark,    // ?
-    NullishCoal,     // ??
-    OptChain,        // ?.
+    LBrace,       // {
+    RBrace,       // }
+    LParen,       // (
+    RParen,       // )
+    LBracket,     // [
+    RBracket,     // ]
+    Dot,          // .
+    Spread,       // ...
+    Semicolon,    // ;
+    Comma,        // ,
+    Colon,        // :
+    Arrow,        // =>
+    QuestionMark, // ?
+    NullishCoal,  // ??
+    OptChain,     // ?.
     // Assignment
-    Assign,     // =
-    AddAssign,  // +=
-    SubAssign,  // -=
-    MulAssign,  // *=
-    DivAssign,  // /=
-    ModAssign,  // %=
-    ExpAssign,  // **=
-    BitAndAssign, // &=
-    BitOrAssign,  // |=
-    BitXorAssign, // ^=
-    ShlAssign,    // <<=
-    ShrAssign,    // >>=
-    UshrAssign,   // >>>=
-    AndAssign,    // &&=
-    OrAssign,     // ||=
+    Assign,        // =
+    AddAssign,     // +=
+    SubAssign,     // -=
+    MulAssign,     // *=
+    DivAssign,     // /=
+    ModAssign,     // %=
+    ExpAssign,     // **=
+    BitAndAssign,  // &=
+    BitOrAssign,   // |=
+    BitXorAssign,  // ^=
+    ShlAssign,     // <<=
+    ShrAssign,     // >>=
+    UshrAssign,    // >>>=
+    AndAssign,     // &&=
+    OrAssign,      // ||=
     NullishAssign, // ??=
     // Comparison
-    Eq,        // ==
-    NotEq,     // !=
-    StrictEq,  // ===
+    Eq,          // ==
+    NotEq,       // !=
+    StrictEq,    // ===
     StrictNotEq, // !==
-    Lt,        // <
-    Gt,        // >
-    Le,        // <=
-    Ge,        // >=
+    Lt,          // <
+    Gt,          // >
+    Le,          // <=
+    Ge,          // >=
     // Arithmetic
-    Add,       // +
-    Sub,       // -
-    Mul,       // *
-    Div,       // /
-    Mod,       // %
-    Exp,       // **
-    Inc,       // ++
-    Dec,       // --
+    Add, // +
+    Sub, // -
+    Mul, // *
+    Div, // /
+    Mod, // %
+    Exp, // **
+    Inc, // ++
+    Dec, // --
     // Logical
-    And,       // &&
-    Or,        // ||
-    Not,       // !
+    And, // &&
+    Or,  // ||
+    Not, // !
     // Bitwise
-    BitAnd,    // &
-    BitOr,     // |
-    BitXor,    // ^
-    BitNot,    // ~
-    Shl,       // <<
-    Shr,       // >>
-    Ushr,      // >>>
+    BitAnd, // &
+    BitOr,  // |
+    BitXor, // ^
+    BitNot, // ~
+    Shl,    // <<
+    Shr,    // >>
+    Ushr,   // >>>
     // Decorators (stage-3 proposal): leading `@` of `@decorator`.
-    At,        // @
+    At, // @
 }
 
 impl Punctuator {

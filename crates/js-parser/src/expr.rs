@@ -7,7 +7,7 @@
 use crate::token_stream::ParserTokenStream;
 use js_diagnostics::Diagnostic;
 use js_syntax::ast::expr::{
-    ArrowBody, ArrowExpr, ArrayExprElement, AssignTarget, CallArg, CallExpr, Expr, FunctionExpr,
+    ArrayExprElement, ArrowBody, ArrowExpr, AssignTarget, CallArg, CallExpr, Expr, FunctionExpr,
     ImportPhase, MemberExpr, MemberProp, NewExpr, ObjectProp, ObjectPropKind, ObjectPropValue,
 };
 use js_syntax::ast::lit::Lit;
@@ -15,10 +15,10 @@ use js_syntax::ast::op::{AssignOp, BinOp, UnaryOp, UpdateOp};
 use js_syntax::ast::pat::{ArrayPatElement, ObjectPatProp, Pat, PropKey};
 use js_syntax::ast::stmt::Stmt;
 use js_syntax::keyword::Keyword;
-use std::str::FromStr;
 use js_syntax::punctuator::Punctuator;
 use js_syntax::source::Span;
 use js_syntax::token::TokenKind;
+use std::str::FromStr;
 
 /// Operator binding power pairs: `(left, right)` precedence, used by the Pratt
 /// loop. Higher binds tighter. Derived from the ECMAScript grammar.
@@ -65,7 +65,10 @@ pub(crate) fn parse_expression_inner(
             break;
         }
     }
-    let span = Span::new(exprs.first().unwrap().span().start, exprs.last().unwrap().span().end);
+    let span = Span::new(
+        exprs.first().unwrap().span().start,
+        exprs.last().unwrap().span().end,
+    );
     Ok(Expr::Sequence { span, exprs })
 }
 
@@ -85,7 +88,7 @@ fn parse_assignment_inner(
     if tokens.current_ctx().is_generator
         && matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Yield))
     {
-        return parse_yield(tokens);
+        return parse_yield(tokens, in_ok);
     }
     if let Some(arrow) = try_parse_arrow(tokens)? {
         return Ok(arrow);
@@ -117,26 +120,19 @@ fn parse_assignment_inner(
     tokens.bump();
     // The RHS inherits the `In` grammar parameter (`for (x = a in b; …)` blocks `in`).
     let rhs = parse_assignment_inner(tokens, in_ok)?;
-    // Unwrap parenthesization: `(x) = 1` / `(a.b) = 1` are valid assignment
-    // targets (CoverParenthesizedExpression collapses to the inner expression).
-    let mut lhs = lhs;
-    while let Expr::Paren { expr, .. } = &lhs {
-        lhs = (**expr).clone();
-    }
-    let target = match &lhs {
-        Expr::Ident { span, name } => AssignTarget::Ident {
-            span: *span,
-            name: name.clone(),
-        },
-        Expr::Member(m) => AssignTarget::Member(m.clone()),
-        // Destructuring assignment: an array/object literal on the LHS is
-        // reinterpreted as a pattern. For the milestone we keep the literal as
-        // the pattern source; the compiler resolves it later.
-        Expr::Array { .. } | Expr::Object { .. } => {
-            AssignTarget::Pat(array_or_object_to_pat(&lhs).map_err(|e| vec![e])?)
+    let target_pattern = assignment_pattern_from_expr(&lhs)
+        .map_err(|_| vec![Diagnostic::error(eq_span, "invalid assignment target")])?;
+    let target = match target_pattern {
+        Pat::Ident { span, name } => AssignTarget::Ident { span, name },
+        Pat::Member(member) => AssignTarget::Member(member),
+        pattern @ (Pat::Array { .. } | Pat::Object { .. }) if op == AssignOp::Assign => {
+            AssignTarget::Pat(pattern)
         }
         _ => {
-            return Err(vec![Diagnostic::error(eq_span, "invalid assignment target")]);
+            return Err(vec![Diagnostic::error(
+                eq_span,
+                "invalid assignment target",
+            )]);
         }
     };
     let span = Span::new(lhs.span().start, rhs.span().end);
@@ -153,18 +149,25 @@ fn parse_assignment_inner(
 fn try_parse_arrow(tokens: &mut ParserTokenStream) -> Result<Option<Expr>, Vec<Diagnostic>> {
     // `Identifier =>` (also a contextual keyword like `yield`/`await` as a name).
     if let Some(name) = peek_binding_name(tokens) {
-        if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow)) {
+        if matches!(
+            tokens.peek2().kind,
+            TokenKind::Punctuator(Punctuator::Arrow)
+        ) && !tokens.preceded_by_newline_at(1)
+        {
             let snap = tokens.snapshot();
             let start = tokens.span();
             tokens.bump(); // the param name
             tokens.bump(); // `=>`
-            return match parse_arrow_body(tokens, start) {
+
+            // A non-async arrow establishes a return target but inherits the
+            // enclosing await/yield grammar parameters lexically.
+            tokens.push_ctx(tokens.current_ctx());
+            let body = parse_arrow_body(tokens, start);
+            tokens.pop_ctx();
+            return match body {
                 Ok(body) => Ok(Some(Expr::Arrow(Box::new(ArrowExpr {
                     span: arrow_span(start, &body),
-                    params: vec![Pat::Ident {
-                        span: start,
-                        name,
-                    }],
+                    params: vec![Pat::Ident { span: start, name }],
                     body,
                     is_async: false,
                 })))),
@@ -176,17 +179,25 @@ fn try_parse_arrow(tokens: &mut ParserTokenStream) -> Result<Option<Expr>, Vec<D
         }
     }
     // `( ... ) =>` — only worth trying when we open a paren.
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         let snap = tokens.snapshot();
         match parse_arrow_params(tokens) {
             Ok(params) => {
-                if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow)) {
+                if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow))
+                    && !tokens.preceded_by_newline()
+                {
                     let start = tokens.span();
                     let lparen_start = start.start; // overwritten below via snap
                     let _ = lparen_start;
                     tokens.bump(); // `=>`
                     let real_start = first_span_after(snap, tokens);
-                    match parse_arrow_body(tokens, real_start) {
+                    tokens.push_ctx(tokens.current_ctx());
+                    let body = parse_arrow_body(tokens, real_start);
+                    tokens.pop_ctx();
+                    match body {
                         Ok(body) => {
                             return Ok(Some(Expr::Arrow(Box::new(ArrowExpr {
                                 span: arrow_span(real_start, &body),
@@ -212,16 +223,32 @@ fn try_parse_arrow(tokens: &mut ParserTokenStream) -> Result<Option<Expr>, Vec<D
 /// `async`-prefixed arrow (`async x => ...`, `async (a,b) => ...`), or fall
 /// back to treating `async` as a plain identifier. The `async` keyword token is
 /// already consumed by the caller.
-fn try_parse_async_arrow(tokens: &mut ParserTokenStream, start: Span) -> Result<Expr, Vec<Diagnostic>> {
+fn try_parse_async_arrow(
+    tokens: &mut ParserTokenStream,
+    start: Span,
+) -> Result<Expr, Vec<Diagnostic>> {
+    // An escaped `async` is an IdentifierReference, never the grammar terminal
+    // introducing an async arrow. A line terminator after `async` likewise
+    // prevents the async-arrow production and leaves ordinary expression/ASI
+    // parsing to determine whether the surrounding source is valid.
+    if tokens.token_span_contains_escape(start) || tokens.preceded_by_newline() {
+        return Ok(Expr::Ident {
+            span: start,
+            name: "async".to_string(),
+        });
+    }
     let snap = tokens.snapshot();
     // `async <binding> =>` — a single-parameter async arrow. The parameter may
     // be a contextual keyword (`async of => …`, `async as => …`).
-    if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Arrow))
+    if matches!(
+        tokens.peek2().kind,
+        TokenKind::Punctuator(Punctuator::Arrow)
+    ) && !tokens.preceded_by_newline_at(1)
         && peek_binding_name(tokens).is_some()
     {
         let name = binding_identifier(tokens).unwrap_or_default();
         tokens.bump(); // `=>`
-        // Async-arrow body is an async context (`await` reserved).
+                       // Async-arrow body is an async context (`await` reserved).
         tokens.enter_fn(true, false);
         let body = parse_arrow_body(tokens, start);
         tokens.pop_ctx();
@@ -239,11 +266,15 @@ fn try_parse_async_arrow(tokens: &mut ParserTokenStream, start: Span) -> Result<
         };
     }
     // `async ( params ) =>`
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         tokens.enter_fn(true, false);
         let parsed = parse_arrow_params(tokens);
         let is_arrow = parsed.is_ok()
-            && matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow));
+            && matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Arrow))
+            && !tokens.preceded_by_newline();
         if is_arrow {
             let params = parsed.unwrap();
             tokens.bump(); // `=>`
@@ -291,7 +322,10 @@ fn parse_arrow_body(
     tokens: &mut ParserTokenStream,
     _start: Span,
 ) -> Result<ArrowBody, Vec<Diagnostic>> {
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LBrace)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LBrace)
+    ) {
         let (body, _) = parse_block(tokens)?;
         Ok(ArrowBody::Block(body))
     } else {
@@ -303,12 +337,18 @@ fn parse_arrow_body(
 /// Parse `(` <binding-pattern-list> `)` for an arrow head. Returns `Err` (not a
 /// diagnostic) if the input is not a valid parameter list — the caller restores.
 fn parse_arrow_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, ()> {
-    if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         return Err(());
     }
     tokens.bump();
     let mut params = Vec::new();
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RParen)
+    ) {
         tokens.bump();
         return Ok(params);
     }
@@ -318,12 +358,18 @@ fn parse_arrow_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, ()> {
             match parse_binding_pattern(tokens) {
                 Ok(p) => {
                     let span = p.span();
-                    params.push(Pat::Rest { span, arg: Box::new(p) });
+                    params.push(Pat::Rest {
+                        span,
+                        arg: Box::new(p),
+                    });
                 }
                 Err(_) => return Err(()),
             }
             // A rest parameter must be immediately followed by `)`.
-            if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+            if !matches!(
+                tokens.peek_kind(),
+                TokenKind::Punctuator(Punctuator::RParen)
+            ) {
                 return Err(());
             }
             tokens.bump();
@@ -337,7 +383,10 @@ fn parse_arrow_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, ()> {
             TokenKind::Punctuator(Punctuator::Comma) => {
                 tokens.bump();
                 // Trailing comma before `)`.
-                if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+                if matches!(
+                    tokens.peek_kind(),
+                    TokenKind::Punctuator(Punctuator::RParen)
+                ) {
                     tokens.bump();
                     return Ok(params);
                 }
@@ -353,10 +402,10 @@ fn parse_arrow_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, ()> {
 
 /// `yield`, `yield expr`, or `yield* expr` (delegate). Restricted production:
 /// a line terminator before the operand means no operand.
-fn parse_yield(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
+fn parse_yield(tokens: &mut ParserTokenStream, in_ok: bool) -> Result<Expr, Vec<Diagnostic>> {
     let start = tokens.span();
     tokens.bump(); // `yield`
-    let delegate = tokens.eat_punctuator(Punctuator::Mul);
+    let delegate = !tokens.preceded_by_newline() && tokens.eat_punctuator(Punctuator::Mul);
     // No operand if a newline (or `;`/`}`/`)`/EOF) follows.
     let stop = matches!(
         tokens.peek_kind(),
@@ -371,7 +420,7 @@ fn parse_yield(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
     let arg = if stop {
         None
     } else {
-        Some(Box::new(parse_assignment(tokens)?))
+        Some(Box::new(parse_assignment_inner(tokens, in_ok)?))
     };
     let end = arg.as_ref().map(|e| e.span().end).unwrap_or(start.end);
     Ok(Expr::Yield {
@@ -388,7 +437,9 @@ fn parse_conditional_inner(
 ) -> Result<Expr, Vec<Diagnostic>> {
     let test = parse_binary_inner(tokens, 0, in_ok)?;
     if tokens.eat_punctuator(Punctuator::QuestionMark) {
-        let cons = parse_assignment_inner(tokens, in_ok)?;
+        // ConditionalExpression[In] always parses its consequent with [+In];
+        // only the test and alternate inherit the surrounding grammar flag.
+        let cons = parse_assignment_inner(tokens, true)?;
         let _ = expect_punctuator(tokens, Punctuator::Colon)?;
         let alt = parse_assignment_inner(tokens, in_ok)?;
         let span = Span::new(test.span().start, alt.span().end);
@@ -408,7 +459,11 @@ fn parse_binary_inner(
     min_bp: u8,
     in_ok: bool,
 ) -> Result<Expr, Vec<Diagnostic>> {
-    let mut lhs = parse_unary(tokens)?;
+    let mut lhs = if matches!(tokens.peek_kind(), TokenKind::PrivateName(_)) {
+        parse_private_in(tokens, min_bp, in_ok)?
+    } else {
+        parse_unary(tokens)?
+    };
     loop {
         // Operator position: a `/` here is always the division operator, never a
         // regex (a regex literal never serves as a binary operator). The lexer's
@@ -433,13 +488,34 @@ fn parse_binary_inner(
             _ => break,
         };
         let (l_bp, r_bp) = binding_power(op).ok_or_else(|| {
-            vec![Diagnostic::error(tokens.span(), "operator has no binding power")]
+            vec![Diagnostic::error(
+                tokens.span(),
+                "operator has no binding power",
+            )]
         })?;
         if l_bp < min_bp {
             break;
         }
+        if forbidden_coalesce_mix(op, &lhs) {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "nullish coalescing may not be mixed with `&&` or `||` without parentheses",
+            )]);
+        }
+        if op == BinOp::Exp && matches!(lhs, Expr::Unary { .. } | Expr::Await { .. }) {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "an unparenthesized unary expression may not be the left operand of `**`",
+            )]);
+        }
         tokens.bump();
         let rhs = parse_binary_inner(tokens, r_bp, in_ok)?;
+        if forbidden_coalesce_mix(op, &rhs) {
+            return Err(vec![Diagnostic::error(
+                rhs.span(),
+                "nullish coalescing may not be mixed with `&&` or `||` without parentheses",
+            )]);
+        }
         let span = Span::new(lhs.span().start, rhs.span().end);
         lhs = if matches!(op, BinOp::And | BinOp::Or | BinOp::NullishCoal) {
             Expr::Logical {
@@ -458,6 +534,35 @@ fn parse_binary_inner(
         };
     }
     Ok(lhs)
+}
+
+/// Parse the dedicated `PrivateIdentifier in ShiftExpression` relational
+/// production. A private identifier is not a PrimaryExpression, so this entry
+/// is available only at relational precedence and only when `[In]` is enabled.
+fn parse_private_in(
+    tokens: &mut ParserTokenStream,
+    min_bp: u8,
+    in_ok: bool,
+) -> Result<Expr, Vec<Diagnostic>> {
+    let (relational_bp, shift_expression_bp) = binding_power(BinOp::In).unwrap();
+    let private = tokens.bump();
+    let name = match private.kind {
+        TokenKind::PrivateName(name) => name,
+        _ => unreachable!(),
+    };
+    if min_bp > relational_bp || !in_ok || !tokens.is_unescaped_keyword_at(0, Keyword::In) {
+        return Err(vec![Diagnostic::error(
+            private.span,
+            "a private identifier is only valid as the left operand of `in`",
+        )]);
+    }
+    tokens.bump(); // `in`
+    let right = parse_binary_inner(tokens, shift_expression_bp, true)?;
+    Ok(Expr::PrivateIn {
+        span: Span::new(private.span.start, right.span().end),
+        name,
+        right: Box::new(right),
+    })
 }
 
 /// Unary prefix operators, including prefix `++` / `--`.
@@ -556,7 +661,10 @@ fn parse_postfix_chain(
         match tokens.peek_kind() {
             TokenKind::Punctuator(Punctuator::LParen) => {
                 let args = parse_call_args(tokens)?;
-                let span = Span::new(expr.span().start, last_arg_end(&args).unwrap_or(expr.span().end));
+                let span = Span::new(
+                    expr.span().start,
+                    last_arg_end(&args).unwrap_or(expr.span().end),
+                );
                 *expr = Expr::Call(Box::new(CallExpr {
                     span,
                     callee: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
@@ -571,7 +679,10 @@ fn parse_postfix_chain(
                 match tokens.peek_kind() {
                     TokenKind::Punctuator(Punctuator::LParen) => {
                         let args = parse_call_args(tokens)?;
-                        let span = Span::new(expr.span().start, last_arg_end(&args).unwrap_or(expr.span().end));
+                        let span = Span::new(
+                            expr.span().start,
+                            last_arg_end(&args).unwrap_or(expr.span().end),
+                        );
                         *expr = Expr::Call(Box::new(CallExpr {
                             span,
                             callee: Box::new(std::mem::replace(expr, Expr::This(Span::DUMMY))),
@@ -641,6 +752,12 @@ fn parse_postfix_chain(
             // Tagged template: `tag\`…\`` / `obj.method\`…\``. The current token
             // is the template's first chunk.
             TokenKind::Template { .. } => {
+                if has_unparenthesized_optional_chain(expr) {
+                    return Err(vec![Diagnostic::error(
+                        expr.span(),
+                        "an optional chain may not be used directly as a tagged-template tag",
+                    )]);
+                }
                 let (raw, cooked, tail) = match tokens.peek_kind() {
                     TokenKind::Template { raw, cooked, tail } => {
                         (raw.clone(), cooked.clone(), *tail)
@@ -648,7 +765,7 @@ fn parse_postfix_chain(
                     _ => unreachable!(),
                 };
                 let tok = tokens.bump();
-                let template = parse_template(tokens, tok.span, raw, cooked, tail)?;
+                let template = parse_template(tokens, tok.span, raw, cooked, tail, true)?;
                 let span = Span::new(expr.span().start, template.span().end);
                 *expr = Expr::TaggedTemplate {
                     span,
@@ -694,23 +811,50 @@ fn last_arg_end(args: &[CallArg]) -> Option<js_syntax::source::BytePos> {
     })
 }
 
+fn forbidden_coalesce_mix(operator: BinOp, expression: &Expr) -> bool {
+    match expression {
+        Expr::Logical { op, .. } => match operator {
+            BinOp::NullishCoal => matches!(op, BinOp::And | BinOp::Or),
+            BinOp::And | BinOp::Or => *op == BinOp::NullishCoal,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+pub(crate) fn has_unparenthesized_optional_chain(expression: &Expr) -> bool {
+    match expression {
+        Expr::Member(member) => {
+            member.optional || has_unparenthesized_optional_chain(&member.object)
+        }
+        Expr::Call(call) => call.optional || has_unparenthesized_optional_chain(&call.callee),
+        // Parentheses terminate an OptionalChain grammar production.
+        _ => false,
+    }
+}
+
 /// `new` expression: `new C`, `new C(args)`, `new C.x.y(args)`, `new.target`.
 fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> {
     let start = tokens.span();
+    if tokens.current_token_contains_escape() {
+        return Err(vec![Diagnostic::error(
+            start,
+            "the `new` terminal may not contain an escape sequence",
+        )]);
+    }
     tokens.bump(); // `new`
-    // `new.target`
+                   // `new.target`
     if tokens.eat_punctuator(Punctuator::Dot) {
-        if let TokenKind::Ident(n) = tokens.peek_kind().clone() {
-            tokens.bump();
-            // Represent new.target as a member access on `this` (parse-only).
-            let _ = n;
-            return Ok(Expr::Member(Box::new(MemberExpr {
-                span: Span::new(start.start, tokens.span().start),
-                object: Box::new(Expr::This(start)),
-                property: MemberProp::Ident("target".to_string()),
-                optional: false,
-            })));
+        if matches!(tokens.peek_kind(), TokenKind::Ident(name) if name == "target")
+            && !tokens.current_token_contains_escape()
+        {
+            let target = tokens.bump();
+            return Ok(Expr::NewTarget(Span::new(start.start, target.span.end)));
         }
+        return Err(vec![Diagnostic::error(
+            tokens.span(),
+            "expected the unescaped identifier `target` after `new.`",
+        )]);
     }
     // Callee: either another `new` (right-assoc) or a primary followed by a
     // member-only chain (no calls — the first `(...)` belongs to `new`).
@@ -753,8 +897,17 @@ fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic
         e
     };
     // Optional constructor argument list.
+    if unparenthesized_import_call_root(&callee) {
+        return Err(vec![Diagnostic::error(
+            callee.span(),
+            "an import call cannot be used as an unparenthesized `new` callee",
+        )]);
+    }
     let mut args_end = callee.span().end;
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         let args = parse_call_args(tokens)?;
         args_end = last_arg_end(&args).unwrap_or(args_end);
         let span = Span::new(start.start, args_end);
@@ -774,12 +927,29 @@ fn parse_new_expr(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic
     Ok(callee)
 }
 
+/// Member access does not turn an ImportCall (a CallExpression) into the
+/// MemberExpression required as the operand of bare `new`. Parentheses do:
+/// `new import('x').p` is invalid, while `new (import('x').p)` is syntactically
+/// valid and may fail later at runtime if the value is not constructable.
+fn unparenthesized_import_call_root(expr: &Expr) -> bool {
+    match expr {
+        Expr::ImportCall { .. } => true,
+        Expr::Member(member) => unparenthesized_import_call_root(&member.object),
+        _ => false,
+    }
+}
+
 /// Parse `( arg, ... )` — a call/constructor argument list (without the leading
 /// paren consumed check; the caller ensures it).
-pub(crate) fn parse_call_args(tokens: &mut ParserTokenStream) -> Result<Vec<CallArg>, Vec<Diagnostic>> {
+pub(crate) fn parse_call_args(
+    tokens: &mut ParserTokenStream,
+) -> Result<Vec<CallArg>, Vec<Diagnostic>> {
     let _ = expect_punctuator(tokens, Punctuator::LParen)?;
     let mut args = Vec::new();
-    if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+    if !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RParen)
+    ) {
         loop {
             if tokens.eat_punctuator(Punctuator::Spread) {
                 let e = parse_assignment(tokens)?;
@@ -791,7 +961,10 @@ pub(crate) fn parse_call_args(tokens: &mut ParserTokenStream) -> Result<Vec<Call
                 break;
             }
             // Trailing comma: `f(a, b,)`.
-            if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+            if matches!(
+                tokens.peek_kind(),
+                TokenKind::Punctuator(Punctuator::RParen)
+            ) {
                 break;
             }
         }
@@ -806,14 +979,23 @@ pub(crate) fn parse_call_args(tokens: &mut ParserTokenStream) -> Result<Vec<Call
 fn shorthand_keyword_allowed(kw: Keyword) -> bool {
     matches!(
         kw,
-        Keyword::Let | Keyword::Static | Keyword::Async | Keyword::Await
-            | Keyword::Yield | Keyword::Of | Keyword::From | Keyword::As
-            | Keyword::Get | Keyword::Set | Keyword::Undefined
+        Keyword::Let
+            | Keyword::Static
+            | Keyword::Async
+            | Keyword::Await
+            | Keyword::Yield
+            | Keyword::Of
+            | Keyword::From
+            | Keyword::As
+            | Keyword::Get
+            | Keyword::Set
+            | Keyword::Undefined
     )
 }
 
-/// The property name after `.`: an identifier, a keyword used as a name, a
-/// private name, or (for completeness) a string/number. Returns `(name, is_private)`.
+/// The property name after `.`: an IdentifierName (including keyword spellings)
+/// or a PrivateIdentifier. Literal property keys are valid only in brackets or
+/// object/class definitions, never directly after `.`.
 pub(crate) fn parse_property_name(
     tokens: &mut ParserTokenStream,
 ) -> Result<(String, bool), Vec<Diagnostic>> {
@@ -829,13 +1011,6 @@ pub(crate) fn parse_property_name(
         TokenKind::Keyword(kw) => {
             tokens.bump();
             Ok((kw.as_str().to_string(), false))
-        }
-        TokenKind::String(_) => {
-            let s = match tokens.bump().kind {
-                TokenKind::String(s) => s,
-                _ => unreachable!(),
-            };
-            Ok((s, false))
         }
         _ => Err(vec![Diagnostic::error(
             tokens.span(),
@@ -874,30 +1049,53 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
                 .map_err(|e| vec![Diagnostic::error(span, e.message())])?;
             Ok(Expr::Lit(Lit::BigInt(span, raw)))
         }
-        TokenKind::String(s) => Ok(Expr::Lit(Lit::String(span, s))),
-        TokenKind::Regex { pattern, flags } => Ok(Expr::Regex { span, pattern, flags }),
+        TokenKind::String(s) => Ok(Expr::Lit(Lit::String(
+            span,
+            s,
+            tokens
+                .token_span_snippet(span)
+                .is_some_and(string_contains_legacy_escape),
+        ))),
+        TokenKind::Regex { pattern, flags } => {
+            crate::regexp::validate_pattern(&pattern, &flags)
+                .map_err(|message| vec![Diagnostic::error(span, message)])?;
+            Ok(Expr::Regex {
+                span,
+                pattern,
+                flags,
+            })
+        }
         TokenKind::Template { raw, cooked, tail } => {
-            parse_template(tokens, span, raw, cooked, tail)
+            parse_template(tokens, span, raw, cooked, tail, false)
         }
         TokenKind::Ident(name) => Ok(Expr::Ident { span, name }),
-        TokenKind::PrivateName(name) => Ok(Expr::Member(Box::new(MemberExpr {
+        TokenKind::PrivateName(_) => Err(vec![Diagnostic::error(
             span,
-            object: Box::new(Expr::This(span)),
-            property: MemberProp::Private(name),
-            optional: false,
-        }))),
+            "a private identifier is only valid as the left operand of `in`",
+        )]),
         TokenKind::Keyword(Keyword::This) => Ok(Expr::This(span)),
         TokenKind::Keyword(Keyword::Super) => Ok(Expr::Super(span)),
         TokenKind::Keyword(Keyword::New) => {
             // `new` reached primary parsing (e.g. inside a member chain) — defer.
             parse_new_from_primary(tokens, span)
         }
-        TokenKind::Keyword(Keyword::True) => Ok(Expr::Lit(Lit::Boolean(span, true))),
-        TokenKind::Keyword(Keyword::False) => Ok(Expr::Lit(Lit::Boolean(span, false))),
-        TokenKind::Keyword(Keyword::Null) => Ok(Expr::Lit(Lit::Null(span))),
+        TokenKind::Keyword(Keyword::True) => {
+            reject_escaped_keyword_terminal(tokens, span, "true")?;
+            Ok(Expr::Lit(Lit::Boolean(span, true)))
+        }
+        TokenKind::Keyword(Keyword::False) => {
+            reject_escaped_keyword_terminal(tokens, span, "false")?;
+            Ok(Expr::Lit(Lit::Boolean(span, false)))
+        }
+        TokenKind::Keyword(Keyword::Null) => {
+            reject_escaped_keyword_terminal(tokens, span, "null")?;
+            Ok(Expr::Lit(Lit::Null(span)))
+        }
         TokenKind::Keyword(Keyword::Function) => parse_function_expr(tokens, span, false),
         TokenKind::Keyword(Keyword::Async)
-            if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Function)) =>
+            if !tokens.token_span_contains_escape(span)
+                && tokens.is_unescaped_keyword_at(0, Keyword::Function)
+                && !tokens.preceded_by_newline() =>
         {
             // `async function` expression (`async` was already consumed by the
             // `bump()` above; the next token is `function`).
@@ -910,8 +1108,19 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
             // params by first consuming `async`.
             try_parse_async_arrow(tokens, span)
         }
-        TokenKind::Keyword(Keyword::Class) => crate::class::parse_class_expr(tokens, span, Vec::new()),
-        TokenKind::Keyword(Keyword::Import) => parse_import_call_or_meta(tokens, span),
+        TokenKind::Keyword(Keyword::Class) => {
+            crate::class::parse_class_expr(tokens, span, Vec::new())
+        }
+        TokenKind::Keyword(Keyword::Import) => {
+            if tokens.token_span_contains_escape(span) {
+                Err(vec![Diagnostic::error(
+                    span,
+                    "the `import` terminal may not contain an escape sequence",
+                )])
+            } else {
+                parse_import_call_or_meta(tokens, span)
+            }
+        }
         TokenKind::Keyword(Keyword::Undefined) => Ok(Expr::Ident {
             span,
             name: "undefined".to_string(),
@@ -934,18 +1143,35 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
             span,
             name: "await".to_string(),
         }),
-        TokenKind::Keyword(Keyword::Yield) if !tokens.current_ctx().is_generator => Ok(Expr::Ident {
-            span,
-            name: "yield".to_string(),
-        }),
+        TokenKind::Keyword(Keyword::Yield) if !tokens.current_ctx().is_generator => {
+            Ok(Expr::Ident {
+                span,
+                name: "yield".to_string(),
+            })
+        }
         // Pure contextual keywords — always usable as identifier references
         // (`set.add`, `var of`, `obj.from`). They have no reserved-word
         // meaning outside specific syntactic positions.
-        TokenKind::Keyword(Keyword::Get) => Ok(Expr::Ident { span, name: "get".to_string() }),
-        TokenKind::Keyword(Keyword::Set) => Ok(Expr::Ident { span, name: "set".to_string() }),
-        TokenKind::Keyword(Keyword::Of) => Ok(Expr::Ident { span, name: "of".to_string() }),
-        TokenKind::Keyword(Keyword::From) => Ok(Expr::Ident { span, name: "from".to_string() }),
-        TokenKind::Keyword(Keyword::As) => Ok(Expr::Ident { span, name: "as".to_string() }),
+        TokenKind::Keyword(Keyword::Get) => Ok(Expr::Ident {
+            span,
+            name: "get".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::Set) => Ok(Expr::Ident {
+            span,
+            name: "set".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::Of) => Ok(Expr::Ident {
+            span,
+            name: "of".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::From) => Ok(Expr::Ident {
+            span,
+            name: "from".to_string(),
+        }),
+        TokenKind::Keyword(Keyword::As) => Ok(Expr::Ident {
+            span,
+            name: "as".to_string(),
+        }),
         TokenKind::Punctuator(Punctuator::LParen) => {
             let inner = parse_expression(tokens)?;
             let close = expect_punctuator(tokens, Punctuator::RParen)?;
@@ -964,6 +1190,21 @@ fn parse_primary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>
     }
 }
 
+fn reject_escaped_keyword_terminal(
+    tokens: &ParserTokenStream,
+    span: Span,
+    spelling: &str,
+) -> Result<(), Vec<Diagnostic>> {
+    if tokens.token_span_contains_escape(span) {
+        Err(vec![Diagnostic::error(
+            span,
+            format!("the `{spelling}` terminal may not contain an escape sequence"),
+        )])
+    } else {
+        Ok(())
+    }
+}
+
 /// `import` reached in expression position: `import.meta`, a dynamic import
 /// call `import(source)` / `import(source, options)`, or the phase forms
 /// `import.source(...)` / `import.defer(...)`.
@@ -974,9 +1215,15 @@ fn parse_import_call_or_meta(
     if tokens.eat_punctuator(Punctuator::Dot) {
         // `import.meta` / `import.source(...)` / `import.defer(...)`.
         let prop = tokens.bump();
+        if tokens.token_span_contains_escape(prop.span) {
+            return Err(vec![Diagnostic::error(
+                prop.span,
+                "an import phase terminal may not contain an escape sequence",
+            )]);
+        }
         return match prop.kind {
             TokenKind::Ident(name) if name == "meta" => {
-                Ok(Expr::ImportMeta(Span::new(start.start, tokens.span().end)))
+                Ok(Expr::ImportMeta(Span::new(start.start, prop.span.end)))
             }
             TokenKind::Ident(name) if name == "source" => {
                 parse_import_call_tail(tokens, start, ImportPhase::Source)
@@ -986,7 +1233,10 @@ fn parse_import_call_or_meta(
             }
             other => Err(vec![Diagnostic::error(
                 prop.span,
-                format!("expected `meta`, `source`, or `defer` after `import.`, found {:?}", other),
+                format!(
+                    "expected `meta`, `source`, or `defer` after `import.`, found {:?}",
+                    other
+                ),
             )]),
         };
     }
@@ -1004,7 +1254,10 @@ fn parse_import_call_tail(
     let source = parse_assignment(tokens)?;
     let mut options = None;
     if tokens.eat_punctuator(Punctuator::Comma) {
-        if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+        if !matches!(
+            tokens.peek_kind(),
+            TokenKind::Punctuator(Punctuator::RParen)
+        ) {
             options = Some(Box::new(parse_assignment(tokens)?));
         }
         // Optional trailing comma after the (possibly absent) options argument.
@@ -1064,7 +1317,10 @@ fn parse_new_expr_after_keyword(
             _ => break,
         }
     }
-    let args = if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    let args = if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         parse_call_args(tokens)?
     } else {
         Vec::new()
@@ -1083,8 +1339,12 @@ fn parse_array_literal(
     start: Span,
 ) -> Result<Expr, Vec<Diagnostic>> {
     let mut elements = Vec::new();
+    let mut trailing_comma = false;
     loop {
-        if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBracket)) {
+        if matches!(
+            tokens.peek_kind(),
+            TokenKind::Punctuator(Punctuator::RBracket)
+        ) {
             break;
         }
         if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
@@ -1101,6 +1361,10 @@ fn parse_array_literal(
         }
         if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
             tokens.bump();
+            trailing_comma = matches!(
+                tokens.peek_kind(),
+                TokenKind::Punctuator(Punctuator::RBracket)
+            );
         } else {
             break;
         }
@@ -1109,6 +1373,7 @@ fn parse_array_literal(
     Ok(Expr::Array {
         span: Span::new(start.start, close.end),
         elements,
+        trailing_comma,
     })
 }
 
@@ -1118,7 +1383,10 @@ fn parse_object_literal(
     start: Span,
 ) -> Result<Expr, Vec<Diagnostic>> {
     let mut props = Vec::new();
-    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBrace)
+    ) {
         // Spread.
         if tokens.eat_punctuator(Punctuator::Spread) {
             let e = parse_assignment(tokens)?;
@@ -1155,8 +1423,15 @@ fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<D
     // async method follows — shared lookahead with class-member parsing.)
     let mut is_async = false;
     if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Async))
+        && !tokens.preceded_by_newline_at(1)
         && crate::class::is_async_modifier_ahead(tokens)
     {
+        if tokens.current_token_contains_escape() {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "the method `async` modifier may not contain an escape sequence",
+            )]);
+        }
         tokens.bump();
         is_async = true;
     }
@@ -1169,12 +1444,24 @@ fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<D
         if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Get))
             && !is_property_terminator(&tokens.peek2().kind)
         {
+            if tokens.current_token_contains_escape() {
+                return Err(vec![Diagnostic::error(
+                    tokens.span(),
+                    "the accessor `get` modifier may not contain an escape sequence",
+                )]);
+            }
             tokens.bump();
             kind = ObjectPropKind::Get;
             is_method = true;
         } else if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Set))
             && !is_property_terminator(&tokens.peek2().kind)
         {
+            if tokens.current_token_contains_escape() {
+                return Err(vec![Diagnostic::error(
+                    tokens.span(),
+                    "the accessor `set` modifier may not contain an escape sequence",
+                )]);
+            }
             tokens.bump();
             kind = ObjectPropKind::Set;
             is_method = true;
@@ -1183,12 +1470,38 @@ fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<D
 
     // Key (possibly computed).
     let (key, computed) = parse_property_key(tokens)?;
+    if matches!(key, PropKey::Private(_)) {
+        return Err(vec![Diagnostic::error(
+            prop_start,
+            "an object literal property may not have a private name",
+        )]);
+    }
 
     // Method shorthand: `name(params){body}`, `*name(){}`, `async name(){}` …
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         tokens.enter_fn(is_async, is_generator);
         let result = (|| {
             let params = parse_params(tokens)?;
+            match kind {
+                ObjectPropKind::Get if !params.is_empty() => {
+                    return Err(vec![Diagnostic::error(
+                        prop_start,
+                        "an object getter must not have parameters",
+                    )]);
+                }
+                ObjectPropKind::Set
+                    if params.len() != 1 || matches!(params.first(), Some(Pat::Rest { .. })) =>
+                {
+                    return Err(vec![Diagnostic::error(
+                        prop_start,
+                        "an object setter must have exactly one non-rest parameter",
+                    )]);
+                }
+                _ => {}
+            }
             let (body, close) = parse_block(tokens)?;
             let span = Span::new(prop_start.start, close.end);
             let func = FunctionExpr {
@@ -1206,11 +1519,22 @@ fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<D
                 computed,
                 method: true,
                 shorthand: false,
-                kind: if is_method { kind } else { ObjectPropKind::Init },
+                kind: if is_method {
+                    kind
+                } else {
+                    ObjectPropKind::Init
+                },
             })
         })();
         tokens.pop_ctx();
         return result;
+    }
+
+    if is_generator || !matches!(kind, ObjectPropKind::Init) {
+        return Err(vec![Diagnostic::error(
+            prop_start,
+            "a method prefix must be followed by a method definition",
+        )]);
     }
 
     // Normal `key: value`.
@@ -1235,17 +1559,27 @@ fn parse_object_prop(tokens: &mut ParserTokenStream) -> Result<ObjectProp, Vec<D
     // forms want an IdentifierName and are exempt. Contextual/strict-only
     // words (let/async/yield/await/…) can be ordinary identifiers in some
     // mode, so they are not unconditionally rejected here.
-    let shorthand_name = propkey_name(&key).unwrap_or_default();
-    if !computed {
-        let reserved_bad = Keyword::from_str(&shorthand_name)
-            .map(|kw| !shorthand_keyword_allowed(kw))
-            .unwrap_or(false);
-        if reserved_bad {
-            return Err(vec![Diagnostic::error(
-                prop_start,
-                "a shorthand property name may not be a reserved word",
-            )]);
-        }
+    let PropKey::Ident(shorthand_name) = &key else {
+        return Err(vec![Diagnostic::error(
+            prop_start,
+            "a shorthand property must be an identifier reference",
+        )]);
+    };
+    if computed {
+        return Err(vec![Diagnostic::error(
+            prop_start,
+            "a computed property name requires a value or method definition",
+        )]);
+    }
+    let shorthand_name = shorthand_name.clone();
+    let reserved_bad = Keyword::from_str(&shorthand_name)
+        .map(|kw| !shorthand_keyword_allowed(kw))
+        .unwrap_or(false);
+    if reserved_bad {
+        return Err(vec![Diagnostic::error(
+            prop_start,
+            "a shorthand property name may not be a reserved word",
+        )]);
     }
     let default = if tokens.eat_punctuator(Punctuator::Assign) {
         Some(parse_assignment(tokens)?)
@@ -1323,10 +1657,7 @@ fn parse_property_key(tokens: &mut ParserTokenStream) -> Result<(PropKey, bool),
         }
         TokenKind::Bigint(raw) => {
             tokens.bump();
-            // Property keys may be BigInt literals; store the numeric value
-            // when it fits, else fall back to the raw string key.
-            let n = raw.parse::<f64>().unwrap_or(f64::NAN);
-            Ok((PropKey::Number(n), false))
+            Ok((PropKey::String(bigint_property_name(&raw)), false))
         }
         other => Err(vec![Diagnostic::error(
             tokens.span(),
@@ -1344,6 +1675,77 @@ fn propkey_name(key: &PropKey) -> Option<String> {
     }
 }
 
+pub(crate) fn bigint_property_name(raw: &str) -> String {
+    let cleaned = raw.strip_suffix('n').unwrap_or(raw).replace('_', "");
+    let (radix, digits) = if let Some(digits) = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
+        (16, digits)
+    } else if let Some(digits) = cleaned
+        .strip_prefix("0o")
+        .or_else(|| cleaned.strip_prefix("0O"))
+    {
+        (8, digits)
+    } else if let Some(digits) = cleaned
+        .strip_prefix("0b")
+        .or_else(|| cleaned.strip_prefix("0B"))
+    {
+        (2, digits)
+    } else {
+        (10, cleaned.as_str())
+    };
+
+    // Little-endian decimal digits. This keeps arbitrarily large property
+    // names exact without introducing a BigInt dependency into the AST.
+    let mut decimal = vec![0u8];
+    for digit in digits.chars() {
+        let Some(value) = digit.to_digit(radix) else {
+            return cleaned;
+        };
+        let mut carry = value;
+        for place in &mut decimal {
+            let next = u32::from(*place) * radix + carry;
+            *place = (next % 10) as u8;
+            carry = next / 10;
+        }
+        while carry != 0 {
+            decimal.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while decimal.len() > 1 && decimal.last() == Some(&0) {
+        decimal.pop();
+    }
+    decimal
+        .iter()
+        .rev()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect()
+}
+
+fn string_contains_legacy_escape(raw: &str) -> bool {
+    let mut chars = raw.chars().peekable();
+    let _ = chars.next();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            return false;
+        };
+        match escaped {
+            '1'..='9' => return true,
+            '0' if chars.peek().is_some_and(char::is_ascii_digit) => return true,
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `PropKey` carries no span of its own; return a dummy for bookkeeping fields.
 fn propkey_span(_key: &PropKey) -> Span {
     Span::DUMMY
@@ -1359,7 +1761,14 @@ fn parse_template(
     raw0: String,
     cooked0: Option<String>,
     tail0: bool,
+    tagged: bool,
 ) -> Result<Expr, Vec<Diagnostic>> {
+    if !tagged && cooked0.is_none() {
+        return Err(vec![Diagnostic::error(
+            start,
+            "invalid escape sequence in untagged template literal",
+        )]);
+    }
     if tail0 {
         return Ok(Expr::TemplateLit {
             span: start,
@@ -1380,6 +1789,12 @@ fn parse_template(
         let nt = tokens.bump();
         match nt.kind {
             TokenKind::Template { raw, cooked, tail } => {
+                if !tagged && cooked.is_none() {
+                    return Err(vec![Diagnostic::error(
+                        nt.span,
+                        "invalid escape sequence in untagged template literal",
+                    )]);
+                }
                 end = nt.span.end;
                 quasis.push((cooked, raw));
                 if tail {
@@ -1409,9 +1824,9 @@ fn parse_function_expr(
     is_async: bool,
 ) -> Result<Expr, Vec<Diagnostic>> {
     let is_generator = tokens.eat_punctuator(Punctuator::Mul);
-    let name = binding_identifier(tokens);
     tokens.enter_fn(is_async, is_generator);
     let result = (|| {
+        let name = binding_identifier(tokens);
         let params = parse_params(tokens)?;
         let (body, close) = parse_block(tokens)?;
         let span = Span::new(start.start, close.end);
@@ -1439,7 +1854,10 @@ fn parse_function_expr(
 /// returning its spelling if so (`await` outside async, `yield` outside
 /// generators, the always-contextual words). Strict-mode-only reserved words
 /// (`let`, `static`, …) are excluded (need strict tracking).
-pub(crate) fn keyword_binding_name(kw: Keyword, ctx: crate::token_stream::FnCtx) -> Option<&'static str> {
+pub(crate) fn keyword_binding_name(
+    kw: Keyword,
+    ctx: crate::token_stream::FnCtx,
+) -> Option<&'static str> {
     let allowed = match kw {
         Keyword::Await => !ctx.is_async,
         Keyword::Yield => !ctx.is_generator,
@@ -1449,18 +1867,30 @@ pub(crate) fn keyword_binding_name(kw: Keyword, ctx: crate::token_stream::FnCtx)
         // produces false-accepts that outweigh the false-rejects it fixes.
         // (Expression-position `let` is handled separately in parse_primary /
         // for-head disambiguation.)
-        Keyword::Async | Keyword::Of | Keyword::From | Keyword::As
-        | Keyword::Get | Keyword::Set | Keyword::Undefined => true,
+        Keyword::Let
+        | Keyword::Async
+        | Keyword::Of
+        | Keyword::From
+        | Keyword::As
+        | Keyword::Get
+        | Keyword::Set
+        | Keyword::Undefined => true,
         _ => false,
     };
-    if allowed { Some(kw.as_str()) } else { None }
+    if allowed {
+        Some(kw.as_str())
+    } else {
+        None
+    }
 }
 
 /// Peek the current token as a binding-identifier name without consuming it.
 pub(crate) fn peek_binding_name(tokens: &ParserTokenStream) -> Option<String> {
     match tokens.peek_kind().clone() {
         TokenKind::Ident(n) => Some(n),
-        TokenKind::Keyword(k) => keyword_binding_name(k, tokens.current_ctx()).map(|s| s.to_string()),
+        TokenKind::Keyword(k) => {
+            keyword_binding_name(k, tokens.current_ctx()).map(|s| s.to_string())
+        }
         _ => None,
     }
 }
@@ -1473,7 +1903,9 @@ pub(crate) fn binding_identifier(tokens: &mut ParserTokenStream) -> Option<Strin
         }
         TokenKind::Keyword(k) => {
             let name = keyword_binding_name(k, tokens.current_ctx()).map(|s| s.to_string());
-            if name.is_some() { tokens.bump(); }
+            if name.is_some() {
+                tokens.bump();
+            }
             name
         }
         _ => None,
@@ -1484,7 +1916,10 @@ pub(crate) fn binding_identifier(tokens: &mut ParserTokenStream) -> Option<Strin
 pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, Vec<Diagnostic>> {
     let _ = expect_punctuator(tokens, Punctuator::LParen)?;
     let mut params = Vec::new();
-    if !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+    if !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RParen)
+    ) {
         loop {
             if tokens.eat_punctuator(Punctuator::Spread) {
                 let p = parse_binding_pattern(tokens)?;
@@ -1492,6 +1927,16 @@ pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, V
                     span: p.span(),
                     arg: Box::new(p),
                 });
+                if !matches!(
+                    tokens.peek_kind(),
+                    TokenKind::Punctuator(Punctuator::RParen)
+                ) {
+                    return Err(vec![Diagnostic::error(
+                        tokens.span(),
+                        "a rest parameter must be last and may not have a trailing comma",
+                    )]);
+                }
+                break;
             } else {
                 params.push(parse_binding_pattern(tokens)?);
             }
@@ -1499,7 +1944,10 @@ pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, V
                 break;
             }
             // Trailing comma: `f(a, b,)` — end the list.
-            if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RParen)) {
+            if matches!(
+                tokens.peek_kind(),
+                TokenKind::Punctuator(Punctuator::RParen)
+            ) {
                 break;
             }
         }
@@ -1511,9 +1959,7 @@ pub(crate) fn parse_params(tokens: &mut ParserTokenStream) -> Result<Vec<Pat>, V
 /// A binding pattern *without* a trailing default. Used by `var`/`let`/`const`
 /// declarators, where the `= init` belongs to the declarator, not the pattern.
 /// (Defaults *inside* nested `[...]`/`{...}` are still parsed.)
-pub(crate) fn parse_binding_target(
-    tokens: &mut ParserTokenStream,
-) -> Result<Pat, Vec<Diagnostic>> {
+pub(crate) fn parse_binding_target(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagnostic>> {
     let span = tokens.span();
     if let Some(name) = binding_identifier(tokens) {
         return Ok(Pat::Ident { span, name });
@@ -1551,7 +1997,10 @@ fn parse_array_pattern(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagno
     let start = tokens.span();
     tokens.bump(); // `[`
     let mut elements = Vec::new();
-    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBracket)) {
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBracket)
+    ) {
         if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::Comma)) {
             tokens.bump();
             elements.push(Some(ArrayPatElement::Hole(tokens.span())));
@@ -1584,7 +2033,10 @@ fn parse_object_pattern(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagn
     let start = tokens.span();
     tokens.bump(); // `{`
     let mut properties = Vec::new();
-    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBrace)
+    ) {
         if tokens.eat_punctuator(Punctuator::Spread) {
             let p = parse_binding_pattern(tokens)?;
             properties.push(ObjectPatProp::Rest {
@@ -1650,7 +2102,18 @@ fn parse_object_pattern(tokens: &mut ParserTokenStream) -> Result<Pat, Vec<Diagn
 /// syntactically valid but not represented by [`Pat`] and are rejected.
 fn array_or_object_to_pat(expr: &Expr) -> Result<Pat, Diagnostic> {
     match expr {
-        Expr::Array { span, elements } => {
+        Expr::Array {
+            span,
+            elements,
+            trailing_comma,
+        } => {
+            if *trailing_comma && matches!(elements.last(), Some(Some(ArrayExprElement::Spread(_))))
+            {
+                return Err(Diagnostic::error(
+                    *span,
+                    "an assignment rest element may not have a trailing comma",
+                ));
+            }
             let mut out = Vec::with_capacity(elements.len());
             for (idx, el) in elements.iter().enumerate() {
                 match el {
@@ -1674,7 +2137,10 @@ fn array_or_object_to_pat(expr: &Expr) -> Result<Pat, Diagnostic> {
                     }
                 }
             }
-            Ok(Pat::Array { span: *span, elements: out })
+            Ok(Pat::Array {
+                span: *span,
+                elements: out,
+            })
         }
         Expr::Object { span, props } => {
             let mut properties = Vec::with_capacity(props.len());
@@ -1707,9 +2173,38 @@ fn array_or_object_to_pat(expr: &Expr) -> Result<Pat, Diagnostic> {
                     }
                 }
             }
-            Ok(Pat::Object { span: *span, properties })
+            Ok(Pat::Object {
+                span: *span,
+                properties,
+            })
         }
-        _ => Err(Diagnostic::error(expr.span(), "not a destructuring pattern")),
+        _ => Err(Diagnostic::error(
+            expr.span(),
+            "not a destructuring pattern",
+        )),
+    }
+}
+
+/// Reinterpret a for-in/of expression head using AssignmentPattern as its
+/// grammar goal. Conversion failures are syntax errors, never placeholder
+/// targets.
+pub(crate) fn assignment_pattern_from_expr(expr: &Expr) -> Result<Pat, Diagnostic> {
+    match expr {
+        Expr::Paren { expr, .. }
+            if matches!(expr.as_ref(), Expr::Ident { .. } | Expr::Member(_)) =>
+        {
+            assignment_pattern_from_expr(expr)
+        }
+        Expr::Ident { span, name } => Ok(Pat::Ident {
+            span: *span,
+            name: name.clone(),
+        }),
+        Expr::Member(member) => Ok(Pat::Member(member.clone())),
+        Expr::Array { .. } | Expr::Object { .. } => array_or_object_to_pat(expr),
+        _ => Err(Diagnostic::error(
+            expr.span(),
+            "invalid for-in/of assignment target",
+        )),
     }
 }
 
@@ -1720,12 +2215,24 @@ fn array_or_object_to_pat(expr: &Expr) -> Result<Pat, Diagnostic> {
 /// them).
 fn expr_to_assignment_pat(e: &Expr) -> Result<Pat, Diagnostic> {
     match e {
-        Expr::Ident { span, name } => Ok(Pat::Ident { span: *span, name: name.clone() }),
+        Expr::Ident { span, name } => Ok(Pat::Ident {
+            span: *span,
+            name: name.clone(),
+        }),
         Expr::Array { .. } | Expr::Object { .. } => array_or_object_to_pat(e),
         Expr::Member(m) => Ok(Pat::Member(m.clone())),
-        Expr::Assign { span, op: AssignOp::Assign, left, right } => {
+        Expr::Assign {
+            span,
+            op: AssignOp::Assign,
+            left,
+            right,
+        } => {
             let lp = assign_target_to_pat(left)?;
-            Ok(Pat::Assignment { span: *span, left: Box::new(lp), right: right.clone() })
+            Ok(Pat::Assignment {
+                span: *span,
+                left: Box::new(lp),
+                right: right.clone(),
+            })
         }
         _ => Err(Diagnostic::error(e.span(), "invalid destructuring target")),
     }
@@ -1735,7 +2242,10 @@ fn expr_to_assignment_pat(e: &Expr) -> Result<Pat, Diagnostic> {
 /// into a [`Pat`], for nested defaults like `[a = 1, b = 2] = x`.
 fn assign_target_to_pat(t: &AssignTarget) -> Result<Pat, Diagnostic> {
     match t {
-        AssignTarget::Ident { span, name } => Ok(Pat::Ident { span: *span, name: name.clone() }),
+        AssignTarget::Ident { span, name } => Ok(Pat::Ident {
+            span: *span,
+            name: name.clone(),
+        }),
         AssignTarget::Pat(p) => Ok(p.clone()),
         AssignTarget::Member(m) => Ok(Pat::Member(m.clone())),
     }
@@ -1752,7 +2262,7 @@ pub(crate) fn parse_block(
         tokens.peek_kind(),
         TokenKind::Punctuator(Punctuator::RBrace) | TokenKind::Eof
     ) {
-        match crate::stmt::parse_statement(tokens) {
+        match crate::stmt::parse_statement_list_item(tokens) {
             Ok(s) => body.push(s),
             Err(diags) => {
                 errors.extend(diags);

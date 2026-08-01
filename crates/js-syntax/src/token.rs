@@ -71,12 +71,26 @@ impl PartialEq for TokenKind {
             (String(a), String(b)) => a == b,
             (Bigint(a), Bigint(b)) => a == b,
             (
-                Regex { pattern: p1, flags: f1 },
-                Regex { pattern: p2, flags: f2 },
+                Regex {
+                    pattern: p1,
+                    flags: f1,
+                },
+                Regex {
+                    pattern: p2,
+                    flags: f2,
+                },
             ) => p1 == p2 && f1 == f2,
             (
-                Template { raw: r1, cooked: c1, tail: t1 },
-                Template { raw: r2, cooked: c2, tail: t2 },
+                Template {
+                    raw: r1,
+                    cooked: c1,
+                    tail: t1,
+                },
+                Template {
+                    raw: r2,
+                    cooked: c2,
+                    tail: t2,
+                },
             ) => r1 == r2 && c1 == c2 && t1 == t2,
             (PrivateName(a), PrivateName(b)) => a == b,
             (Unknown(a), Unknown(b)) => a == b,

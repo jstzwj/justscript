@@ -13,7 +13,7 @@
 use crate::constant::ConstantPool;
 use crate::module::{BytecodeFunction, BytecodeModule};
 use crate::opcode::{Instruction, Opcode};
-use js_diagnostics::{Diagnostic, DiagResult};
+use js_diagnostics::{DiagResult, Diagnostic};
 use js_syntax::ast::expr::{AssignTarget, CallArg, Expr, MemberProp, ObjectPropValue};
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::op::{BinOp, UpdateOp};
@@ -109,7 +109,9 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
             func.emit_bare(Opcode::Return);
         }
         Stmt::Decl(d) => compile_decl(d, func, ctx),
-        Stmt::If { test, cons, alt, .. } => {
+        Stmt::If {
+            test, cons, alt, ..
+        } => {
             compile_expr(test, func, ctx);
             let jmp_false = emit_placeholder(func, Opcode::JumpIfFalse);
             compile_stmt(cons, func, ctx, false);
@@ -248,26 +250,40 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
         }
         Stmt::Break { .. } => {
             if !ctx.emit_break(func) {
-                ctx.errors.push(Diagnostic::error(stmt.span(), "`break` outside of a loop or switch"));
+                ctx.errors.push(Diagnostic::error(
+                    stmt.span(),
+                    "`break` outside of a loop or switch",
+                ));
             }
         }
         Stmt::Continue { .. } => {
             if !ctx.emit_continue(func) {
-                ctx.errors
-                    .push(Diagnostic::error(stmt.span(), "`continue` outside of a loop"));
+                ctx.errors.push(Diagnostic::error(
+                    stmt.span(),
+                    "`continue` outside of a loop",
+                ));
             }
         }
         Stmt::Throw { arg, .. } => {
             compile_expr(arg, func, ctx);
             func.emit_bare(Opcode::Throw);
         }
-        Stmt::Try { block, handler, finalizer, .. } => {
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
             compile_try(block, handler.as_deref(), finalizer.as_ref(), func, ctx);
         }
-        Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForOf {
+            left, right, body, ..
+        } => {
             compile_for_of(left, right, body, func, ctx);
         }
-        Stmt::ForIn { left, right, body, .. } => {
+        Stmt::ForIn {
+            left, right, body, ..
+        } => {
             compile_for_in(left, right, body, func, ctx);
         }
         other => {
@@ -281,7 +297,11 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
 
 fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match decl {
-        Decl::Var { kind: _, declarations, .. } => {
+        Decl::Var {
+            kind: _,
+            declarations,
+            ..
+        } => {
             for d in declarations {
                 // Ensure the pattern's binding names are in scope (idempotent;
                 // the hoisting pre-pass usually did this already).
@@ -294,7 +314,14 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         }
         Decl::Function(f) => compile_function_decl(f, func, ctx),
         Decl::Class(c) => {
-            let id = compile_class_value(c.span, c.name.as_deref(), &c.body, c.superclass.as_deref(), func, ctx);
+            let id = compile_class_value(
+                c.span,
+                c.name.as_deref(),
+                &c.body,
+                c.superclass.as_deref(),
+                func,
+                ctx,
+            );
             if let Some(name) = &c.name {
                 func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
                 let slot = ctx.declare_local(func, name);
@@ -310,11 +337,7 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
     }
 }
 
-fn compile_function_decl(
-    f: &FunctionDecl,
-    parent: &mut BytecodeFunction,
-    ctx: &mut CompilerCtx,
-) {
+fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     let id = compile_function_value(
         f.span,
         f.name.as_deref(),
@@ -475,7 +498,10 @@ fn compile_class_value(
     let mut methods: Vec<(js_syntax::ast::pat::PropKey, bool, u32)> = Vec::new();
     for m in members {
         if m.static_ {
-            ctx.errors.push(Diagnostic::error(m.span, "static class members are not supported yet"));
+            ctx.errors.push(Diagnostic::error(
+                m.span,
+                "static class members are not supported yet",
+            ));
             continue;
         }
         if matches!(m.kind, ClassMemberKind::Constructor) {
@@ -523,7 +549,11 @@ fn compile_class_value(
     for (i, p) in ctor_params.iter().enumerate() {
         if let Pat::Ident { name, .. } = p {
             let slot = ctor.locals.intern(name);
-            ctx.scopes.last_mut().unwrap().locals.insert(name.clone(), slot);
+            ctx.scopes
+                .last_mut()
+                .unwrap()
+                .locals
+                .insert(name.clone(), slot);
         } else {
             ctor.locals.intern(format!("<ctor-param{}>", i));
         }
@@ -564,7 +594,14 @@ fn compile_class_value(
     ctor.emit_bare(Opcode::LdaUndefined);
     ctor.emit_bare(Opcode::Return);
 
-    let upvalues = ctx.scopes.last().unwrap().upvalues.iter().map(|b| b.spec).collect();
+    let upvalues = ctx
+        .scopes
+        .last()
+        .unwrap()
+        .upvalues
+        .iter()
+        .map(|b| b.spec)
+        .collect();
     ctor.upvalues = upvalues;
     ctx.scopes.pop();
     ctx.functions[id as usize - 1] = ctor;
@@ -589,12 +626,23 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(arg, func, ctx);
             func.emit_bare(Opcode::for_unaryop(*op));
         }
-        Expr::Binary { op, left, right, .. } => {
+        Expr::Binary {
+            op, left, right, ..
+        } => {
             compile_expr(left, func, ctx);
             compile_expr(right, func, ctx);
             emit_binop(*op, func);
         }
-        Expr::Logical { op, left, right, .. } => {
+        Expr::PrivateIn { right, .. } => {
+            compile_expr(right, func, ctx);
+            ctx.errors.push(Diagnostic::error(
+                expr.span(),
+                "private brand checks are not supported by bytecode compilation yet",
+            ));
+        }
+        Expr::Logical {
+            op, left, right, ..
+        } => {
             // Short-circuit. `a && b`: if a falsy, result is a; else b.
             // JumpIf* pops the test, so Dup first to retain `a` as the result
             // on the taken branch.
@@ -621,7 +669,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_update(*op, *prefix, arg, func, ctx, expr.span());
         }
         Expr::TemplateLit {
-            quasis, expressions, ..
+            quasis,
+            expressions,
+            ..
         } => {
             // Concatenate: quasi0, then for each (expr, quasi_i) push + Add.
             let mut first = true;
@@ -737,7 +787,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             }
             func.emit(Instruction::new(Opcode::New, count));
         }
-        Expr::Conditional { test, cons, alt, .. } => {
+        Expr::Conditional {
+            test, cons, alt, ..
+        } => {
             compile_expr(test, func, ctx);
             let jf = emit_placeholder(func, Opcode::JumpIfFalse);
             compile_expr(cons, func, ctx);
@@ -746,7 +798,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(alt, func, ctx);
             patch(func, je, func.here());
         }
-        Expr::Assign { op, left, right, .. } => {
+        Expr::Assign {
+            op, left, right, ..
+        } => {
             match left {
                 AssignTarget::Ident { name, .. } => {
                     if *op == AssignOp::Assign {
@@ -872,6 +926,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
         }
         Expr::This { .. } => func.emit_bare(Opcode::LdaThis),
+        // The VM does not expose a new-target register yet. Preserve the
+        // previous behavior for ordinary calls until constructor frames carry it.
+        Expr::NewTarget(_) => func.emit_bare(Opcode::LdaUndefined),
         Expr::Yield { arg, delegate, .. } => {
             if *delegate {
                 ctx.errors.push(Diagnostic::error(
@@ -910,23 +967,34 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
 fn compile_lit(lit: &Lit, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match lit {
         Lit::Null(_) => func.emit_bare(Opcode::LdaNull),
-        Lit::Boolean(_, b) => func.emit_bare(if *b { Opcode::LdaTrue } else { Opcode::LdaFalse }),
+        Lit::Boolean(_, b) => func.emit_bare(if *b {
+            Opcode::LdaTrue
+        } else {
+            Opcode::LdaFalse
+        }),
         Lit::Number(_, n, _) => {
             // Integral literals that fit in i32 take the integer fast path;
             // everything else is stored as a float.
-            let idx = if n.fract() == 0.0 && n.is_finite() && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 {
+            let idx = if n.fract() == 0.0
+                && n.is_finite()
+                && *n >= i32::MIN as f64
+                && *n <= i32::MAX as f64
+            {
                 ctx.constants.intern_int(*n as i32)
             } else {
                 ctx.constants.intern_num(*n)
             };
             func.emit(Instruction::new(Opcode::LdaConst, idx));
         }
-        Lit::String(_, s) => {
+        Lit::String(_, s, _) => {
             let idx = ctx.constants.intern_str(s);
             func.emit(Instruction::new(Opcode::LdaConst, idx));
         }
         Lit::BigInt(span, _) | Lit::Regex { span, .. } | Lit::TemplateString { span, .. } => {
-            ctx.errors.push(Diagnostic::error(*span, "this literal kind is not supported yet"));
+            ctx.errors.push(Diagnostic::error(
+                *span,
+                "this literal kind is not supported yet",
+            ));
             func.emit_bare(Opcode::LdaUndefined);
         }
     }
@@ -1045,7 +1113,11 @@ fn compile_try(
     patch(func, jmp_to_after, after_pc);
     func.handlers[spec_idx as usize] = crate::module::HandlerSpec {
         catch_pc,
-        finally_pc: if finalizer.is_some() { Some(after_pc) } else { None },
+        finally_pc: if finalizer.is_some() {
+            Some(after_pc)
+        } else {
+            None
+        },
     };
     let _ = end;
 }
@@ -1312,7 +1384,12 @@ fn collect_stmt_bindings(stmt: &Stmt, out: &mut Vec<String>) {
                 collect_bindings(&c.body, out);
             }
         }
-        Stmt::Try { block, handler, finalizer, .. } => {
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
             collect_bindings(&block.body, out);
             if let Some(h) = handler {
                 if let Some(p) = &h.param {
@@ -1382,11 +1459,7 @@ fn collect_pat_bindings(pat: &Pat, out: &mut Vec<String>) {
 
 /// Push a member property key onto the stack as a Value (string for `.x`,
 /// evaluated expr for `[e]`).
-fn compile_member_key_push(
-    prop: &MemberProp,
-    func: &mut BytecodeFunction,
-    ctx: &mut CompilerCtx,
-) {
+fn compile_member_key_push(prop: &MemberProp, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match prop {
         MemberProp::Ident(n) | MemberProp::Private(n) => {
             let idx = ctx.constants.intern_str(n);
@@ -1411,7 +1484,11 @@ fn compile_prop_key_push(
             func.emit(Instruction::new(Opcode::LdaConst, idx));
         }
         PropKey::Number(n) => {
-            let idx = if n.fract() == 0.0 && n.is_finite() && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 {
+            let idx = if n.fract() == 0.0
+                && n.is_finite()
+                && *n >= i32::MIN as f64
+                && *n <= i32::MAX as f64
+            {
                 ctx.constants.intern_int(*n as i32)
             } else {
                 ctx.constants.intern_num(*n)
@@ -1502,13 +1579,12 @@ fn compile_update(
             }
         }
         _ => {
-            ctx.errors.push(Diagnostic::error(span, "invalid update target"));
+            ctx.errors
+                .push(Diagnostic::error(span, "invalid update target"));
             func.emit_bare(Opcode::LdaUndefined);
         }
     }
 }
-
-
 
 /// Bind (or look up) a local slot for a binding pattern. Only simple identifier
 /// patterns are supported for the milestone.
@@ -1547,7 +1623,6 @@ fn compound_to_binop(op: AssignOp) -> BinOp {
         AssignOp::Assign => BinOp::Add, // unused
     }
 }
-
 
 struct CompilerCtx {
     constants: ConstantPool,
@@ -1628,20 +1703,28 @@ impl CompilerCtx {
         // Does this ancestor hold `name` as a local?
         let local_slot = self.scopes[scope_idx].locals.get(name).copied();
         if let Some(slot) = local_slot {
-            return Some(self.add_upvalue(scope_idx + 1, name, crate::module::UpvalueSpec {
-                is_local: true,
-                index: slot,
-            }));
+            return Some(self.add_upvalue(
+                scope_idx + 1,
+                name,
+                crate::module::UpvalueSpec {
+                    is_local: true,
+                    index: slot,
+                },
+            ));
         }
         // Does the ancestor itself capture it as an upvalue? (or further out)
         if scope_idx == 0 {
             return None;
         }
         let parent_uv = self.resolve_upvalue(name, scope_idx - 1)?;
-        Some(self.add_upvalue(scope_idx + 1, name, crate::module::UpvalueSpec {
-            is_local: false,
-            index: parent_uv,
-        }))
+        Some(self.add_upvalue(
+            scope_idx + 1,
+            name,
+            crate::module::UpvalueSpec {
+                is_local: false,
+                index: parent_uv,
+            },
+        ))
     }
 
     /// Register an upvalue in `scopes[scope_idx]` (deduped by name); return its index.

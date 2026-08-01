@@ -29,7 +29,9 @@ impl NumericError {
     pub fn message(self) -> &'static str {
         match self {
             NumericError::BadSeparator => "invalid numeric separator position",
-            NumericError::BigIntFractional => "BigInt literal may not have a fractional or exponent part",
+            NumericError::BigIntFractional => {
+                "BigInt literal may not have a fractional or exponent part"
+            }
             NumericError::BigIntLeadingZero => "BigInt literal may not have a leading zero",
             NumericError::Empty => "numeric literal has no digits",
         }
@@ -137,6 +139,12 @@ fn validate_decimal(body: &str, is_bigint: bool) -> Result<(), NumericError> {
         None => (mantissa, None),
     };
 
+    // Separators are not permitted in legacy-octal-like or non-octal decimal
+    // integer forms. Radix-prefixed literals use the separate branch above.
+    if int_part.contains('_') && has_leading_zero(int_part) {
+        return Err(NumericError::BadSeparator);
+    }
+
     // At least one digit must be present somewhere in the mantissa.
     let int_digits = strip_underscores(int_part);
     let has_int = !int_digits.is_empty();
@@ -155,7 +163,10 @@ fn validate_decimal(body: &str, is_bigint: bool) -> Result<(), NumericError> {
     }
     if let Some(exp) = exponent {
         // exponent := [+-] DecimalDigits
-        let digits = exp.strip_prefix('+').or_else(|| exp.strip_prefix('-')).unwrap_or(exp);
+        let digits = exp
+            .strip_prefix('+')
+            .or_else(|| exp.strip_prefix('-'))
+            .unwrap_or(exp);
         let digits = if digits.is_empty() {
             return Err(NumericError::Empty);
         } else {
@@ -215,21 +226,61 @@ mod tests {
 
     #[test]
     fn rejects_bad_separators() {
-        assert_eq!(validate_numeric_literal("_1"), Err(NumericError::BadSeparator));
-        assert_eq!(validate_numeric_literal("1_"), Err(NumericError::BadSeparator));
-        assert_eq!(validate_numeric_literal("1__2"), Err(NumericError::BadSeparator));
-        assert_eq!(validate_numeric_literal("0x_1"), Err(NumericError::BadSeparator));
-        assert_eq!(validate_numeric_literal("1_e5"), Err(NumericError::BadSeparator));
-        assert_eq!(validate_numeric_literal("1.0_"), Err(NumericError::BadSeparator));
+        assert_eq!(
+            validate_numeric_literal("_1"),
+            Err(NumericError::BadSeparator)
+        );
+        assert_eq!(
+            validate_numeric_literal("1_"),
+            Err(NumericError::BadSeparator)
+        );
+        assert_eq!(
+            validate_numeric_literal("1__2"),
+            Err(NumericError::BadSeparator)
+        );
+        assert_eq!(
+            validate_numeric_literal("0x_1"),
+            Err(NumericError::BadSeparator)
+        );
+        assert_eq!(
+            validate_numeric_literal("1_e5"),
+            Err(NumericError::BadSeparator)
+        );
+        assert_eq!(
+            validate_numeric_literal("1.0_"),
+            Err(NumericError::BadSeparator)
+        );
+        for raw in ["0_0", "00_0", "08_0", "0_0123456789"] {
+            assert_eq!(
+                validate_numeric_literal(raw),
+                Err(NumericError::BadSeparator),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
     fn rejects_bad_bigint() {
-        assert_eq!(validate_numeric_literal("1.0n"), Err(NumericError::BigIntFractional));
-        assert_eq!(validate_numeric_literal("1e0n"), Err(NumericError::BigIntFractional));
-        assert_eq!(validate_numeric_literal("08n"), Err(NumericError::BigIntLeadingZero));
-        assert_eq!(validate_numeric_literal("00n"), Err(NumericError::BigIntLeadingZero));
-        assert_eq!(validate_numeric_literal("0_0n"), Err(NumericError::BigIntLeadingZero));
+        assert_eq!(
+            validate_numeric_literal("1.0n"),
+            Err(NumericError::BigIntFractional)
+        );
+        assert_eq!(
+            validate_numeric_literal("1e0n"),
+            Err(NumericError::BigIntFractional)
+        );
+        assert_eq!(
+            validate_numeric_literal("08n"),
+            Err(NumericError::BigIntLeadingZero)
+        );
+        assert_eq!(
+            validate_numeric_literal("00n"),
+            Err(NumericError::BigIntLeadingZero)
+        );
+        assert_eq!(
+            validate_numeric_literal("0_0n"),
+            Err(NumericError::BigIntLeadingZero)
+        );
     }
 
     #[test]

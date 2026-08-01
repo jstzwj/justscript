@@ -12,17 +12,12 @@ pub mod class;
 pub mod early_errors;
 pub mod expr;
 pub mod parser;
+mod regexp;
 pub mod sess;
+mod static_semantics;
 pub mod stmt;
 pub mod token_stream;
 
-pub use parser::{parse, parse_script, parse_module, Parser};
+pub use parser::{parse, parse_module, parse_script, Parser};
 pub use sess::ParseSess;
 pub use token_stream::ParserTokenStream;
-
-
-
-
-
-
-

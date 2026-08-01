@@ -56,7 +56,9 @@ impl CallFrame {
         CallFrame {
             func_index,
             pc: 0,
-            locals: (0..slot_count).map(|_| new_cell(Value::undefined())).collect(),
+            locals: (0..slot_count)
+                .map(|_| new_cell(Value::undefined()))
+                .collect(),
             upvalues: Vec::new(),
             this: Value::undefined(),
             captured_this: None,

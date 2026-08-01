@@ -47,7 +47,10 @@ impl Attribute {
 /// (a [`Value`]) or an accessor (get/set callables).
 #[derive(Clone, Debug)]
 pub enum PropertyDescriptor {
-    Data { value: Value, attr: Attribute },
+    Data {
+        value: Value,
+        attr: Attribute,
+    },
     Accessor {
         get: Option<Value>,
         set: Option<Value>,

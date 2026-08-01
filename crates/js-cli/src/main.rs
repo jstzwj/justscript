@@ -2,11 +2,15 @@
 //! `--mode` flag selecting the execution backend.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use js_engine::{Engine, EngineConfig, ExecutionMode};
 use js_diagnostics::{BufferEmitter, Emitter};
+use js_engine::{Engine, EngineConfig, ExecutionMode};
 
 #[derive(Parser)]
-#[command(name = "justscript", version, about = "A Rust JavaScript engine (interpret / JIT / AOT)")]
+#[command(
+    name = "justscript",
+    version,
+    about = "A Rust JavaScript engine (interpret / JIT / AOT)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -95,7 +99,8 @@ fn run_once(config: &EngineConfig, src: &str) -> Result<(), Vec<js_diagnostics::
 
 fn print_info() {
     println!("justscript — Rust JavaScript engine (skeleton)");
-    println!("backends: interpret (default){jit}{aot}",
+    println!(
+        "backends: interpret (default){jit}{aot}",
         jit = if cfg!(feature = "jit") { " +jit" } else { "" },
         aot = if cfg!(feature = "aot") { " +aot" } else { "" },
     );

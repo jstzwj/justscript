@@ -77,9 +77,12 @@ impl Engine {
         let value = match self.config.mode {
             ExecutionMode::Interpret | ExecutionMode::AstWalk => {
                 let mut interp = js_vm::Interpreter::new(self.ctx_realm_clone());
-                interp
-                    .run_module(&compiled.bytecode)
-                    .map_err(|e| vec![js_diagnostics::Diagnostic::error(js_syntax::Span::DUMMY, format!("{e}"))])?
+                interp.run_module(&compiled.bytecode).map_err(|e| {
+                    vec![js_diagnostics::Diagnostic::error(
+                        js_syntax::Span::DUMMY,
+                        format!("{e}"),
+                    )]
+                })?
             }
             ExecutionMode::Jit => self.run_jit(&compiled.bytecode)?,
             ExecutionMode::Aot => {
@@ -129,9 +132,12 @@ impl Engine {
         #[cfg(feature = "jit")]
         {
             let compiler = js_codegen::JitCompiler::for_host();
-            let _jit = compiler
-                .compile(_module)
-                .map_err(|e| vec![js_diagnostics::Diagnostic::error(js_syntax::Span::DUMMY, format!("{e:?}"))])?;
+            let _jit = compiler.compile(_module).map_err(|e| {
+                vec![js_diagnostics::Diagnostic::error(
+                    js_syntax::Span::DUMMY,
+                    format!("{e:?}"),
+                )]
+            })?;
             // TODO: invoke the native entry for `<main>` with a runtime trampoline.
             return Ok(Value::undefined());
         }
@@ -151,12 +157,18 @@ impl Engine {
                 .clone()
                 .unwrap_or_else(|| std::env::consts::ARCH.to_string());
             let compiler = js_codegen::AotCompiler::new(triple);
-            let artifact = compiler
-                .compile(module)
-                .map_err(|e| vec![js_diagnostics::Diagnostic::error(js_syntax::Span::DUMMY, format!("{e:?}"))])?;
-            let _bytes = artifact
-                .finish()
-                .map_err(|e| vec![js_diagnostics::Diagnostic::error(js_syntax::Span::DUMMY, format!("{e:?}"))])?;
+            let artifact = compiler.compile(module).map_err(|e| {
+                vec![js_diagnostics::Diagnostic::error(
+                    js_syntax::Span::DUMMY,
+                    format!("{e:?}"),
+                )]
+            })?;
+            let _bytes = artifact.finish().map_err(|e| {
+                vec![js_diagnostics::Diagnostic::error(
+                    js_syntax::Span::DUMMY,
+                    format!("{e:?}"),
+                )]
+            })?;
             return Ok(());
         }
         #[cfg(not(feature = "aot"))]
@@ -188,4 +200,3 @@ mod tests {
         assert!(result.value.is_undefined());
     }
 }
-

@@ -1,3 +1,4 @@
 /target/
+/test262/
 **/*.rs.bk
 .vscode/

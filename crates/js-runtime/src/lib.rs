@@ -15,7 +15,7 @@ pub mod object;
 pub mod realm;
 pub mod value;
 
-pub use context::{RealmContext, ExecutionContext};
+pub use context::{ExecutionContext, RealmContext};
 pub use object::{JsObject, Object, ObjectData, PropertyDescriptor, Shape};
 pub use realm::Realm;
 pub use value::{JsBigInt, JsFunction, JsString, JsSymbol, Value, ValueData};

@@ -59,7 +59,14 @@ struct GenReturn;
 struct GenThrow;
 
 impl NativeFn for GenThrow {
-    fn call(&self, _interp: &mut Interpreter, _module: &BytecodeModule, _this: Value, f: &JsFunction, _args: Vec<Value>) -> Result<NativeResult, InterpError> {
+    fn call(
+        &self,
+        _interp: &mut Interpreter,
+        _module: &BytecodeModule,
+        _this: Value,
+        f: &JsFunction,
+        _args: Vec<Value>,
+    ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
@@ -69,7 +76,14 @@ impl NativeFn for GenThrow {
 }
 
 impl NativeFn for GenNext {
-    fn call(&self, _interp: &mut Interpreter, _module: &BytecodeModule, _this: Value, f: &JsFunction, args: Vec<Value>) -> Result<NativeResult, InterpError> {
+    fn call(
+        &self,
+        _interp: &mut Interpreter,
+        _module: &BytecodeModule,
+        _this: Value,
+        f: &JsFunction,
+        args: Vec<Value>,
+    ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
@@ -79,7 +93,14 @@ impl NativeFn for GenNext {
 }
 
 impl NativeFn for GenReturn {
-    fn call(&self, _interp: &mut Interpreter, _module: &BytecodeModule, _this: Value, f: &JsFunction, args: Vec<Value>) -> Result<NativeResult, InterpError> {
+    fn call(
+        &self,
+        _interp: &mut Interpreter,
+        _module: &BytecodeModule,
+        _this: Value,
+        f: &JsFunction,
+        args: Vec<Value>,
+    ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
@@ -214,435 +235,466 @@ impl Interpreter {
     /// One-instruction outcome of [`Self::step`]: keep going, or the running
     /// frame returned `Value` (the top-level script, in [`Self::dispatch`]).
     fn step(&mut self, module: &BytecodeModule) -> Result<Step, InterpError> {
-            // Step budget: bound runaway loops so a stuck program surfaces as an
-            // `Internal` error instead of hanging the runner.
-            self.steps = self.steps.saturating_add(1);
-            if self.steps > MAX_STEPS {
-                return Err(InterpError::Internal(
-                    "step budget exceeded (possible infinite loop)".into(),
-                ));
-            }
-            // A native call may have surfaced an error to unwind the loop.
-            if let Some(err) = self.pending_err.take() {
-                return Err(err);
-            }
-            // Fetch + advance the PC without holding a long-lived borrow.
-            let ins = {
-                let frame = self.frames.last_mut().unwrap();
-                let func = func_ref(module, frame.func_index);
-                match func.code.get(frame.pc) {
-                    Some(ins) => {
-                        frame.pc += 1;
-                        frame.span = func.span;
-                        *ins
-                    }
-                    None => {
-                        // Fell off the end of a function without an explicit
-                        // Return — treat as `return undefined`.
-                        return Ok(Step::Done(Value::undefined()));
-                    }
+        // Step budget: bound runaway loops so a stuck program surfaces as an
+        // `Internal` error instead of hanging the runner.
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > MAX_STEPS {
+            return Err(InterpError::Internal(
+                "step budget exceeded (possible infinite loop)".into(),
+            ));
+        }
+        // A native call may have surfaced an error to unwind the loop.
+        if let Some(err) = self.pending_err.take() {
+            return Err(err);
+        }
+        // Fetch + advance the PC without holding a long-lived borrow.
+        let ins = {
+            let frame = self.frames.last_mut().unwrap();
+            let func = func_ref(module, frame.func_index);
+            match func.code.get(frame.pc) {
+                Some(ins) => {
+                    frame.pc += 1;
+                    frame.span = func.span;
+                    *ins
                 }
-            };
+                None => {
+                    // Fell off the end of a function without an explicit
+                    // Return — treat as `return undefined`.
+                    return Ok(Step::Done(Value::undefined()));
+                }
+            }
+        };
 
-            match ins.op {
-                Opcode::Nop => {}
-                Opcode::ArrayPush => {
-                    let v = self.top().stack.pop();
-                    let arr = self.top().stack.peek().clone();
+        match ins.op {
+            Opcode::Nop => {}
+            Opcode::ArrayPush => {
+                let v = self.top().stack.pop();
+                let arr = self.top().stack.peek().clone();
+                array_append(&arr, v);
+            }
+            Opcode::ArrayExtend => {
+                let src = self.top().stack.pop();
+                let arr = self.top().stack.peek().clone();
+                let values: Vec<Value> = match src.data() {
+                    ValueData::Object(o) => {
+                        let b = o.borrow();
+                        let len = b
+                            .properties
+                            .get("length")
+                            .and_then(|d| match d {
+                                js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                                    Some(value.clone())
+                                }
+                                _ => None,
+                            })
+                            .and_then(|v| match v.data() {
+                                ValueData::Integer(i) => Some(*i as usize),
+                                ValueData::Number(n) => Some(*n as usize),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        (0..len)
+                            .filter_map(|i| {
+                                b.properties.get(&i.to_string()).and_then(|d| match d {
+                                    js_runtime::object::PropertyDescriptor::Data {
+                                        value, ..
+                                    } => Some(value.clone()),
+                                    _ => None,
+                                })
+                            })
+                            .collect()
+                    }
+                    ValueData::String(s) => s
+                        .as_str()
+                        .chars()
+                        .map(|c| Value::string(c.to_string()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for v in values {
                     array_append(&arr, v);
                 }
-                Opcode::ArrayExtend => {
-                    let src = self.top().stack.pop();
-                    let arr = self.top().stack.peek().clone();
-                    let values: Vec<Value> = match src.data() {
-                        ValueData::Object(o) => {
-                            let b = o.borrow();
-                            let len = b
-                                .properties
-                                .get("length")
-                                .and_then(|d| match d {
-                                    js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
-                                    _ => None,
-                                })
-                                .and_then(|v| match v.data() {
-                                    ValueData::Integer(i) => Some(*i as usize),
-                                    ValueData::Number(n) => Some(*n as usize),
-                                    _ => None,
-                                })
-                                .unwrap_or(0);
-                            (0..len)
-                                .filter_map(|i| {
-                                    b.properties.get(&i.to_string()).and_then(|d| match d {
-                                        js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
-                                        _ => None,
-                                    })
-                                })
-                                .collect()
-                        }
-                        ValueData::String(s) => s.as_str().chars().map(|c| Value::string(c.to_string())).collect(),
-                        _ => Vec::new(),
-                    };
-                    for v in values {
-                        array_append(&arr, v);
-                    }
-                }
-                Opcode::GetIterator => {
-                    let v = self.top().stack.pop();
-                    self.top().stack.push(make_iterator(&v));
-                }
-                Opcode::IterNext => {
-                    let it = self.top().stack.pop();
-                    if it.is_generator() {
-                        // Drive one `.next()` via the call machinery; the
-                        // iterator-result lands on this frame's stack when the
-                        // generator yields/returns (or synchronously if done).
-                        let next_fn = get_property(&it, &Value::string("next"));
-                        self.invoke(module, next_fn, Vec::new(), it, false);
-                    } else {
-                        // Array-iterator object: step by index synchronously.
-                        let result = step_array_iterator(&it);
-                        self.top().stack.push(result);
-                    }
-                }
-                Opcode::ObjectKeys => {
-                    let v = self.top().stack.pop();
-                    let keys: Vec<String> = match v.data() {
-                        ValueData::Object(o) => {
-                            let b = o.borrow();
-                            // For arrays, expose numeric indices (skip "length").
-                            if b.is_exotic_array {
-                                (0..b.properties.len().saturating_sub(1))
-                                    .map(|i| i.to_string())
-                                    .collect()
-                            } else {
-                                b.properties.keys().cloned().collect()
-                            }
-                        }
-                        ValueData::String(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
-                        _ => Vec::new(),
-                    };
-                    let o = js_runtime::object::ObjectData::new_handle();
-                    {
-                        let mut obj = o.borrow_mut();
-                        obj.class = "Array";
-                        obj.is_exotic_array = true;
-                        for (i, k) in keys.iter().enumerate() {
-                            obj.properties.insert(
-                                i.to_string(),
-                                js_runtime::object::PropertyDescriptor::data(Value::string(k.clone())),
-                            );
-                        }
-                        obj.properties.insert(
-                            "length".to_string(),
-                            js_runtime::object::PropertyDescriptor::data(Value::integer(keys.len() as i32)),
-                        );
-                    }
-                    self.top().stack.push(Value::object(o));
-                }
-
-                // ---- stack / constants ----
-                Opcode::LdaUndefined => self.top().stack.push(Value::undefined()),
-                Opcode::LdaNull => self.top().stack.push(Value::null()),
-                Opcode::LdaTrue => self.top().stack.push(Value::boolean(true)),
-                Opcode::LdaFalse => self.top().stack.push(Value::boolean(false)),
-                Opcode::LdaConst => {
-                    let v = module.constants.get(ins.operand).clone();
-                    self.top().stack.push(v);
-                }
-                Opcode::LdaFunction => {
-                    let f = self.function_value(module, ins.operand as u32);
-                    self.top().stack.push(Value::function(f));
-                }
-                Opcode::LdaThis => {
-                    let v = self.current_this();
-                    self.top().stack.push(v);
-                }
-                Opcode::LdaUpvalue => {
-                    let v = self.top().upvalues[ins.operand as usize].borrow().clone();
-                    self.top().stack.push(v);
-                }
-                Opcode::StaUpvalue => {
-                    let v = self.top().stack.pop();
-                    *self.top().upvalues[ins.operand as usize].borrow_mut() = v;
-                }
-                Opcode::LdaLocal => {
-                    let v = self.top().locals[ins.operand as usize].borrow().clone();
-                    self.top().stack.push(v);
-                }
-                Opcode::StaLocal => {
-                    let v = self.top().stack.pop();
-                    *self.top().locals[ins.operand as usize].borrow_mut() = v;
-                }
-                Opcode::Pop => {
-                    self.top().stack.pop();
-                }
-                Opcode::Dup => {
-                    let v = self.top().stack.peek().clone();
-                    self.top().stack.push(v);
-                }
-                Opcode::Swap => {
-                    let b = self.top().stack.pop();
-                    let a = self.top().stack.pop();
-                    self.top().stack.push(b);
-                    self.top().stack.push(a);
-                }
-
-                // ---- arithmetic / binary ----
-                Opcode::Add => self.binop(add),
-                Opcode::Sub => self.binop(sub),
-                Opcode::Mul => self.binop(mul),
-                Opcode::Div => self.binop(div),
-                Opcode::Mod => self.binop(rem),
-                Opcode::Exp => self.binop(pow),
-                Opcode::BitAnd => self.binop(bitand),
-                Opcode::BitOr => self.binop(bitor),
-                Opcode::BitXor => self.binop(bitxor),
-                Opcode::Shl => self.binop(shl),
-                Opcode::Shr => self.binop(shr),
-
-                // ---- comparison ----
-                Opcode::Eq => self.cmp(eq_loose),
-                Opcode::StrictEq => self.cmp(eq_strict),
-                Opcode::Lt => self.cmp(cmp_lt),
-                Opcode::Le => self.cmp(cmp_le),
-                Opcode::Gt => self.cmp(cmp_gt),
-                Opcode::Ge => self.cmp(cmp_ge),
-                Opcode::Instanceof => {
-                    let b = self.top().stack.pop();
-                    let a = self.top().stack.pop();
-                    self.top().stack.push(Value::boolean(crate::builtins::instanceof_check(&a, &b)));
-                }
-
-                // ---- unary ----
-                Opcode::Neg => self.unary(neg),
-                Opcode::Pos => self.unary(pos),
-                Opcode::Not => {
-                    let b = is_falsy(&self.top().stack.pop());
-                    self.top().stack.push(Value::boolean(b));
-                }
-                Opcode::BitNot => self.unary(bitnot),
-                Opcode::Typeof => self.unary(typeof_),
-
-                // ---- globals ----
-                Opcode::GetGlobal => {
-                    let name = match module.constants.get(ins.operand).data() {
-                        ValueData::String(s) => s.as_str().to_string(),
-                        _ => String::new(),
-                    };
-                    let v = self
-                        .ctx
-                        .realm
-                        .borrow()
-                        .globals
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.top().stack.push(v);
-                }
-                Opcode::SetGlobal => {
-                    let v = self.top().stack.pop();
-                    let name = match module.constants.get(ins.operand).data() {
-                        ValueData::String(s) => s.as_str().to_string(),
-                        _ => String::new(),
-                    };
-                    self.ctx.realm.borrow_mut().globals.insert(name, v);
-                }
-
-                // ---- control flow ----
-                Opcode::Jump => {
-                    self.top().pc = ins.operand as usize;
-                }
-                Opcode::JumpIfTrue => {
-                    let v = self.top().stack.pop();
-                    if is_truthy(&v) {
-                        self.top().pc = ins.operand as usize;
-                    }
-                }
-                Opcode::JumpIfFalse => {
-                    let v = self.top().stack.pop();
-                    if is_falsy(&v) {
-                        self.top().pc = ins.operand as usize;
-                    }
-                }
-                Opcode::Return => {
-                    let (ret, was_construct, this_obj, gen) = {
-                        let f = self.frames.last_mut().unwrap();
-                        (f.stack.pop(), f.is_construct, f.this.clone(), f.generator.clone())
-                    };
-                    // A generator body completing: mark done, return {value, done:true}.
-                    if let Some(g) = gen {
-                        g.borrow_mut().done = true;
-                        self.frames.pop();
-                        if self.frames.is_empty() {
-                            return Ok(Step::Done(Value::undefined()));
-                        }
-                        self.top().stack.push(iter_result(ret, true));
-                        return Ok(Step::More);
-                    }
-                    self.frames.pop();
-                    let ret = if was_construct && !ret.is_object() { this_obj } else { ret };
-                    if self.frames.is_empty() {
-                        return Ok(Step::Done(ret));
-                    }
-                    self.top().stack.push(ret);
-                }
-                Opcode::Throw => {
-                    let v = self.top().stack.pop();
-                    return Err(InterpError::Throw(v));
-                }
-                Opcode::TryBegin => {
-                    let idx = self.top().func_index;
-                    let spec = func_ref(module, idx).handlers[ins.operand as usize];
-                    self.top().try_stack.push(crate::frame::ActiveTry {
-                        catch_pc: spec.catch_pc,
-                        finally_pc: spec.finally_pc,
-                    });
-                }
-                Opcode::TryEnd => {
-                    self.top().try_stack.pop();
-                }
-                Opcode::FinallyEnd => {
-                    // Re-raise the pending exception (try/finally with no catch),
-                    // else continue normally.
-                    if let Some(v) = self.top().pending_throw.take() {
-                        return Err(InterpError::Throw(v));
-                    }
-                }
-                Opcode::Yield => {
-                    // Suspend the current generator frame: pop the yielded
-                    // value, save the frame back into its generator, then pop
-                    // the frame and hand {value, done:false} to the caller.
-                    let gen = self.frames.last().unwrap().generator.clone();
-                    let gen = gen.expect("`yield` outside a generator frame");
-                    let yielded = self.frames.last_mut().unwrap().stack.pop();
-                    {
-                        let mut s = gen.borrow_mut();
-                        let f = self.frames.last().unwrap();
-                        s.pc = f.pc;
-                        s.locals = self.frames.last_mut().unwrap().locals.split_off(0);
-                        let depth = self.frames.last().unwrap().stack.depth();
-                        let mut v: Vec<Value> = (0..depth)
-                            .map(|_| self.frames.last_mut().unwrap().stack.pop())
-                            .collect();
-                        v.reverse();
-                        s.stack = v;
-                        s.upvalues = self.frames.last_mut().unwrap().upvalues.split_off(0);
-                        s.this = self.frames.last_mut().unwrap().this.clone();
-                        s.captured_this = self.frames.last_mut().unwrap().captured_this.take();
-                        s.done = false;
-                    }
-                    self.frames.pop();
-                    if self.frames.is_empty() {
-                        // `yield` at the top of the script (no caller) — drop it.
-                        return Ok(Step::Done(Value::undefined()));
-                    }
-                    self.top().stack.push(iter_result(yielded, false));
-                }
-
-                // ---- calls ----
-                Opcode::Call => {
-                    let (callee, args) = pop_args(self, ins.operand);
-                    self.invoke(module, callee, args, Value::undefined(), false);
-                }
-                Opcode::CallMethod => {
-                    // Stack: [obj, fn, args...]
-                    let (args, this, callee) = {
-                        let n = ins.operand as usize;
-                        let frame = self.frames.last_mut().unwrap();
-                        let mut a: Vec<Value> = (0..n).map(|_| frame.stack.pop()).collect();
-                        a.reverse();
-                        let callee = frame.stack.pop();
-                        let this = frame.stack.pop();
-                        (a, this, callee)
-                    };
-                    self.invoke(module, callee, args, this, false);
-                }
-                Opcode::NewObject => {
-                    let o = js_runtime::object::ObjectData::new_handle();
-                    self.top().stack.push(Value::object(o));
-                }
-                Opcode::NewRegex => {
-                    // Constant holds "pattern\0flags".
-                    let combined = match module.constants.get(ins.operand).data() {
-                        ValueData::String(s) => s.as_str().to_string(),
-                        _ => String::new(),
-                    };
-                    let (pattern, flags) = combined.split_once('\0')
-                        .map(|(p, f)| (p.to_string(), f.to_string()))
-                        .unwrap_or((combined.clone(), String::new()));
-                    let global = flags.contains('g');
-                    let ignore_case = flags.contains('i');
-                    let multiline = flags.contains('m');
-                    let dotall = flags.contains('s');
-                    let sticky = flags.contains('y');
-                    let unicode = flags.contains('u');
-                    let o = js_runtime::object::ObjectData::new_handle();
-                    {
-                        let mut b = o.borrow_mut();
-                        b.class = "RegExp";
-                        let pd = |v: Value| js_runtime::object::PropertyDescriptor::data(v);
-                        b.properties.insert("source".into(), pd(Value::string(pattern)));
-                        b.properties.insert("flags".into(), pd(Value::string(flags)));
-                        b.properties.insert("global".into(), pd(Value::boolean(global)));
-                        b.properties.insert("ignoreCase".into(), pd(Value::boolean(ignore_case)));
-                        b.properties.insert("multiline".into(), pd(Value::boolean(multiline)));
-                        b.properties.insert("dotAll".into(), pd(Value::boolean(dotall)));
-                        b.properties.insert("sticky".into(), pd(Value::boolean(sticky)));
-                        b.properties.insert("unicode".into(), pd(Value::boolean(unicode)));
-                        b.properties.insert("lastIndex".into(), pd(Value::integer(0)));
-                    }
-                    self.top().stack.push(Value::object(o));
-                }
-                Opcode::NewArray => {
-                    let n = ins.operand as usize;
-                    let mut args: Vec<Value> = (0..n).map(|_| self.top().stack.pop()).collect();
-                    args.reverse();
-                    let o = js_runtime::object::ObjectData::new_handle();
-                    {
-                        let mut obj = o.borrow_mut();
-                        obj.class = "Array";
-                        obj.is_exotic_array = true;
-                        for (i, v) in args.iter().enumerate() {
-                            obj.properties.insert(
-                                i.to_string(),
-                                js_runtime::object::PropertyDescriptor::data(v.clone()),
-                            );
-                        }
-                        obj.properties.insert(
-                            "length".to_string(),
-                            js_runtime::object::PropertyDescriptor::data(Value::integer(n as i32)),
-                        );
-                    }
-                    self.top().stack.push(Value::object(o));
-                }
-                Opcode::GetProp => {
-                    let key = self.top().stack.pop();
-                    let obj = self.top().stack.pop();
-                    self.top().stack.push(get_property(&obj, &key));
-                }
-                Opcode::SetProp => {
-                    // Stack: [..., value, obj, key] (key on top). Pops key, obj,
-                    // value; the compiler keeps the assignment result via a
-                    // preceding `Dup` of the value.
-                    let key = self.top().stack.pop();
-                    let obj = self.top().stack.pop();
-                    let value = self.top().stack.pop();
-                    set_property(&obj, &key, value);
-                }
-                Opcode::New => {
-                    let (callee, args) = pop_args(self, ins.operand);
-                    // Construct a fresh object bound as `this`.
-                    let this = Value::object(js_runtime::object::ObjectData::new_handle());
-                    self.invoke(module, callee, args, this, true);
-                }
-
-                Opcode::LogicalAnd | Opcode::LogicalOr | Opcode::NullishCoal => {
-                    return Err(InterpError::Internal(format!(
-                        "opcode {:?} not implemented yet (lowered to runtime calls)",
-                        ins.op
-                    )));
+            }
+            Opcode::GetIterator => {
+                let v = self.top().stack.pop();
+                self.top().stack.push(make_iterator(&v));
+            }
+            Opcode::IterNext => {
+                let it = self.top().stack.pop();
+                if it.is_generator() {
+                    // Drive one `.next()` via the call machinery; the
+                    // iterator-result lands on this frame's stack when the
+                    // generator yields/returns (or synchronously if done).
+                    let next_fn = get_property(&it, &Value::string("next"));
+                    self.invoke(module, next_fn, Vec::new(), it, false);
+                } else {
+                    // Array-iterator object: step by index synchronously.
+                    let result = step_array_iterator(&it);
+                    self.top().stack.push(result);
                 }
             }
+            Opcode::ObjectKeys => {
+                let v = self.top().stack.pop();
+                let keys: Vec<String> = match v.data() {
+                    ValueData::Object(o) => {
+                        let b = o.borrow();
+                        // For arrays, expose numeric indices (skip "length").
+                        if b.is_exotic_array {
+                            (0..b.properties.len().saturating_sub(1))
+                                .map(|i| i.to_string())
+                                .collect()
+                        } else {
+                            b.properties.keys().cloned().collect()
+                        }
+                    }
+                    ValueData::String(s) => (0..s.chars().count()).map(|i| i.to_string()).collect(),
+                    _ => Vec::new(),
+                };
+                let o = js_runtime::object::ObjectData::new_handle();
+                {
+                    let mut obj = o.borrow_mut();
+                    obj.class = "Array";
+                    obj.is_exotic_array = true;
+                    for (i, k) in keys.iter().enumerate() {
+                        obj.properties.insert(
+                            i.to_string(),
+                            js_runtime::object::PropertyDescriptor::data(Value::string(k.clone())),
+                        );
+                    }
+                    obj.properties.insert(
+                        "length".to_string(),
+                        js_runtime::object::PropertyDescriptor::data(Value::integer(
+                            keys.len() as i32
+                        )),
+                    );
+                }
+                self.top().stack.push(Value::object(o));
+            }
+
+            // ---- stack / constants ----
+            Opcode::LdaUndefined => self.top().stack.push(Value::undefined()),
+            Opcode::LdaNull => self.top().stack.push(Value::null()),
+            Opcode::LdaTrue => self.top().stack.push(Value::boolean(true)),
+            Opcode::LdaFalse => self.top().stack.push(Value::boolean(false)),
+            Opcode::LdaConst => {
+                let v = module.constants.get(ins.operand).clone();
+                self.top().stack.push(v);
+            }
+            Opcode::LdaFunction => {
+                let f = self.function_value(module, ins.operand as u32);
+                self.top().stack.push(Value::function(f));
+            }
+            Opcode::LdaThis => {
+                let v = self.current_this();
+                self.top().stack.push(v);
+            }
+            Opcode::LdaUpvalue => {
+                let v = self.top().upvalues[ins.operand as usize].borrow().clone();
+                self.top().stack.push(v);
+            }
+            Opcode::StaUpvalue => {
+                let v = self.top().stack.pop();
+                *self.top().upvalues[ins.operand as usize].borrow_mut() = v;
+            }
+            Opcode::LdaLocal => {
+                let v = self.top().locals[ins.operand as usize].borrow().clone();
+                self.top().stack.push(v);
+            }
+            Opcode::StaLocal => {
+                let v = self.top().stack.pop();
+                *self.top().locals[ins.operand as usize].borrow_mut() = v;
+            }
+            Opcode::Pop => {
+                self.top().stack.pop();
+            }
+            Opcode::Dup => {
+                let v = self.top().stack.peek().clone();
+                self.top().stack.push(v);
+            }
+            Opcode::Swap => {
+                let b = self.top().stack.pop();
+                let a = self.top().stack.pop();
+                self.top().stack.push(b);
+                self.top().stack.push(a);
+            }
+
+            // ---- arithmetic / binary ----
+            Opcode::Add => self.binop(add),
+            Opcode::Sub => self.binop(sub),
+            Opcode::Mul => self.binop(mul),
+            Opcode::Div => self.binop(div),
+            Opcode::Mod => self.binop(rem),
+            Opcode::Exp => self.binop(pow),
+            Opcode::BitAnd => self.binop(bitand),
+            Opcode::BitOr => self.binop(bitor),
+            Opcode::BitXor => self.binop(bitxor),
+            Opcode::Shl => self.binop(shl),
+            Opcode::Shr => self.binop(shr),
+
+            // ---- comparison ----
+            Opcode::Eq => self.cmp(eq_loose),
+            Opcode::StrictEq => self.cmp(eq_strict),
+            Opcode::Lt => self.cmp(cmp_lt),
+            Opcode::Le => self.cmp(cmp_le),
+            Opcode::Gt => self.cmp(cmp_gt),
+            Opcode::Ge => self.cmp(cmp_ge),
+            Opcode::Instanceof => {
+                let b = self.top().stack.pop();
+                let a = self.top().stack.pop();
+                self.top()
+                    .stack
+                    .push(Value::boolean(crate::builtins::instanceof_check(&a, &b)));
+            }
+
+            // ---- unary ----
+            Opcode::Neg => self.unary(neg),
+            Opcode::Pos => self.unary(pos),
+            Opcode::Not => {
+                let b = is_falsy(&self.top().stack.pop());
+                self.top().stack.push(Value::boolean(b));
+            }
+            Opcode::BitNot => self.unary(bitnot),
+            Opcode::Typeof => self.unary(typeof_),
+
+            // ---- globals ----
+            Opcode::GetGlobal => {
+                let name = match module.constants.get(ins.operand).data() {
+                    ValueData::String(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                let v = self
+                    .ctx
+                    .realm
+                    .borrow()
+                    .globals
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                self.top().stack.push(v);
+            }
+            Opcode::SetGlobal => {
+                let v = self.top().stack.pop();
+                let name = match module.constants.get(ins.operand).data() {
+                    ValueData::String(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                self.ctx.realm.borrow_mut().globals.insert(name, v);
+            }
+
+            // ---- control flow ----
+            Opcode::Jump => {
+                self.top().pc = ins.operand as usize;
+            }
+            Opcode::JumpIfTrue => {
+                let v = self.top().stack.pop();
+                if is_truthy(&v) {
+                    self.top().pc = ins.operand as usize;
+                }
+            }
+            Opcode::JumpIfFalse => {
+                let v = self.top().stack.pop();
+                if is_falsy(&v) {
+                    self.top().pc = ins.operand as usize;
+                }
+            }
+            Opcode::Return => {
+                let (ret, was_construct, this_obj, gen) = {
+                    let f = self.frames.last_mut().unwrap();
+                    (
+                        f.stack.pop(),
+                        f.is_construct,
+                        f.this.clone(),
+                        f.generator.clone(),
+                    )
+                };
+                // A generator body completing: mark done, return {value, done:true}.
+                if let Some(g) = gen {
+                    g.borrow_mut().done = true;
+                    self.frames.pop();
+                    if self.frames.is_empty() {
+                        return Ok(Step::Done(Value::undefined()));
+                    }
+                    self.top().stack.push(iter_result(ret, true));
+                    return Ok(Step::More);
+                }
+                self.frames.pop();
+                let ret = if was_construct && !ret.is_object() {
+                    this_obj
+                } else {
+                    ret
+                };
+                if self.frames.is_empty() {
+                    return Ok(Step::Done(ret));
+                }
+                self.top().stack.push(ret);
+            }
+            Opcode::Throw => {
+                let v = self.top().stack.pop();
+                return Err(InterpError::Throw(v));
+            }
+            Opcode::TryBegin => {
+                let idx = self.top().func_index;
+                let spec = func_ref(module, idx).handlers[ins.operand as usize];
+                self.top().try_stack.push(crate::frame::ActiveTry {
+                    catch_pc: spec.catch_pc,
+                    finally_pc: spec.finally_pc,
+                });
+            }
+            Opcode::TryEnd => {
+                self.top().try_stack.pop();
+            }
+            Opcode::FinallyEnd => {
+                // Re-raise the pending exception (try/finally with no catch),
+                // else continue normally.
+                if let Some(v) = self.top().pending_throw.take() {
+                    return Err(InterpError::Throw(v));
+                }
+            }
+            Opcode::Yield => {
+                // Suspend the current generator frame: pop the yielded
+                // value, save the frame back into its generator, then pop
+                // the frame and hand {value, done:false} to the caller.
+                let gen = self.frames.last().unwrap().generator.clone();
+                let gen = gen.expect("`yield` outside a generator frame");
+                let yielded = self.frames.last_mut().unwrap().stack.pop();
+                {
+                    let mut s = gen.borrow_mut();
+                    let f = self.frames.last().unwrap();
+                    s.pc = f.pc;
+                    s.locals = self.frames.last_mut().unwrap().locals.split_off(0);
+                    let depth = self.frames.last().unwrap().stack.depth();
+                    let mut v: Vec<Value> = (0..depth)
+                        .map(|_| self.frames.last_mut().unwrap().stack.pop())
+                        .collect();
+                    v.reverse();
+                    s.stack = v;
+                    s.upvalues = self.frames.last_mut().unwrap().upvalues.split_off(0);
+                    s.this = self.frames.last_mut().unwrap().this.clone();
+                    s.captured_this = self.frames.last_mut().unwrap().captured_this.take();
+                    s.done = false;
+                }
+                self.frames.pop();
+                if self.frames.is_empty() {
+                    // `yield` at the top of the script (no caller) — drop it.
+                    return Ok(Step::Done(Value::undefined()));
+                }
+                self.top().stack.push(iter_result(yielded, false));
+            }
+
+            // ---- calls ----
+            Opcode::Call => {
+                let (callee, args) = pop_args(self, ins.operand);
+                self.invoke(module, callee, args, Value::undefined(), false);
+            }
+            Opcode::CallMethod => {
+                // Stack: [obj, fn, args...]
+                let (args, this, callee) = {
+                    let n = ins.operand as usize;
+                    let frame = self.frames.last_mut().unwrap();
+                    let mut a: Vec<Value> = (0..n).map(|_| frame.stack.pop()).collect();
+                    a.reverse();
+                    let callee = frame.stack.pop();
+                    let this = frame.stack.pop();
+                    (a, this, callee)
+                };
+                self.invoke(module, callee, args, this, false);
+            }
+            Opcode::NewObject => {
+                let o = js_runtime::object::ObjectData::new_handle();
+                self.top().stack.push(Value::object(o));
+            }
+            Opcode::NewRegex => {
+                // Constant holds "pattern\0flags".
+                let combined = match module.constants.get(ins.operand).data() {
+                    ValueData::String(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                let (pattern, flags) = combined
+                    .split_once('\0')
+                    .map(|(p, f)| (p.to_string(), f.to_string()))
+                    .unwrap_or((combined.clone(), String::new()));
+                let global = flags.contains('g');
+                let ignore_case = flags.contains('i');
+                let multiline = flags.contains('m');
+                let dotall = flags.contains('s');
+                let sticky = flags.contains('y');
+                let unicode = flags.contains('u');
+                let o = js_runtime::object::ObjectData::new_handle();
+                {
+                    let mut b = o.borrow_mut();
+                    b.class = "RegExp";
+                    let pd = |v: Value| js_runtime::object::PropertyDescriptor::data(v);
+                    b.properties
+                        .insert("source".into(), pd(Value::string(pattern)));
+                    b.properties
+                        .insert("flags".into(), pd(Value::string(flags)));
+                    b.properties
+                        .insert("global".into(), pd(Value::boolean(global)));
+                    b.properties
+                        .insert("ignoreCase".into(), pd(Value::boolean(ignore_case)));
+                    b.properties
+                        .insert("multiline".into(), pd(Value::boolean(multiline)));
+                    b.properties
+                        .insert("dotAll".into(), pd(Value::boolean(dotall)));
+                    b.properties
+                        .insert("sticky".into(), pd(Value::boolean(sticky)));
+                    b.properties
+                        .insert("unicode".into(), pd(Value::boolean(unicode)));
+                    b.properties
+                        .insert("lastIndex".into(), pd(Value::integer(0)));
+                }
+                self.top().stack.push(Value::object(o));
+            }
+            Opcode::NewArray => {
+                let n = ins.operand as usize;
+                let mut args: Vec<Value> = (0..n).map(|_| self.top().stack.pop()).collect();
+                args.reverse();
+                let o = js_runtime::object::ObjectData::new_handle();
+                {
+                    let mut obj = o.borrow_mut();
+                    obj.class = "Array";
+                    obj.is_exotic_array = true;
+                    for (i, v) in args.iter().enumerate() {
+                        obj.properties.insert(
+                            i.to_string(),
+                            js_runtime::object::PropertyDescriptor::data(v.clone()),
+                        );
+                    }
+                    obj.properties.insert(
+                        "length".to_string(),
+                        js_runtime::object::PropertyDescriptor::data(Value::integer(n as i32)),
+                    );
+                }
+                self.top().stack.push(Value::object(o));
+            }
+            Opcode::GetProp => {
+                let key = self.top().stack.pop();
+                let obj = self.top().stack.pop();
+                self.top().stack.push(get_property(&obj, &key));
+            }
+            Opcode::SetProp => {
+                // Stack: [..., value, obj, key] (key on top). Pops key, obj,
+                // value; the compiler keeps the assignment result via a
+                // preceding `Dup` of the value.
+                let key = self.top().stack.pop();
+                let obj = self.top().stack.pop();
+                let value = self.top().stack.pop();
+                set_property(&obj, &key, value);
+            }
+            Opcode::New => {
+                let (callee, args) = pop_args(self, ins.operand);
+                // Construct a fresh object bound as `this`.
+                let this = Value::object(js_runtime::object::ObjectData::new_handle());
+                self.invoke(module, callee, args, this, true);
+            }
+
+            Opcode::LogicalAnd | Opcode::LogicalOr | Opcode::NullishCoal => {
+                return Err(InterpError::Internal(format!(
+                    "opcode {:?} not implemented yet (lowered to runtime calls)",
+                    ins.op
+                )));
+            }
+        }
         Ok(Step::More)
     }
 
@@ -671,8 +723,8 @@ impl Interpreter {
                 Ok(Step::More) => {}
                 Ok(Step::Done(_)) => break,
                 Err(e) => match self.handle_exception(e, target) {
-                    Ok(()) => {}                  // caught inside the callee
-                    Err(e) => return Err(e),      // escaped the callee → propagate
+                    Ok(()) => {}             // caught inside the callee
+                    Err(e) => return Err(e), // escaped the callee → propagate
                 },
             }
         }
@@ -751,7 +803,11 @@ impl Interpreter {
         let f = match callee.as_function() {
             Some(f) => f.clone(),
             None => {
-                self.top().stack.push(if is_construct { this } else { Value::undefined() });
+                self.top().stack.push(if is_construct {
+                    this
+                } else {
+                    Value::undefined()
+                });
                 return;
             }
         };
@@ -783,7 +839,9 @@ impl Interpreter {
         // Calling a `function*` creates a generator object (it does not run).
         if func.is_generator && !is_construct {
             let state = self.make_generator_state(module, id, &f, args, this);
-            self.top().stack.push(Value::generator(Rc::new(RefCell::new(state))));
+            self.top()
+                .stack
+                .push(Value::generator(Rc::new(RefCell::new(state))));
             return;
         }
         let (slot_count, param_count, span) = func_meta(module, id);
@@ -812,7 +870,9 @@ impl Interpreter {
     ) -> GeneratorState {
         let func = func_ref(module, id);
         let slot_count = func.locals.slot_count();
-        let mut locals: Vec<_> = (0..slot_count).map(|_| new_cell(Value::undefined())).collect();
+        let mut locals: Vec<_> = (0..slot_count)
+            .map(|_| new_cell(Value::undefined()))
+            .collect();
         for i in 0..(func.param_count as usize).min(args.len()) {
             locals[i] = new_cell(args[i].clone());
         }
@@ -822,7 +882,11 @@ impl Interpreter {
             locals,
             stack: Vec::new(),
             upvalues: f.upvalues.clone(),
-            this: if f.this_cell.is_some() { Value::undefined() } else { this },
+            this: if f.this_cell.is_some() {
+                Value::undefined()
+            } else {
+                this
+            },
             captured_this: f.this_cell.clone(),
             done: false,
             started: false,
@@ -877,11 +941,8 @@ impl Interpreter {
 /// Build the default native-function table (generator `.next`/`.return`/`.
 /// throw`, then the Array/String builtin methods).
 fn default_natives() -> Vec<Box<dyn NativeFn>> {
-    let mut v: Vec<Box<dyn NativeFn>> = vec![
-        Box::new(GenNext),
-        Box::new(GenReturn),
-        Box::new(GenThrow),
-    ];
+    let mut v: Vec<Box<dyn NativeFn>> =
+        vec![Box::new(GenNext), Box::new(GenReturn), Box::new(GenThrow)];
     v.extend(crate::builtins::all_builtins());
     v
 }
@@ -1141,11 +1202,13 @@ pub(crate) fn to_string(v: &Value) -> String {
                     .properties
                     .get("length")
                     .and_then(|d| match d {
-                        js_runtime::object::PropertyDescriptor::Data { value, .. } => match value.data() {
-                            ValueData::Integer(i) => Some(*i as usize),
-                            ValueData::Number(n) => Some(*n as usize),
-                            _ => None,
-                        },
+                        js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                            match value.data() {
+                                ValueData::Integer(i) => Some(*i as usize),
+                                ValueData::Number(n) => Some(*n as usize),
+                                _ => None,
+                            }
+                        }
                         _ => None,
                     })
                     .unwrap_or(0);
@@ -1155,7 +1218,9 @@ pub(crate) fn to_string(v: &Value) -> String {
                             .properties
                             .get(&i.to_string())
                             .and_then(|d| match d {
-                                js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
+                                js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                                    Some(value.clone())
+                                }
                                 _ => None,
                             })
                             .unwrap_or_else(Value::undefined);
@@ -1172,16 +1237,18 @@ pub(crate) fn to_string(v: &Value) -> String {
                 // Error-like objects: if they have `name` + `message`,
                 // display as "name: message" for readable output.
                 let (name_v, msg_v) = {
-                    let nv = b.properties.get("name")
-                        .and_then(|d| match d {
-                            js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
-                            _ => None,
-                        });
-                    let mv = b.properties.get("message")
-                        .and_then(|d| match d {
-                            js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
-                            _ => None,
-                        });
+                    let nv = b.properties.get("name").and_then(|d| match d {
+                        js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    });
+                    let mv = b.properties.get("message").and_then(|d| match d {
+                        js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    });
                     (nv, mv)
                 };
                 drop(b);
@@ -1190,7 +1257,11 @@ pub(crate) fn to_string(v: &Value) -> String {
                         let n = to_string(&nv);
                         let m = to_string(&mv);
                         if n.ends_with("Error") {
-                            if m.is_empty() { n } else { format!("{}: {}", n, m) }
+                            if m.is_empty() {
+                                n
+                            } else {
+                                format!("{}: {}", n, m)
+                            }
                         } else {
                             "[object Object]".to_string()
                         }
@@ -1379,11 +1450,7 @@ fn step_array_iterator(it: &Value) -> Value {
     };
     if i < l {
         let value = get_property(&src, &Value::string(i.to_string()));
-        set_property(
-            it,
-            &Value::string(IT_IDX),
-            Value::integer(i + 1),
-        );
+        set_property(it, &Value::string(IT_IDX), Value::integer(i + 1));
         iter_result(value, false)
     } else {
         iter_result(Value::undefined(), true)
@@ -1420,7 +1487,9 @@ pub(crate) fn array_len(arr: &Value) -> usize {
             b.properties
                 .get("length")
                 .and_then(|d| match d {
-                    js_runtime::object::PropertyDescriptor::Data { value, .. } => Some(value.clone()),
+                    js_runtime::object::PropertyDescriptor::Data { value, .. } => {
+                        Some(value.clone())
+                    }
                     _ => None,
                 })
                 .and_then(|v| match v.data() {
@@ -1441,7 +1510,9 @@ pub(crate) fn array_get(arr: &Value, i: usize) -> Value {
 }
 
 pub(crate) fn array_append(arr: &Value, v: Value) {
-    let Some(handle) = obj_as_object(arr) else { return; };
+    let Some(handle) = obj_as_object(arr) else {
+        return;
+    };
     let mut b = handle.borrow_mut();
     let len = b
         .properties
@@ -1456,8 +1527,10 @@ pub(crate) fn array_append(arr: &Value, v: Value) {
             _ => None,
         })
         .unwrap_or(0);
-    b.properties
-        .insert(len.to_string(), js_runtime::object::PropertyDescriptor::data(v));
+    b.properties.insert(
+        len.to_string(),
+        js_runtime::object::PropertyDescriptor::data(v),
+    );
     b.properties.insert(
         "length".to_string(),
         js_runtime::object::PropertyDescriptor::data(Value::integer((len + 1) as i32)),

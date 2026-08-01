@@ -45,7 +45,14 @@ fn parse_class(
     // returns `None` without consuming for an anonymous class (`{`/`extends`).
     let name = expr::binding_identifier(tokens);
     let superclass = if tokens.eat_keyword(Keyword::Extends) {
-        Some(Box::new(expr::parse_lhs(tokens)?))
+        let heritage = expr::parse_lhs(tokens)?;
+        if matches!(heritage, js_syntax::ast::expr::Expr::Arrow(_)) {
+            return Err(vec![Diagnostic::error(
+                heritage.span(),
+                "an unparenthesized arrow function is not valid class heritage",
+            )]);
+        }
+        Some(Box::new(heritage))
     } else {
         None
     };
@@ -83,7 +90,10 @@ fn parse_decorator(
     tokens.bump(); // `@`
 
     use js_syntax::ast::expr::{CallExpr, Expr, MemberExpr, MemberProp};
-    let mut node: Expr = if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    let mut node: Expr = if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         // @( Expression )
         tokens.bump(); // `(`
         let inner = expr::parse_expression(tokens)?;
@@ -199,7 +209,10 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
     if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Static))
         && !is_member_continuation(&tokens.peek2().kind)
     {
-        if matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::LBrace)) {
+        if matches!(
+            tokens.peek2().kind,
+            TokenKind::Punctuator(Punctuator::LBrace)
+        ) {
             tokens.bump(); // `static`
             let (block, close) = expr::parse_block(tokens)?;
             return Ok(ClassMember {
@@ -212,8 +225,25 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
                 decorators,
             });
         }
+        if tokens.current_token_contains_escape() {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "the class `static` modifier may not contain an escape sequence",
+            )]);
+        }
         tokens.bump();
         static_ = true;
+    }
+
+    // Stage-3 auto-accessor: `accessor name [= initializer]`. The current AST
+    // represents it as a field until auto-accessor runtime semantics exist, but
+    // recognizing the modifier here is necessary to preserve its grammar (and
+    // keeps ordinary same-line fields invalid).
+    let is_auto_accessor = matches!(tokens.peek_kind(), TokenKind::Ident(name) if name == "accessor")
+        && !tokens.preceded_by_newline_at(1)
+        && is_plain_prop_name_start(&tokens.peek2().kind);
+    if is_auto_accessor {
+        tokens.bump();
     }
 
     // `async` method modifier (contextual keyword). It is a modifier only when
@@ -223,6 +253,12 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
     if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Async))
         && is_async_modifier_ahead(tokens)
     {
+        if tokens.current_token_contains_escape() {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "the method `async` modifier may not contain an escape sequence",
+            )]);
+        }
         tokens.bump();
         is_async = true;
     }
@@ -253,13 +289,21 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
     let (key, computed) = parse_member_key(tokens)?;
 
     // Method (including constructor).
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LParen)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LParen)
+    ) {
         tokens.enter_strict_fn(is_async, is_generator);
         let result = (|| {
             let params = expr::parse_params(tokens)?;
             let (body, close) = expr::parse_block(tokens)?;
             let span = Span::new(start.start, close.end);
-            let final_kind = if is_constructor_key(&key) && !static_ {
+            let final_kind = if is_constructor_key(&key)
+                && !static_
+                && kind == ClassMemberKind::Method
+                && !is_async
+                && !is_generator
+            {
                 ClassMemberKind::Constructor
             } else {
                 kind
@@ -292,9 +336,25 @@ fn parse_class_member(tokens: &mut ParserTokenStream) -> Result<ClassMember, Vec
     } else {
         None
     };
-    // Optional trailing `;`.
-    let _ = tokens.eat_punctuator(Punctuator::Semicolon);
-    let end = init.as_ref().map(|e| e.span().end).unwrap_or_else(|| tokens.span().start);
+    // A class field may omit its semicolon only at a line boundary or directly
+    // before the closing brace. Without either, the following token is part of
+    // the same ClassElement and makes it invalid (`x y`, `x method(){}`).
+    if !tokens.eat_punctuator(Punctuator::Semicolon)
+        && !matches!(
+            tokens.peek_kind(),
+            TokenKind::Punctuator(Punctuator::RBrace)
+        )
+        && !tokens.preceded_by_newline()
+    {
+        return Err(vec![Diagnostic::error(
+            tokens.span(),
+            "expected `;` or a line terminator after class field",
+        )]);
+    }
+    let end = init
+        .as_ref()
+        .map(|e| e.span().end)
+        .unwrap_or_else(|| tokens.span().start);
     Ok(ClassMember {
         span: Span::new(start.start, end),
         key,
@@ -316,7 +376,10 @@ pub(crate) fn is_async_modifier_ahead(tokens: &ParserTokenStream) -> bool {
         return true;
     }
     if is_plain_prop_name_start(k2) {
-        return matches!(tokens.peek3().kind, TokenKind::Punctuator(Punctuator::LParen));
+        return matches!(
+            tokens.peek3().kind,
+            TokenKind::Punctuator(Punctuator::LParen)
+        );
     }
     // Computed-key async method: `async [expr](`. Scan past the bracket-balanced
     // `[...]` and check that a `(` follows.
@@ -385,7 +448,14 @@ fn parse_member_key(tokens: &mut ParserTokenStream) -> Result<(PropKey, bool), V
         }
         TokenKind::Numeric(raw) => {
             tokens.bump();
-            Ok((PropKey::Number(js_lexer::parse_number(&raw).unwrap_or(f64::NAN)), false))
+            Ok((
+                PropKey::Number(js_lexer::parse_number(&raw).unwrap_or(f64::NAN)),
+                false,
+            ))
+        }
+        TokenKind::Bigint(raw) => {
+            tokens.bump();
+            Ok((PropKey::String(expr::bigint_property_name(&raw)), false))
         }
         other => Err(vec![Diagnostic::error(
             tokens.span(),

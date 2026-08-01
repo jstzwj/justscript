@@ -120,14 +120,19 @@ impl<'a> Lexer<'a> {
         // the next template chunk (text up to `` ` `` or `${`).
         if self.tmpl_pending {
             self.tmpl_pending = false;
-            let (raw, cooked, tail) = self.scan_template_chunk();
-            return TokenKind::Template { raw, cooked, tail };
+            return match self.scan_template_chunk() {
+                Some((raw, cooked, tail)) => TokenKind::Template { raw, cooked, tail },
+                None => TokenKind::Unknown('`'),
+            };
         }
         // Hashbang comment: `#!...` is allowed only as the very first thing in
         // the source (a single line comment, like a shell shebang).
         if first == '#' && self.cursor.second() == '!' && self.cursor.byte_offset() == BytePos(0) {
             self.cursor.eat_while(|c| !is_line_terminator(c));
-            return TokenKind::Comment { is_block: false, has_newline: false };
+            return TokenKind::Comment {
+                is_block: false,
+                has_newline: false,
+            };
         }
 
         // Private name `#name` (class private fields/methods/accessors). `#`
@@ -172,7 +177,10 @@ impl<'a> Lexer<'a> {
             match self.cursor.second() {
                 '/' => {
                     self.cursor.eat_while(|c| !is_line_terminator(c));
-                    return TokenKind::Comment { is_block: false, has_newline: false };
+                    return TokenKind::Comment {
+                        is_block: false,
+                        has_newline: false,
+                    };
                 }
                 '*' => {
                     self.cursor.bump(); // '/'
@@ -191,8 +199,10 @@ impl<'a> Lexer<'a> {
         // Template literals start with a backtick.
         if first == '`' {
             self.cursor.bump(); // opening backtick
-            let (raw, cooked, tail) = self.scan_template_chunk();
-            return TokenKind::Template { raw, cooked, tail };
+            return match self.scan_template_chunk() {
+                Some((raw, cooked, tail)) => TokenKind::Template { raw, cooked, tail },
+                None => TokenKind::Unknown('`'),
+            };
         }
 
         // Inside a template substitution, `{`/`}` drive the substitution depth.
@@ -234,6 +244,16 @@ impl<'a> Lexer<'a> {
             return self.eat_string(first);
         }
 
+        // `?.` is not an OptionalChainingPunctuator when immediately followed
+        // by a decimal digit: `cond ?.3 : alt` tokenizes as `?` and `.3`.
+        if first == '?'
+            && self.cursor.second() == '.'
+            && self.cursor.peek_ahead4()[2].is_ascii_digit()
+        {
+            self.cursor.bump();
+            return TokenKind::Punctuator(Punctuator::QuestionMark);
+        }
+
         // Punctuators (maximal munch).
         if let Some(p) = self.eat_punctuator() {
             return TokenKind::Punctuator(p);
@@ -249,11 +269,13 @@ impl<'a> Lexer<'a> {
         // Track whether a line terminator appears inside — per spec 12.4, a
         // block comment containing a line terminator acts as one for ASI.
         let mut has_newline = false;
+        let mut terminated = false;
         while !self.cursor.is_eof() {
             let c = self.cursor.first();
             if c == '*' && self.cursor.second() == '/' {
                 self.cursor.bump();
                 self.cursor.bump();
+                terminated = true;
                 break;
             }
             if is_line_terminator(c) {
@@ -261,7 +283,14 @@ impl<'a> Lexer<'a> {
             }
             self.cursor.bump();
         }
-        TokenKind::Comment { is_block: true, has_newline }
+        if terminated {
+            TokenKind::Comment {
+                is_block: true,
+                has_newline,
+            }
+        } else {
+            TokenKind::Unknown('/')
+        }
     }
 
     /// A regex literal `/pattern/flags`. Validates the RegularExpressionLiteral
@@ -445,7 +474,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-
     /// Read a `RegExpIdentifierName` (used in `(?<name>` and `\k<name>`) starting
     /// at the current cursor, then consume the closing `>`. Returns `None` for
     /// an empty name, an invalid name char, or a missing `>`.
@@ -475,35 +503,32 @@ impl<'a> Lexer<'a> {
     /// after an opening backtick, or just after a substitution's closing `}`).
     /// Stops at a closing backtick (→ `tail` true) or at `${` (→ pushes a
     /// substitution frame, `tail` false). Returns `(raw, cooked, tail)`.
-    fn scan_template_chunk(&mut self) -> (String, Option<String>, bool) {
+    fn scan_template_chunk(&mut self) -> Option<(String, Option<String>, bool)> {
         let mut raw = String::new();
         let mut cooked = String::new();
         let mut cooked_ok = true;
         loop {
-            let c = self.cursor.first();
-            if c == EOF_CHAR {
-                // Unterminated template — treat what we have as a tail.
-                return (raw, if cooked_ok { Some(cooked) } else { None }, true);
+            if self.cursor.is_eof() {
+                return None;
             }
+            let c = self.cursor.first();
             if c == '`' {
                 self.cursor.bump();
-                return (raw, if cooked_ok { Some(cooked) } else { None }, true);
+                return Some((raw, if cooked_ok { Some(cooked) } else { None }, true));
             }
             if c == '$' && self.cursor.second() == '{' {
                 self.cursor.bump();
                 self.cursor.bump();
                 self.tmpl_stack.push(0);
-                return (raw, if cooked_ok { Some(cooked) } else { None }, false);
+                return Some((raw, if cooked_ok { Some(cooked) } else { None }, false));
             }
             if c == '\\' {
                 raw.push('\\');
                 self.cursor.bump();
                 let e = self.cursor.first();
                 raw.push(e);
-                if e == EOF_CHAR {
-                    cooked_ok = false;
-                    self.cursor.bump();
-                    continue;
+                if self.cursor.is_eof() {
+                    return None;
                 }
                 self.cursor.bump();
                 match e {
@@ -513,10 +538,84 @@ impl<'a> Lexer<'a> {
                     'b' => cooked.push('\u{0008}'),
                     'f' => cooked.push('\u{000C}'),
                     'v' => cooked.push('\u{000B}'),
-                    '0' => cooked.push('\0'),
+                    '0' => {
+                        if self.cursor.first().is_ascii_digit() {
+                            cooked_ok = false;
+                        } else {
+                            cooked.push('\0');
+                        }
+                    }
+                    '1'..='9' => cooked_ok = false,
+                    'x' => {
+                        let mut value = 0;
+                        let mut valid = true;
+                        for _ in 0..2 {
+                            let character = self.cursor.first();
+                            let Some(digit) = character.to_digit(16) else {
+                                valid = false;
+                                break;
+                            };
+                            raw.push(character);
+                            self.cursor.bump();
+                            value = value * 16 + digit;
+                        }
+                        if valid {
+                            cooked.push(char::from_u32(value).unwrap());
+                        } else {
+                            cooked_ok = false;
+                        }
+                    }
+                    'u' => {
+                        let value = if self.cursor.first() == '{' {
+                            raw.push('{');
+                            self.cursor.bump();
+                            let mut value = 0u32;
+                            let mut count = 0;
+                            while let Some(digit) = self.cursor.first().to_digit(16) {
+                                raw.push(self.cursor.first());
+                                self.cursor.bump();
+                                value = value
+                                    .checked_mul(16)
+                                    .and_then(|current| current.checked_add(digit))
+                                    .unwrap_or(u32::MAX);
+                                count += 1;
+                            }
+                            if self.cursor.first() == '}' {
+                                raw.push('}');
+                                self.cursor.bump();
+                                (count > 0 && value <= 0x10ffff).then_some(value)
+                            } else {
+                                None
+                            }
+                        } else {
+                            let mut value = 0;
+                            let mut valid = true;
+                            for _ in 0..4 {
+                                let character = self.cursor.first();
+                                let Some(digit) = character.to_digit(16) else {
+                                    valid = false;
+                                    break;
+                                };
+                                raw.push(character);
+                                self.cursor.bump();
+                                value = value * 16 + digit;
+                            }
+                            valid.then_some(value)
+                        };
+                        if let Some(value) = value {
+                            cooked.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                        } else {
+                            cooked_ok = false;
+                        }
+                    }
                     '`' | '\\' | '$' => cooked.push(e),
                     // LineContinuation: `\` + line terminator → nothing in cooked.
-                    lc if is_line_terminator(lc) => {}
+                    lc if is_line_terminator(lc) => {
+                        if lc == '\r' && self.cursor.first() == '\n' {
+                            raw.push('\n');
+                            self.cursor.bump();
+                        }
+                    }
                     other => cooked.push(other),
                 }
                 continue;
@@ -650,7 +749,8 @@ impl<'a> Lexer<'a> {
                 'o' | 'O' => {
                     self.cursor.bump();
                     self.cursor.bump();
-                    self.cursor.eat_while(|c| ('0'..='7').contains(&c) || c == '_');
+                    self.cursor
+                        .eat_while(|c| ('0'..='7').contains(&c) || c == '_');
                     return self.numeric_or_bigint(start);
                 }
                 _ => {}
@@ -676,31 +776,47 @@ impl<'a> Lexer<'a> {
     }
 
     fn numeric_or_bigint(&mut self, start: BytePos) -> TokenKind {
-        if self.cursor.first() == 'n' {
+        let kind = if self.cursor.first() == 'n' {
             self.cursor.bump();
             TokenKind::Bigint(self.snippet_from(start))
         } else {
             TokenKind::Numeric(self.snippet_from(start))
+        };
+        // A NumericLiteral may not be immediately followed by IdentifierStart
+        // (including an escaped identifier start).
+        if is_id_start(self.cursor.first()) || self.cursor.first() == '\\' {
+            TokenKind::Unknown(self.cursor.first())
+        } else {
+            kind
         }
     }
 
     fn eat_string(&mut self, quote: char) -> TokenKind {
         self.cursor.bump(); // opening quote
         let mut out = String::new();
+        let mut valid = true;
+        let mut terminated = false;
         loop {
+            if self.cursor.is_eof() {
+                break;
+            }
             let c = self.cursor.first();
             // Only `<LF>` (`\n`) / `<CR>` (`\r`) terminate a string literal
             // raw; ES2019 permits `<LS>` (U+2028) / `<PS>` (U+2029) inline.
-            if c == EOF_CHAR || c == '\n' || c == '\r' {
-                // Unterminated string — bail with what we have.
+            if c == '\n' || c == '\r' {
                 break;
             }
             if c == quote {
                 self.cursor.bump();
+                terminated = true;
                 break;
             }
             if c == '\\' {
                 self.cursor.bump(); // backslash
+                if self.cursor.is_eof() {
+                    valid = false;
+                    break;
+                }
                 let esc = self.cursor.first();
                 // LineContinuation: `\` + LineTerminatorSequence → nothing.
                 if is_line_terminator(esc) {
@@ -716,17 +832,26 @@ impl<'a> Lexer<'a> {
                     'n' => out.push('\n'),
                     't' => out.push('\t'),
                     'r' => out.push('\r'),
-                    '0' => out.push('\0'),
+                    '0' => {
+                        let mut value = 0;
+                        for _ in 0..2 {
+                            let Some(digit) = self.cursor.first().to_digit(8) else {
+                                break;
+                            };
+                            value = value * 8 + digit;
+                            self.cursor.bump();
+                        }
+                        out.push(char::from_u32(value).unwrap());
+                    }
                     'b' => out.push('\u{0008}'),
                     'f' => out.push('\u{000C}'),
                     'v' => out.push('\u{000B}'),
                     '\\' | '\'' | '"' => out.push(esc),
                     '/' => out.push('/'),
-                    'x' => {
-                        if let Some(ch) = self.take_hex(2).and_then(char::from_u32) {
-                            out.push(ch);
-                        }
-                    }
+                    'x' => match self.take_hex(2) {
+                        Some(value) => out.push(char::from_u32(value).unwrap()),
+                        None => valid = false,
+                    },
                     'u' => {
                         let hex = if self.cursor.first() == '{' {
                             self.cursor.bump();
@@ -734,11 +859,29 @@ impl<'a> Lexer<'a> {
                         } else {
                             self.take_hex(4)
                         };
-                        if let Some(ch) = hex.and_then(char::from_u32) {
-                            out.push(ch);
+                        match hex {
+                            Some(value) if value <= 0x10ffff => {
+                                // ECMAScript strings are UTF-16 and can contain
+                                // lone surrogates; Rust strings cannot, so retain
+                                // syntactic validity with a replacement scalar.
+                                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                            }
+                            _ => valid = false,
                         }
                     }
-                    EOF_CHAR => break,
+                    '1'..='7' => {
+                        let mut value = esc.to_digit(8).unwrap();
+                        let extra = if esc <= '3' { 2 } else { 1 };
+                        for _ in 0..extra {
+                            let Some(digit) = self.cursor.first().to_digit(8) else {
+                                break;
+                            };
+                            value = value * 8 + digit;
+                            self.cursor.bump();
+                        }
+                        out.push(char::from_u32(value).unwrap());
+                    }
+                    '8' | '9' => out.push(esc),
                     other => out.push(other),
                 }
                 continue;
@@ -746,7 +889,11 @@ impl<'a> Lexer<'a> {
             out.push(c);
             self.cursor.bump();
         }
-        TokenKind::String(out)
+        if valid && terminated {
+            TokenKind::String(out)
+        } else {
+            TokenKind::Unknown(quote)
+        }
     }
 
     /// Consume exactly `n` hex digits and return the parsed value.
@@ -764,18 +911,20 @@ impl<'a> Lexer<'a> {
     /// Consume hex digits until a closing `}` (for `\u{...}`).
     fn take_hex_until_brace(&mut self) -> Option<u32> {
         let mut acc = 0u32;
+        let mut count = 0;
         loop {
             let c = self.cursor.first();
             if c == '}' {
                 self.cursor.bump();
-                return Some(acc);
+                return (count > 0 && acc <= 0x10ffff).then_some(acc);
             }
-            if c == EOF_CHAR {
+            if self.cursor.is_eof() {
                 return None;
             }
             let d = c.to_digit(16)?;
             self.cursor.bump();
             acc = acc.checked_mul(16)?.checked_add(d)?;
+            count += 1;
         }
     }
 
@@ -800,7 +949,10 @@ impl<'a> Lexer<'a> {
     fn snippet_from(&self, start: BytePos) -> String {
         let s = start.to_usize();
         let e = self.cursor.byte_offset().to_usize();
-        self.src.get(s..e).map(|s| s.to_string()).unwrap_or_default()
+        self.src
+            .get(s..e)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -837,7 +989,10 @@ pub fn tokenize(src: &str) -> Tokens<'_> {
 fn is_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\u{000B}' | '\u{000C}')
         || (c >= '\u{2000}' && c <= '\u{200A}')
-        || matches!(c, '\u{00A0}' | '\u{FEFF}' | '\u{3000}')
+        || matches!(
+            c,
+            '\u{00A0}' | '\u{1680}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
+        )
 }
 
 fn is_line_terminator(c: char) -> bool {
@@ -939,12 +1094,16 @@ mod regex_tests {
     }
 
     fn is_regex(src: &str) -> bool {
-        kinds(src).into_iter().any(|k| matches!(k, TokenKind::Regex { .. }))
+        kinds(src)
+            .into_iter()
+            .any(|k| matches!(k, TokenKind::Regex { .. }))
     }
 
     fn is_unknown_slash(src: &str) -> bool {
         // An invalid regex lexes as Unknown('/').
-        kinds(src).into_iter().any(|k| matches!(k, TokenKind::Unknown('/')))
+        kinds(src)
+            .into_iter()
+            .any(|k| matches!(k, TokenKind::Unknown('/')))
     }
 
     #[test]

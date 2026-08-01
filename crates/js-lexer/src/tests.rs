@@ -46,6 +46,41 @@ fn lex_comments() {
 }
 
 #[test]
+fn lexes_ecmascript_unicode_space_separators() {
+    for whitespace in ['\u{1680}', '\u{202f}', '\u{205f}'] {
+        let src = format!("/x/g{whitespace};");
+        let tokens: Vec<_> = tokenize(&src).collect();
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::Whitespace)),
+            "U+{:04X}",
+            whitespace as u32
+        );
+        let significant = nontrivia(&src);
+        assert!(matches!(
+            significant.as_slice(),
+            [
+                TokenKind::Regex { .. },
+                TokenKind::Punctuator(js_syntax::Punctuator::Semicolon)
+            ]
+        ));
+    }
+
+    // U+0085 NEXT LINE is Unicode whitespace, but not ECMAScript WhiteSpace.
+    assert!(matches!(
+        nontrivia("\u{0085}").as_slice(),
+        [TokenKind::Unknown('\u{0085}')]
+    ));
+}
+
+#[test]
+fn unterminated_block_comment_is_not_trivia() {
+    let toks = nontrivia("/*/");
+    assert!(matches!(toks.as_slice(), [TokenKind::Unknown('/')]))
+}
+
+#[test]
 fn lex_hashbang_only_at_start() {
     // A leading `#!` line is a comment; the identifier after it survives.
     let toks = nontrivia("#!/usr/bin/env node\nvar x");
@@ -73,7 +108,10 @@ fn lex_escaped_identifiers() {
     // An escaped reserved word yields the Keyword token (accepted in property
     // names, rejected as a binding — the parser already enforces that).
     let toks = nontrivia("x.\\u0063ontinue");
-    assert!(matches!(toks[1], TokenKind::Punctuator(js_syntax::Punctuator::Dot)));
+    assert!(matches!(
+        toks[1],
+        TokenKind::Punctuator(js_syntax::Punctuator::Dot)
+    ));
     assert!(matches!(&toks[2], TokenKind::Keyword(k) if k.as_str() == "continue"));
 }
 
@@ -87,3 +125,15 @@ fn lex_numeric_separators() {
     assert!(matches!(&toks[1], TokenKind::Numeric(_)));
 }
 
+#[test]
+fn numeric_identifier_and_optional_chain_lookahead_boundaries() {
+    let kinds = nontrivia("3in");
+    assert!(matches!(kinds.first(), Some(TokenKind::Unknown('i'))));
+
+    let kinds = nontrivia("true ?.30 : false");
+    assert!(matches!(
+        kinds.get(1),
+        Some(TokenKind::Punctuator(js_syntax::Punctuator::QuestionMark))
+    ));
+    assert!(matches!(kinds.get(2), Some(TokenKind::Numeric(raw)) if raw == ".30"));
+}

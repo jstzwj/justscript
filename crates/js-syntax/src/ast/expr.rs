@@ -27,6 +27,8 @@ pub enum Expr {
     This(Span),
     /// A super reference (`super`, `super.x`, `super(...)`).
     Super(Span),
+    /// The `new.target` meta-property.
+    NewTarget(Span),
     /// An identifier reference, e.g. `foo`.
     Ident { span: Span, name: String },
     /// A literal.
@@ -41,6 +43,9 @@ pub enum Expr {
     Array {
         span: Span,
         elements: Vec<Option<ArrayExprElement>>,
+        /// Runtime-neutral for an array literal, but significant when cover
+        /// grammar reinterprets `[...x,]` as an AssignmentPattern.
+        trailing_comma: bool,
     },
     /// An object literal `{ a, b: c, ...d }`.
     Object { span: Span, props: Vec<ObjectProp> },
@@ -59,7 +64,11 @@ pub enum Expr {
     /// A parenthesized expression (transparent; kept for spans).
     Paren { span: Span, expr: BoxExpr },
     /// Unary prefix `-x`, `!x`, `typeof x`, ...
-    Unary { span: Span, op: UnaryOp, arg: BoxExpr },
+    Unary {
+        span: Span,
+        op: UnaryOp,
+        arg: BoxExpr,
+    },
     /// `++x` / `--x` (prefix) and `x++` / `x--` (postfix).
     Update {
         span: Span,
@@ -68,9 +77,26 @@ pub enum Expr {
         arg: BoxExpr,
     },
     /// A binary operation `a + b`.
-    Binary { span: Span, op: BinOp, left: BoxExpr, right: BoxExpr },
+    Binary {
+        span: Span,
+        op: BinOp,
+        left: BoxExpr,
+        right: BoxExpr,
+    },
+    /// A private brand check, `#name in object`. This is a dedicated grammar
+    /// production: a PrivateIdentifier is not otherwise an expression.
+    PrivateIn {
+        span: Span,
+        name: String,
+        right: BoxExpr,
+    },
     /// A logical short-circuit chain, used for `a && b && c`.
-    Logical { span: Span, op: BinOp, left: BoxExpr, right: BoxExpr },
+    Logical {
+        span: Span,
+        op: BinOp,
+        left: BoxExpr,
+        right: BoxExpr,
+    },
     /// A conditional / ternary `c ? a : b`.
     Conditional {
         span: Span,
@@ -102,7 +128,11 @@ pub enum Expr {
     /// Spread / rest in an argument or array position: `...x`.
     Spread { span: Span, arg: BoxExpr },
     /// `yield expr` / `yield* expr`.
-    Yield { span: Span, arg: Option<BoxExpr>, delegate: bool },
+    Yield {
+        span: Span,
+        arg: Option<BoxExpr>,
+        delegate: bool,
+    },
     /// `await expr`.
     Await { span: Span, arg: BoxExpr },
     /// Dynamic import call `import(source)` / `import(source, options)`,
@@ -122,7 +152,7 @@ impl Expr {
     /// The byte span this expression covers in the source.
     pub fn span(&self) -> Span {
         match self {
-            Expr::This(s) | Expr::Super(s) => *s,
+            Expr::This(s) | Expr::Super(s) | Expr::NewTarget(s) => *s,
             Expr::Lit(l) => l.span(),
             Expr::Ident { span, .. }
             | Expr::TemplateLit { span, .. }
@@ -133,6 +163,7 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Update { span, .. }
             | Expr::Binary { span, .. }
+            | Expr::PrivateIn { span, .. }
             | Expr::Logical { span, .. }
             | Expr::Conditional { span, .. }
             | Expr::Assign { span, .. }
@@ -162,7 +193,10 @@ pub enum ArrayExprElement {
 /// The left-hand side of an assignment (after destructuring analysis).
 #[derive(Clone, Debug)]
 pub enum AssignTarget {
-    Ident { span: Span, name: String },
+    Ident {
+        span: Span,
+        name: String,
+    },
     Member(Box<MemberExpr>),
     /// A destructuring pattern — resolved to a [`crate::ast::pat::Pat`] by the parser.
     Pat(crate::ast::pat::Pat),

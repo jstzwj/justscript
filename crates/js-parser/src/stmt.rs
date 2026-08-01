@@ -21,7 +21,37 @@ use js_syntax::token::TokenKind;
 
 /// Parse one statement.
 pub fn parse_statement(tokens: &mut ParserTokenStream) -> Result<Stmt, Vec<Diagnostic>> {
+    parse_statement_inner(tokens, false)
+}
+
+/// Parse a StatementListItem, where declarations are grammar alternatives in
+/// addition to ordinary statements. This distinction matters for `let` plus a
+/// line terminator: a block item continues as a declaration, while an unbraced
+/// statement body may parse `let` as an expression and insert a semicolon.
+pub(crate) fn parse_statement_list_item(
+    tokens: &mut ParserTokenStream,
+) -> Result<Stmt, Vec<Diagnostic>> {
+    parse_statement_inner(tokens, true)
+}
+
+fn parse_statement_inner(
+    tokens: &mut ParserTokenStream,
+    in_statement_list: bool,
+) -> Result<Stmt, Vec<Diagnostic>> {
     let span = tokens.span();
+
+    if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Let))
+        && tokens.preceded_by_newline_at(1)
+        && matches!(
+            tokens.peek2().kind,
+            TokenKind::Punctuator(Punctuator::LBracket)
+        )
+    {
+        return Err(vec![Diagnostic::error(
+            span,
+            "an expression statement may not begin with the token sequence `let [`",
+        )]);
+    }
 
     // Block statement.
     if matches!(
@@ -84,9 +114,7 @@ pub fn parse_statement(tokens: &mut ParserTokenStream) -> Result<Stmt, Vec<Diagn
     // Keyword-led statements.
     if let TokenKind::Keyword(kw) = tokens.peek_kind().clone() {
         // `async function` declaration: hoisted like a function declaration.
-        if matches!(kw, Keyword::Async)
-            && matches!(tokens.peek2().kind, TokenKind::Keyword(Keyword::Function))
-        {
+        if matches!(kw, Keyword::Async) && async_function_ahead(tokens) {
             tokens.bump(); // `async`
             tokens.bump(); // `function`
             let decl = parse_function_decl(tokens, span, true)?;
@@ -97,7 +125,7 @@ pub fn parse_statement(tokens: &mut ParserTokenStream) -> Result<Stmt, Vec<Diagn
         // declaration; otherwise (`let;`, `let = 1;`, `let.x;`) it is a plain
         // identifier reference and an expression statement.
         if !is_statement_keyword(kw)
-            || (kw == Keyword::Let && !let_is_declaration_ahead(tokens))
+            || (kw == Keyword::Let && !let_is_declaration_ahead(tokens, in_statement_list))
         {
             return parse_expr_statement(tokens, span);
         }
@@ -117,14 +145,7 @@ pub fn parse_statement(tokens: &mut ParserTokenStream) -> Result<Stmt, Vec<Diagn
             Keyword::For => parse_for(tokens, span)?,
             Keyword::Switch => parse_switch(tokens, span)?,
             Keyword::Try => parse_try(tokens, span)?,
-            Keyword::Throw => {
-                let arg = expr::parse_expression(tokens)?;
-                expr::consume_asi(tokens)?;
-                Stmt::Throw {
-                    span,
-                    arg: Box::new(arg),
-                }
-            }
+            Keyword::Throw => parse_throw(tokens, span)?,
             Keyword::Break => {
                 let label = optional_label(tokens);
                 expr::consume_asi(tokens)?;
@@ -179,6 +200,16 @@ fn is_statement_keyword(kw: Keyword) -> bool {
     )
 }
 
+/// `async function` and `async function*` start with two literal grammar
+/// terminals separated by no LineTerminator. Cooked keyword values are not
+/// enough here: `\u0061sync` remains an IdentifierName, not the `async`
+/// terminal.
+fn async_function_ahead(tokens: &ParserTokenStream) -> bool {
+    tokens.is_unescaped_keyword_at(0, Keyword::Async)
+        && tokens.is_unescaped_keyword_at(1, Keyword::Function)
+        && !tokens.preceded_by_newline_at(1)
+}
+
 /// True when the current token is a label identifier immediately followed by
 /// `:`. A label may be an `Ident` or a contextual keyword usable as a binding
 /// (`await`/`yield`/`let`/`static`/`async`/`of`/…), per `LabelIdentifier`.
@@ -192,7 +223,10 @@ fn kw_ppeks_colon(tokens: &ParserTokenStream) -> bool {
     {
         return false;
     }
-    matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Colon))
+    matches!(
+        tokens.peek2().kind,
+        TokenKind::Punctuator(Punctuator::Colon)
+    )
 }
 
 /// Whether the current position starts a `using` / `await using` lexical
@@ -201,8 +235,14 @@ fn kw_ppeks_colon(tokens: &ParserTokenStream) -> bool {
 /// pattern (`x`, `[`, `{`), not when used as a plain identifier
 /// (`using = 1`, `using.x`, `using(...)`).
 fn using_decl_kind(tokens: &ParserTokenStream) -> Option<VarKind> {
-    fn binding_start(k: &TokenKind) -> bool {
-        matches!(k, TokenKind::Ident(_) | TokenKind::Punctuator(Punctuator::LBracket) | TokenKind::Punctuator(Punctuator::LBrace))
+    fn binding_identifier_start(tokens: &ParserTokenStream, offset: usize) -> bool {
+        match &tokens.peek_at(offset).kind {
+            TokenKind::Ident(_) => true,
+            TokenKind::Keyword(keyword) => {
+                expr::keyword_binding_name(*keyword, tokens.current_ctx()).is_some()
+            }
+            _ => false,
+        }
     }
     // `await using x = …` (valid only in async; legality is checked later).
     // `[no LineTerminator here]` between `await`/`using` and the binding.
@@ -210,16 +250,14 @@ fn using_decl_kind(tokens: &ParserTokenStream) -> Option<VarKind> {
         && !tokens.preceded_by_newline_at(1)
         && matches!(tokens.peek2().kind, TokenKind::Ident(ref n) if n == "using")
         && !tokens.preceded_by_newline_at(2)
-        && binding_start(&tokens.peek3().kind)
+        && binding_identifier_start(tokens, 2)
     {
         return Some(VarKind::AwaitUsing);
     }
     // `using x = …` / `using { x } = …` / `using [x] = …`. A line terminator
     // between `using` and the binding makes `using` a plain identifier.
     if let TokenKind::Ident(ref n) = tokens.peek_kind() {
-        if n == "using"
-            && !tokens.preceded_by_newline_at(1)
-            && binding_start(&tokens.peek2().kind)
+        if n == "using" && !tokens.preceded_by_newline_at(1) && binding_identifier_start(tokens, 1)
         {
             return Some(VarKind::Using);
         }
@@ -232,23 +270,28 @@ fn using_decl_kind(tokens: &ParserTokenStream) -> Option<VarKind> {
 /// `let` is a declaration when followed by a binding: `{`/`[` (destructuring)
 /// or an identifier-name binding. Otherwise (`let in`, `let =`, `let .`, …)
 /// it is an identifier.
-fn let_is_declaration_ahead(tokens: &ParserTokenStream) -> bool {
-    // `[no LineTerminator here]`: `let` is a lexical declaration only when not
-    // immediately followed by a line terminator. `let\n{…}` is the identifier
-    // `let` followed by a block.
-    if tokens.preceded_by_newline_at(1) {
+fn let_is_declaration_ahead(tokens: &ParserTokenStream, allow_binding_after_newline: bool) -> bool {
+    if !tokens.is_unescaped_keyword_at(0, Keyword::Let) {
         return false;
     }
+    let newline = tokens.preceded_by_newline_at(1);
     match &tokens.peek2().kind {
-        // `let {` / `let [` — destructuring declaration.
-        TokenKind::Punctuator(Punctuator::LBrace)
-        | TokenKind::Punctuator(Punctuator::LBracket)
-        | TokenKind::Ident(_) => true,
+        // `let\n{}` may remain an expression statement followed by a block.
+        // The `let [` lookahead restriction applies even across a line break.
+        TokenKind::Punctuator(Punctuator::LBrace) => !newline,
+        TokenKind::Punctuator(Punctuator::LBracket) => true,
+        TokenKind::Ident(_) => allow_binding_after_newline || !newline,
         // `let <contextual-keyword binding>` — e.g. `let async = …`,
-        // `let await = …` (outside async). The keyword must be acceptable as a
-        // binding name in the current function context.
+        // `let await = …`. `await` and `yield` still have the syntactic shape
+        // of BindingIdentifier when their grammar parameter is set; contextual
+        // early errors reject them later. They must therefore participate in
+        // declaration lookahead even when they are illegal in this context.
+        TokenKind::Keyword(Keyword::Await | Keyword::Yield) => {
+            allow_binding_after_newline || !newline
+        }
         TokenKind::Keyword(k) => {
-            expr::keyword_binding_name(*k, tokens.current_ctx()).is_some()
+            (allow_binding_after_newline || !newline)
+                && expr::keyword_binding_name(*k, tokens.current_ctx()).is_some()
         }
         _ => false,
     }
@@ -296,9 +339,7 @@ pub fn parse_program_item(tokens: &mut ParserTokenStream) -> Result<ProgramItem,
                 let c = crate::class::parse_class_decl(tokens, span, Vec::new())?;
                 return Ok(ProgramItem::Decl(Decl::Class(Box::new(c))));
             }
-            Keyword::Async
-                if matches!(tokens.peek2().kind, TokenKind::Keyword(Keyword::Function)) =>
-            {
+            Keyword::Async if async_function_ahead(tokens) => {
                 let span = tokens.span();
                 tokens.bump(); // async
                 tokens.bump(); // function
@@ -306,7 +347,7 @@ pub fn parse_program_item(tokens: &mut ParserTokenStream) -> Result<ProgramItem,
                 return Ok(ProgramItem::Decl(decl));
             }
             Keyword::Var | Keyword::Let | Keyword::Const
-                if !(kw == Keyword::Let && !let_is_declaration_ahead(tokens)) =>
+                if !(kw == Keyword::Let && !let_is_declaration_ahead(tokens, true)) =>
             {
                 let kind = match kw {
                     Keyword::Var => VarKind::Var,
@@ -326,7 +367,7 @@ pub fn parse_program_item(tokens: &mut ParserTokenStream) -> Result<ProgramItem,
                 // parsing. Distinguish by the token following `import`.
                 let is_expr = match tokens.peek2().kind {
                     TokenKind::Punctuator(Punctuator::LParen) => true, // import(...)
-                    TokenKind::Punctuator(Punctuator::Dot) => true,    // import.meta / .source / .defer
+                    TokenKind::Punctuator(Punctuator::Dot) => true, // import.meta / .source / .defer
                     _ => false,
                 };
                 if !is_expr {
@@ -389,11 +430,17 @@ fn parse_module_source(tokens: &mut ParserTokenStream) -> Result<String, Vec<Dia
 fn parse_import_items(tokens: &mut ParserTokenStream) -> Result<Vec<ImportItem>, Vec<Diagnostic>> {
     let _ = expr::expect_punctuator(tokens, Punctuator::LBrace)?;
     let mut items = Vec::new();
-    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBrace)
+    ) {
         let imported = ident_name(tokens)?;
         let local = if tokens.eat_keyword(Keyword::As) {
             expr::binding_identifier(tokens).ok_or_else(|| {
-                vec![Diagnostic::error(tokens.span(), "expected a binding name after `as`")]
+                vec![Diagnostic::error(
+                    tokens.span(),
+                    "expected a binding name after `as`",
+                )]
             })?
         } else {
             imported.clone()
@@ -408,12 +455,9 @@ fn parse_import_items(tokens: &mut ParserTokenStream) -> Result<Vec<ImportItem>,
 }
 
 /// Parse a static `import` declaration.
-fn parse_import(
-    tokens: &mut ParserTokenStream,
-    span: Span,
-) -> Result<Decl, Vec<Diagnostic>> {
+fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<Diagnostic>> {
     tokens.bump(); // `import`
-    // Bare side-effect import: `import "mod"`.
+                   // Bare side-effect import: `import "mod"`.
     if let TokenKind::String(src) = tokens.peek_kind().clone() {
         tokens.bump();
         expr::consume_asi(tokens)?;
@@ -426,16 +470,25 @@ fn parse_import(
     let spec = if tokens.eat_punctuator(Punctuator::Mul) {
         // `import * as ns from "mod"`
         if !tokens.eat_keyword(Keyword::As) {
-            return Err(vec![Diagnostic::error(tokens.span(), "expected `as` after `*`")]);
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "expected `as` after `*`",
+            )]);
         }
         let ns = expr::binding_identifier(tokens).ok_or_else(|| {
-            vec![Diagnostic::error(tokens.span(), "expected a namespace name")]
+            vec![Diagnostic::error(
+                tokens.span(),
+                "expected a namespace name",
+            )]
         })?;
         ImportSpec::Namespace {
             ns,
             source: parse_module_source(tokens)?,
         }
-    } else if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LBrace)) {
+    } else if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LBrace)
+    ) {
         // `import { a, b } from "mod"`
         let items = parse_import_items(tokens)?;
         ImportSpec::Named {
@@ -445,7 +498,10 @@ fn parse_import(
     } else {
         // `import def from "mod"` / `import def, { a } from "mod"`
         let local = expr::binding_identifier(tokens).ok_or_else(|| {
-            vec![Diagnostic::error(tokens.span(), "expected a default import name")]
+            vec![Diagnostic::error(
+                tokens.span(),
+                "expected a default import name",
+            )]
         })?;
         let mut named = Vec::new();
         if tokens.eat_punctuator(Punctuator::Comma) {
@@ -479,7 +535,10 @@ fn parse_import(
 fn parse_export_items(tokens: &mut ParserTokenStream) -> Result<Vec<ExportItem>, Vec<Diagnostic>> {
     let _ = expr::expect_punctuator(tokens, Punctuator::LBrace)?;
     let mut items = Vec::new();
-    while !matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::RBrace)) {
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBrace)
+    ) {
         let local = ident_name(tokens)?;
         let exported = if tokens.eat_keyword(Keyword::As) {
             ident_name(tokens)?
@@ -496,10 +555,7 @@ fn parse_export_items(tokens: &mut ParserTokenStream) -> Result<Vec<ExportItem>,
 }
 
 /// Parse an `export` declaration.
-fn parse_export(
-    tokens: &mut ParserTokenStream,
-    span: Span,
-) -> Result<Decl, Vec<Diagnostic>> {
+fn parse_export(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<Diagnostic>> {
     tokens.bump(); // `export`
 
     // `export default …`
@@ -529,7 +585,10 @@ fn parse_export(
     }
 
     // `export { a, b as c } [from "mod"]`
-    if matches!(tokens.peek_kind(), TokenKind::Punctuator(Punctuator::LBrace)) {
+    if matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::LBrace)
+    ) {
         let items = parse_export_items(tokens)?;
         if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::From)) {
             let source = parse_module_source(tokens)?;
@@ -564,16 +623,18 @@ fn parse_export(
             tokens.bump();
             parse_function_decl(tokens, span, false)?
         }
-        TokenKind::Keyword(Keyword::Async)
-            if matches!(tokens.peek2().kind, TokenKind::Keyword(Keyword::Function)) =>
-        {
+        TokenKind::Keyword(Keyword::Async) if async_function_ahead(tokens) => {
             tokens.bump();
             tokens.bump();
             parse_function_decl(tokens, span, true)?
         }
         TokenKind::Keyword(Keyword::Class) => {
             tokens.bump();
-            Decl::Class(Box::new(crate::class::parse_class_decl(tokens, span, Vec::new())?))
+            Decl::Class(Box::new(crate::class::parse_class_decl(
+                tokens,
+                span,
+                Vec::new(),
+            )?))
         }
         other => {
             return Err(vec![Diagnostic::error(
@@ -637,6 +698,14 @@ fn parse_var(
     let mut declarations = Vec::new();
     loop {
         let name = expr::parse_binding_target(tokens)?;
+        if matches!(kind, VarKind::Using | VarKind::AwaitUsing)
+            && !matches!(name, Pat::Ident { .. })
+        {
+            return Err(vec![Diagnostic::error(
+                name.span(),
+                "using declarations require a binding identifier",
+            )]);
+        }
         let name_span = name.span();
         let init = if tokens.eat_punctuator(Punctuator::Assign) {
             Some(expr::parse_assignment(tokens)?)
@@ -663,6 +732,12 @@ fn parse_var(
 }
 
 fn parse_return(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Diagnostic>> {
+    if !tokens.in_function() {
+        return Err(vec![Diagnostic::error(
+            start,
+            "a return statement is only allowed inside a function body",
+        )]);
+    }
     // Restricted production: `return [no LineTerminator here] Expression? ;`.
     let arg = if matches!(
         tokens.peek_kind(),
@@ -680,6 +755,24 @@ fn parse_return(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec
     Ok(Stmt::Return {
         span: Span::new(start.start, end.start),
         arg,
+    })
+}
+
+fn parse_throw(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Diagnostic>> {
+    // Unlike `return`, `throw` has no operand-less production. A line
+    // terminator before its required Expression is therefore always a syntax
+    // error; ASI cannot turn it into a valid `throw;` statement.
+    if tokens.preceded_by_newline() {
+        return Err(vec![Diagnostic::error(
+            start,
+            "a line terminator is not allowed after `throw`",
+        )]);
+    }
+    let arg = expr::parse_expression(tokens)?;
+    expr::consume_asi(tokens)?;
+    Ok(Stmt::Throw {
+        span: Span::new(start.start, arg.span().end),
+        arg: Box::new(arg),
     })
 }
 
@@ -794,7 +887,7 @@ fn parse_for(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Di
         // `let` is a declaration only when a binding pattern follows
         // (`let {`, `let [`, `let ident`); otherwise `let` is a plain
         // identifier reference (sloppy mode: `for (let in obj)`, `for (let = 1;;)`).
-        TokenKind::Keyword(Keyword::Let) if let_is_declaration_ahead(tokens) => {
+        TokenKind::Keyword(Keyword::Let) if let_is_declaration_ahead(tokens, true) => {
             Some(VarKind::Let)
         }
         TokenKind::Keyword(Keyword::Const) => Some(VarKind::Const),
@@ -817,6 +910,12 @@ fn parse_for(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Di
         let mut pat = expr::parse_binding_target(tokens)?;
         // for-in / for-of: `pat of expr` / `pat in expr`.
         if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Of)) {
+            if tokens.current_token_contains_escape() {
+                return Err(vec![Diagnostic::error(
+                    tokens.span(),
+                    "the `of` terminal may not contain an escape sequence",
+                )]);
+            }
             tokens.bump();
             let right = Box::new(expr::parse_assignment(tokens)?);
             let _ = expr::expect_punctuator(tokens, Punctuator::RParen)?;
@@ -891,6 +990,24 @@ fn parse_for(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Di
     }
     let lhs = expr::parse_expression_inner(tokens, false)?;
     if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Of)) {
+        if !for_await
+            && matches!(
+            &lhs,
+            Expr::Ident { span, name }
+                if name == "async" && !tokens.token_span_contains_escape(*span)
+            )
+        {
+            return Err(vec![Diagnostic::error(
+                lhs.span(),
+                "an unparenthesized `async` may not precede `of` in a for-of statement",
+            )]);
+        }
+        if tokens.current_token_contains_escape() {
+            return Err(vec![Diagnostic::error(
+                tokens.span(),
+                "the `of` terminal may not contain an escape sequence",
+            )]);
+        }
         tokens.bump();
         let right = Box::new(expr::parse_assignment(tokens)?);
         let _ = expr::expect_punctuator(tokens, Punctuator::RParen)?;
@@ -898,7 +1015,9 @@ fn parse_for(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Di
         let end = tokens.span();
         return Ok(Stmt::ForOf {
             span: Span::new(start.start, end.start),
-            left: ForTarget::Pat(pat_from_expr_or_identity(&lhs)),
+            left: ForTarget::Pat(
+                expr::assignment_pattern_from_expr(&lhs).map_err(|error| vec![error])?,
+            ),
             right,
             body,
             is_async: for_await,
@@ -920,7 +1039,9 @@ fn parse_for(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec<Di
         let end = tokens.span();
         return Ok(Stmt::ForIn {
             span: Span::new(start.start, end.start),
-            left: ForTarget::Pat(pat_from_expr_or_identity(&lhs)),
+            left: ForTarget::Pat(
+                expr::assignment_pattern_from_expr(&lhs).map_err(|error| vec![error])?,
+            ),
             right,
             body,
         });
@@ -968,26 +1089,7 @@ fn make_var_decl(kind: VarKind, name: Pat, init: Option<Expr>) -> Decl {
     Decl::Var {
         span,
         kind,
-        declarations: vec![VarDeclarator {
-            span,
-            name,
-            init,
-        }],
-    }
-}
-
-/// A for-in/of target that is a plain expression LHS — represent as an ident
-/// pattern when possible, otherwise a synthetic placeholder pattern.
-fn pat_from_expr_or_identity(e: &Expr) -> Pat {
-    match e {
-        Expr::Ident { span, name } => Pat::Ident {
-            span: *span,
-            name: name.clone(),
-        },
-        _ => Pat::Ident {
-            span: e.span(),
-            name: String::new(),
-        },
+        declarations: vec![VarDeclarator { span, name, init }],
     }
 }
 
@@ -1021,7 +1123,7 @@ fn parse_switch(tokens: &mut ParserTokenStream, start: Span) -> Result<Stmt, Vec
                 | TokenKind::Keyword(Keyword::Default)
                 | TokenKind::Eof
         ) {
-            match parse_statement(tokens) {
+            match parse_statement_list_item(tokens) {
                 Ok(s) => body.push(s),
                 Err(e) => {
                     expr::recover_to_statement_boundary(tokens);
