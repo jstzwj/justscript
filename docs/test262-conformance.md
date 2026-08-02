@@ -76,13 +76,18 @@ property writes invoke accessor descriptors, and anonymous field definitions
 receive their field names.
 
 The focused `test/language/statements/class/elements` runtime subset currently
-reports 1,534 files / 3,054 variants, with 1,068 executed: 734 pass, 62 fail,
-272 incomplete and 1,986 skipped. Computed element keys are evaluated and
+reports 1,534 files / 3,054 variants, with 1,068 executed: 974 pass, 70 fail,
+24 incomplete and 1,986 skipped. Computed element keys are evaluated and
 converted once during class definition; both accessor-name computed-key
 directories pass 42 / 42. Direct and indirect eval now use runtime parsing and
 bytecode compilation, retain eval-created modules for escaping closures, and
-bridge lexical/private/class execution contexts. The largest remaining class
-element cluster is 248 incomplete variants requiring `yield*` delegation.
+bridge lexical/private/class execution contexts. A shared sync/async `yield*`
+state machine now retains its iterator record across suspension, forwards
+`next`, `throw`, and `return` completions, performs Async-from-Sync Promise
+unwrapping, and preserves active exception handlers. This removed all 248
+`yield*` compile-incomplete variants from the class-element snapshot. Each of
+the four private async-generator method/static-method directories now executes
+128 variants with 128 pass, 0 fail, and 0 incomplete.
 
 The standards-based front-end repairs have removed all false accepts from the
 current `test/language` corpus. Block and Module Early Errors now compare the

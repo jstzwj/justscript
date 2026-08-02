@@ -118,6 +118,9 @@ pub enum Opcode {
     /// `yield` (generator): pop the yielded value, suspend the frame, push the
     /// value passed to the next `.next(v)` onto resumption.
     Yield,
+    /// Delegate to a sync or async iterator. The VM retains the iterator record
+    /// across suspension and forwards next/throw/return completions.
+    YieldStar,
     /// `await`: perform Promise resolution and suspend a top-level module;
     /// resumption pushes the fulfillment or throws the rejection reason.
     Await,

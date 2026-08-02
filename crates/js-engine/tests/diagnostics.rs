@@ -34,20 +34,25 @@ fn bytecode_has_an_instruction_source_map() {
 }
 
 #[test]
-fn bytecode_rejection_is_a_compile_phase_report() {
+fn yield_star_has_a_mapped_bytecode_instruction() {
     let engine = Engine::default_interpreter();
-    let report = engine
+    let compiled = engine
         .compile_named(
-            "unsupported.js",
+            "delegate.js",
             "function* values() { yield* []; }",
             ProgramKind::Script,
         )
-        .err()
-        .expect("unsupported lowering must be reported");
-
-    assert_eq!(report.first().unwrap().phase, DiagnosticPhase::Compile);
-    assert_eq!(report.first().unwrap().code.as_deref(), Some("JS-COMPILE"));
-    assert!(report.to_string().starts_with("unsupported.js:1:"));
+        .expect("yield* must lower successfully");
+    let function = compiled
+        .bytecode
+        .functions
+        .iter()
+        .find(|function| function.name == "values")
+        .expect("generator bytecode");
+    assert!(function
+        .code
+        .iter()
+        .any(|instruction| instruction.op == js_bytecode::Opcode::YieldStar));
 }
 
 #[test]

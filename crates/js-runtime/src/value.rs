@@ -280,10 +280,39 @@ pub struct GeneratorState {
     pub this: Value,
     pub captured_this: Option<Cell>,
     pub is_async: bool,
+    /// Iterator record retained while a `yield*` expression is suspended.
+    pub delegate: Option<GeneratorDelegate>,
+    /// Active handlers must survive suspension just like locals and the stack.
+    pub try_stack: Vec<GeneratorTryState>,
+    pub pending_throw: Option<Value>,
     /// `true` once the body has completed; further `.next()` returns done.
     pub done: bool,
     /// `false` until the first `.next()` (pc starts at 0).
     pub started: bool,
+}
+
+/// The completion used to resume a suspended generator.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GeneratorResumeKind {
+    Next,
+    Throw,
+    Return,
+}
+
+/// Persistent iterator record for the shared sync/async `yield*` state machine.
+#[derive(Clone, Debug)]
+pub struct GeneratorDelegate {
+    pub iterator: Value,
+    pub next_method: Value,
+    pub async_from_sync: bool,
+    pub intrinsic_next: bool,
+}
+
+/// Runtime-neutral representation of a VM exception handler.
+#[derive(Clone, Debug)]
+pub struct GeneratorTryState {
+    pub catch_pc: Option<u16>,
+    pub finally_pc: Option<u16>,
 }
 
 /// A JavaScript function value.
@@ -453,7 +482,7 @@ pub struct JsSymbol {
 impl JsSymbol {
     pub fn new(description: Option<String>) -> JsSymbol {
         use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(3);
+        static NEXT_ID: AtomicU64 = AtomicU64::new(4);
         JsSymbol {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             description,
@@ -471,6 +500,13 @@ impl JsSymbol {
         JsSymbol {
             id: 2,
             description: Some("Symbol.iterator".into()),
+        }
+    }
+
+    pub fn async_iterator() -> JsSymbol {
+        JsSymbol {
+            id: 3,
+            description: Some("Symbol.asyncIterator".into()),
         }
     }
 }

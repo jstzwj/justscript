@@ -188,6 +188,7 @@ pub fn native_static_value(obj: &Value, name: &str) -> Option<Value> {
         return match name {
             "toStringTag" => Some(Value::symbol(js_runtime::value::JsSymbol::to_string_tag())),
             "iterator" => Some(Value::symbol(js_runtime::value::JsSymbol::iterator())),
+            "asyncIterator" => Some(Value::symbol(js_runtime::value::JsSymbol::async_iterator())),
             _ => None,
         };
     }
@@ -1127,6 +1128,10 @@ fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
         keys.extend(symbols.into_iter().map(|id| {
             let symbol = if id == js_runtime::value::JsSymbol::to_string_tag().id {
                 js_runtime::value::JsSymbol::to_string_tag()
+            } else if id == js_runtime::value::JsSymbol::iterator().id {
+                js_runtime::value::JsSymbol::iterator()
+            } else if id == js_runtime::value::JsSymbol::async_iterator().id {
+                js_runtime::value::JsSymbol::async_iterator()
             } else {
                 js_runtime::value::JsSymbol {
                     id,

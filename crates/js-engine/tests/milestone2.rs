@@ -298,6 +298,46 @@ fn generator_expression() {
     }
 }
 
+#[test]
+fn generator_yield_star_delegates_and_returns() {
+    match run(
+        "function* g(){ var result = yield *\n[1, 2]; return result } \
+         var it = g(); it.next().value * 100 + it.next().value * 10 + (it.next().done ? 1 : 0)",
+    ) {
+        ValueData::Integer(121) => {}
+        v => panic!("expected Integer(121), got {:?}", v),
+    }
+}
+
+#[test]
+fn generator_yield_star_forwards_next_value() {
+    match run("function* inner(){ var value = yield 1; return value } \
+         function* outer(){ return yield* inner() } \
+         var it = outer(); it.next(); it.next(9).value")
+    {
+        ValueData::Integer(9) => {}
+        v => panic!("expected Integer(9), got {:?}", v),
+    }
+}
+
+#[test]
+fn generator_yield_star_forwards_throw_and_return() {
+    match run("var iterator = { \
+           next: function(){ return { value: 1, done: false } }, \
+           throw: function(value){ return { value: value + 1, done: true } }, \
+           return: function(value){ return { value: value + 2, done: true } }, \
+           [Symbol.iterator]: function(){ return this } \
+         }; \
+         function* outer(){ return yield* iterator } \
+         var thrown = outer(); thrown.next(); var a = thrown.throw(8).value; \
+         var returned = outer(); returned.next(); var b = returned.return(8).value; \
+         a * 10 + b")
+    {
+        ValueData::Integer(100) => {}
+        v => panic!("expected Integer(100), got {:?}", v),
+    }
+}
+
 // ---- iterator protocol: for-of / spread over generators ----
 
 #[test]

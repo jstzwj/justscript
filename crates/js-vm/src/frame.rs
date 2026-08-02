@@ -7,7 +7,7 @@
 //! visible. Operand-stack values remain plain `Value`s.
 
 use crate::stack::OperandStack;
-use js_runtime::value::{Cell, Value};
+use js_runtime::value::{Cell, GeneratorResumeKind, Value};
 use js_syntax::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,6 +44,9 @@ pub struct CallFrame {
     /// Promise for the active AsyncGenerator request, if this is an async
     /// generator frame checked out by `.next()`.
     pub async_generator_promise: Option<js_runtime::object::JsObject>,
+    /// Completion delivered by the active generator request. `YieldStar`
+    /// consumes all three variants; ordinary `yield` consumes `Next`.
+    pub generator_resume: Option<(GeneratorResumeKind, Value)>,
     /// Active exception handlers (innermost last), pushed by `TryBegin`.
     pub try_stack: Vec<ActiveTry>,
     /// An exception awaiting re-raise after a `finally` block completes.
@@ -94,6 +97,7 @@ impl CallFrame {
             constructor: None,
             generator: None,
             async_generator_promise: None,
+            generator_resume: None,
             try_stack: Vec::new(),
             pending_throw: None,
             superclass: None,

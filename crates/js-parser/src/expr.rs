@@ -416,7 +416,7 @@ fn parse_yield(tokens: &mut ParserTokenStream, in_ok: bool) -> Result<Expr, Vec<
             | TokenKind::Punctuator(Punctuator::Colon)
             | TokenKind::Punctuator(Punctuator::RBracket)
             | TokenKind::Eof
-    ) || tokens.preceded_by_newline();
+    ) || (!delegate && tokens.preceded_by_newline());
     let arg = if stop {
         None
     } else {

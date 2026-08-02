@@ -1467,21 +1467,17 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         // previous behavior for ordinary calls until constructor frames carry it.
         Expr::NewTarget(_) => func.emit_bare(Opcode::LdaUndefined),
         Expr::Yield { arg, delegate, .. } => {
-            if *delegate {
-                ctx.errors.push(Diagnostic::error(
-                    expr.span(),
-                    "`yield*` delegation is not supported yet",
-                ));
-                func.emit_bare(Opcode::LdaUndefined);
-                func.annotate_since(start_pc, expr.span());
-                return;
-            }
-            // Push the value to yield (undefined if no operand), then suspend.
+            // Push the operand (undefined only for plain `yield`), then let the
+            // VM suspend directly or enter the persistent delegation machine.
             match arg {
                 Some(e) => compile_expr(e, func, ctx),
                 None => func.emit_bare(Opcode::LdaUndefined),
             }
-            func.emit_bare(Opcode::Yield);
+            func.emit_bare(if *delegate {
+                Opcode::YieldStar
+            } else {
+                Opcode::Yield
+            });
         }
         Expr::Await { arg, .. } => {
             compile_expr(arg, func, ctx);

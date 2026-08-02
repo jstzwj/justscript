@@ -12,7 +12,10 @@ use js_bytecode::{BytecodeFunction, BytecodeModule, Opcode};
 use js_diagnostics::DiagResult;
 use js_runtime::context::RealmContext;
 use js_runtime::object::PropertyDescriptor;
-use js_runtime::value::{GeneratorState, JsFunction, Value, ValueData};
+use js_runtime::value::{
+    GeneratorDelegate, GeneratorResumeKind, GeneratorState, GeneratorTryState, JsFunction, Value,
+    ValueData,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -32,12 +35,13 @@ const IT_SRC: &str = "__it_src";
 const IT_IDX: &str = "__it_idx";
 
 /// The result of a native call: either a plain value, or a request to resume a
-/// paused generator with `arg` (the value passed to `.next(arg)`).
+/// paused generator with a normal, throw, or return completion.
 pub enum NativeResult {
     Value(Value),
-    ResumeGenerator(Rc<RefCell<GeneratorState>>, Value),
+    ResumeGenerator(Rc<RefCell<GeneratorState>>, GeneratorResumeKind, Value),
     ResumeAsyncGenerator(
         Rc<RefCell<GeneratorState>>,
+        GeneratorResumeKind,
         Value,
         js_runtime::object::JsObject,
     ),
@@ -92,7 +96,7 @@ struct DeferredModuleGraph {
 pub trait NativeFn {
     fn call(
         &self,
-        interp: &mut Interpreter,
+        _interp: &mut Interpreter,
         modules: &BytecodeGraph<'_>,
         this: Value,
         f: &JsFunction,
@@ -111,13 +115,40 @@ impl NativeFn for GenThrow {
         _modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
-        _args: Vec<Value>,
+        args: Vec<Value>,
     ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
-        gen.borrow_mut().done = true;
-        Ok(NativeResult::Value(iter_result(Value::undefined(), true)))
+        let value = args.into_iter().next().unwrap_or_else(Value::undefined);
+        let (is_async, done, started) = {
+            let state = gen.borrow();
+            (state.is_async, state.done, state.started)
+        };
+        if done || !started {
+            gen.borrow_mut().done = true;
+            if is_async {
+                return Ok(NativeResult::Value(crate::builtins::promise_rejected(
+                    value,
+                )));
+            }
+            return Err(InterpError::Throw(value));
+        }
+        if is_async {
+            let promise = crate::builtins::promise_pending();
+            Ok(NativeResult::ResumeAsyncGenerator(
+                gen,
+                GeneratorResumeKind::Throw,
+                value,
+                promise,
+            ))
+        } else {
+            Ok(NativeResult::ResumeGenerator(
+                gen,
+                GeneratorResumeKind::Throw,
+                value,
+            ))
+        }
     }
 }
 
@@ -144,9 +175,18 @@ impl NativeFn for GenNext {
                 return Ok(NativeResult::Value(promise));
             }
             let promise = crate::builtins::promise_pending();
-            Ok(NativeResult::ResumeAsyncGenerator(gen, arg, promise))
+            Ok(NativeResult::ResumeAsyncGenerator(
+                gen,
+                GeneratorResumeKind::Next,
+                arg,
+                promise,
+            ))
         } else {
-            Ok(NativeResult::ResumeGenerator(gen, arg))
+            Ok(NativeResult::ResumeGenerator(
+                gen,
+                GeneratorResumeKind::Next,
+                arg,
+            ))
         }
     }
 }
@@ -154,8 +194,8 @@ impl NativeFn for GenNext {
 impl NativeFn for GenReturn {
     fn call(
         &self,
-        _interp: &mut Interpreter,
-        _modules: &BytecodeGraph<'_>,
+        interp: &mut Interpreter,
+        modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
@@ -164,8 +204,35 @@ impl NativeFn for GenReturn {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
         let value = args.into_iter().next().unwrap_or_else(Value::undefined);
-        gen.borrow_mut().done = true;
-        Ok(NativeResult::Value(iter_result(value, true)))
+        let (is_async, done, started) = {
+            let state = gen.borrow();
+            (state.is_async, state.done, state.started)
+        };
+        if done || !started {
+            gen.borrow_mut().done = true;
+            let result = iter_result(value, true);
+            if is_async {
+                return Ok(NativeResult::Value(crate::builtins::promise_resolved(
+                    interp, modules, result,
+                )?));
+            }
+            return Ok(NativeResult::Value(result));
+        }
+        if is_async {
+            let promise = crate::builtins::promise_pending();
+            Ok(NativeResult::ResumeAsyncGenerator(
+                gen,
+                GeneratorResumeKind::Return,
+                value,
+                promise,
+            ))
+        } else {
+            Ok(NativeResult::ResumeGenerator(
+                gen,
+                GeneratorResumeKind::Return,
+                value,
+            ))
+        }
     }
 }
 
@@ -711,7 +778,25 @@ impl Interpreter {
                                 frame.module_index
                             ))
                         })?;
-                    if func_ref(module, frame.func_index).is_async {
+                    if let Some(generator) = frame.generator.clone() {
+                        {
+                            let mut state = generator.borrow_mut();
+                            state.done = true;
+                            state.delegate = None;
+                        }
+                        let active_promise = frame.async_generator_promise.clone();
+                        if let Some(promise) = active_promise {
+                            crate::builtins::reject_promise(self, promise.clone(), thrown);
+                            self.frames.pop();
+                            if let Some(caller) = self.frames.last_mut() {
+                                caller.stack.push(Value::object(promise));
+                                return Ok(());
+                            }
+                            return Err(InterpError::Internal(
+                                "async generator escaped without a caller frame".into(),
+                            ));
+                        }
+                    } else if func_ref(module, frame.func_index).is_async {
                         let promise = crate::builtins::promise_rejected(thrown);
                         self.frames.pop();
                         if let Some(caller) = self.frames.last_mut() {
@@ -744,6 +829,25 @@ impl Interpreter {
         // A native call may have surfaced an error to unwind the loop.
         if let Some(err) = self.pending_err.take() {
             return Err(err);
+        }
+        // A plain `yield` resumes at the following instruction. Apply its
+        // completion before fetching that instruction; delegated yields replay
+        // `YieldStar`, which consumes the completion itself.
+        let plain_resume = self.frames.last_mut().and_then(|frame| {
+            let delegated = frame
+                .generator
+                .as_ref()
+                .is_some_and(|generator| generator.borrow().delegate.is_some());
+            (!delegated)
+                .then(|| frame.generator_resume.take())
+                .flatten()
+        });
+        if let Some((kind, value)) = plain_resume {
+            match kind {
+                GeneratorResumeKind::Next => self.top().stack.push(value),
+                GeneratorResumeKind::Throw => return Err(InterpError::Throw(value)),
+                GeneratorResumeKind::Return => return self.complete_generator_request(value),
+            }
         }
         let module_index = self.frames.last().unwrap().module_index;
         let module_ptr = self.module_ptr(modules, module_index).ok_or_else(|| {
@@ -1282,64 +1386,10 @@ impl Interpreter {
                 }
             }
             Opcode::Yield => {
-                // Suspend the current generator frame: pop the yielded
-                // value, save the frame back into its generator, then pop
-                // the frame and hand {value, done:false} to the caller.
-                let gen = self.frames.last().unwrap().generator.clone();
-                let gen = gen.expect("`yield` outside a generator frame");
-                let async_generator_promise =
-                    self.frames.last().unwrap().async_generator_promise.clone();
                 let yielded = self.frames.last_mut().unwrap().stack.pop();
-                {
-                    let mut s = gen.borrow_mut();
-                    let f = self.frames.last().unwrap();
-                    s.pc = f.pc;
-                    s.locals = self.frames.last_mut().unwrap().locals.split_off(0);
-                    let depth = self.frames.last().unwrap().stack.depth();
-                    let mut v: Vec<Value> = (0..depth)
-                        .map(|_| self.frames.last_mut().unwrap().stack.pop())
-                        .collect();
-                    v.reverse();
-                    s.stack = v;
-                    s.upvalues = self.frames.last_mut().unwrap().upvalues.split_off(0);
-                    s.private_brands =
-                        std::mem::take(&mut self.frames.last_mut().unwrap().private_brands);
-                    s.this = self.frames.last_mut().unwrap().this.clone();
-                    s.captured_this = self.frames.last_mut().unwrap().captured_this.take();
-                    s.done = false;
-                }
-                self.frames.pop();
-                if self.frames.is_empty() {
-                    // `yield` at the top of the script (no caller) — drop it.
-                    return Ok(Step::Done(Value::undefined()));
-                }
-                if let Some(promise) = async_generator_promise {
-                    let yielded = crate::builtins::promise_resolved(self, modules, yielded)?;
-                    self.drain_jobs(modules)?;
-                    match crate::builtins::promise_result(&yielded) {
-                        Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => {
-                            crate::builtins::fulfill_promise(
-                                self,
-                                promise.clone(),
-                                iter_result(value, false),
-                            );
-                        }
-                        Some(crate::builtins::AwaitedPromise::Rejected(value)) => {
-                            gen.borrow_mut().done = true;
-                            crate::builtins::reject_promise(self, promise.clone(), value);
-                        }
-                        Some(crate::builtins::AwaitedPromise::Pending) => {
-                            return Err(InterpError::Internal(
-                                "async generator yielded a pending Promise".into(),
-                            ));
-                        }
-                        None => unreachable!("PromiseResolve always returns a Promise"),
-                    }
-                    self.top().stack.push(Value::object(promise));
-                } else {
-                    self.top().stack.push(iter_result(yielded, false));
-                }
+                return self.suspend_generator(modules, yielded, false);
             }
+            Opcode::YieldStar => return self.step_yield_star(modules),
             Opcode::Await => {
                 let awaited = self.top().stack.pop();
                 let awaited = crate::builtins::promise_resolved(self, modules, awaited)?;
@@ -1736,6 +1786,377 @@ impl Interpreter {
     /// Short-hand for the currently executing frame.
     fn top(&mut self) -> &mut CallFrame {
         self.frames.last_mut().unwrap()
+    }
+
+    fn complete_generator_request(&mut self, value: Value) -> Result<Step, InterpError> {
+        let (generator, promise) = {
+            let frame = self.frames.last().expect("generator frame");
+            (
+                frame.generator.clone().expect("generator frame owner"),
+                frame.async_generator_promise.clone(),
+            )
+        };
+        {
+            let mut state = generator.borrow_mut();
+            state.done = true;
+            state.delegate = None;
+        }
+        self.frames.pop();
+        if let Some(promise) = promise {
+            crate::builtins::fulfill_promise(self, promise.clone(), iter_result(value, true));
+            let result = Value::object(promise);
+            if self.frames.is_empty() {
+                Ok(Step::Done(result))
+            } else {
+                self.top().stack.push(result);
+                Ok(Step::More)
+            }
+        } else if self.frames.is_empty() {
+            Ok(Step::Done(Value::undefined()))
+        } else {
+            self.top().stack.push(iter_result(value, true));
+            Ok(Step::More)
+        }
+    }
+
+    fn suspend_generator(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        yielded: Value,
+        repeat_current_instruction: bool,
+    ) -> Result<Step, InterpError> {
+        let (
+            generator,
+            promise,
+            pc,
+            locals,
+            stack,
+            upvalues,
+            private_brands,
+            this,
+            captured_this,
+            try_stack,
+            pending_throw,
+        ) = {
+            let frame = self.frames.last_mut().expect("generator frame");
+            let generator = frame.generator.clone().expect("generator frame owner");
+            if repeat_current_instruction {
+                frame.pc = frame.pc.saturating_sub(1);
+            }
+            let depth = frame.stack.depth();
+            let mut stack: Vec<Value> = (0..depth).map(|_| frame.stack.pop()).collect();
+            stack.reverse();
+            (
+                generator,
+                frame.async_generator_promise.clone(),
+                frame.pc,
+                std::mem::take(&mut frame.locals),
+                stack,
+                std::mem::take(&mut frame.upvalues),
+                std::mem::take(&mut frame.private_brands),
+                frame.this.clone(),
+                frame.captured_this.take(),
+                std::mem::take(&mut frame.try_stack),
+                frame.pending_throw.take(),
+            )
+        };
+        {
+            let mut state = generator.borrow_mut();
+            state.pc = pc;
+            state.locals = locals;
+            state.stack = stack;
+            state.upvalues = upvalues;
+            state.private_brands = private_brands;
+            state.this = this;
+            state.captured_this = captured_this;
+            state.try_stack = try_stack
+                .into_iter()
+                .map(|handler| GeneratorTryState {
+                    catch_pc: handler.catch_pc,
+                    finally_pc: handler.finally_pc,
+                })
+                .collect();
+            state.pending_throw = pending_throw;
+            state.done = false;
+        }
+        self.frames.pop();
+        if self.frames.is_empty() {
+            return Ok(Step::Done(Value::undefined()));
+        }
+        if let Some(promise) = promise {
+            match self.await_value_now(modules, yielded) {
+                Ok(value) => crate::builtins::fulfill_promise(
+                    self,
+                    promise.clone(),
+                    iter_result(value, false),
+                ),
+                Err(InterpError::Throw(reason)) => {
+                    let mut state = generator.borrow_mut();
+                    state.done = true;
+                    state.delegate = None;
+                    drop(state);
+                    crate::builtins::reject_promise(self, promise.clone(), reason);
+                }
+                Err(error) => return Err(error),
+            }
+            self.top().stack.push(Value::object(promise));
+        } else {
+            self.top().stack.push(iter_result(yielded, false));
+        }
+        Ok(Step::More)
+    }
+
+    fn await_value_now(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        value: Value,
+    ) -> Result<Value, InterpError> {
+        let promise = crate::builtins::promise_resolved(self, modules, value)?;
+        self.drain_jobs(modules)?;
+        match crate::builtins::promise_result(&promise) {
+            Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => Ok(value),
+            Some(crate::builtins::AwaitedPromise::Rejected(reason)) => {
+                Err(InterpError::Throw(reason))
+            }
+            Some(crate::builtins::AwaitedPromise::Pending) => Err(InterpError::Internal(
+                "yield* awaited a pending Promise without a host continuation".into(),
+            )),
+            None => unreachable!("PromiseResolve always returns a Promise"),
+        }
+    }
+
+    fn step_yield_star(&mut self, modules: &BytecodeGraph<'_>) -> Result<Step, InterpError> {
+        let generator = self
+            .frames
+            .last()
+            .and_then(|frame| frame.generator.clone())
+            .expect("`yield*` outside a generator frame");
+        let is_async = generator.borrow().is_async;
+
+        if generator.borrow().delegate.is_none() {
+            let iterable = self.top().stack.pop();
+            let delegate = self.get_yield_star_iterator(modules, iterable, is_async)?;
+            generator.borrow_mut().delegate = Some(delegate);
+        }
+
+        let (kind, mut received) = self
+            .top()
+            .generator_resume
+            .take()
+            .unwrap_or((GeneratorResumeKind::Next, Value::undefined()));
+        if is_async && kind == GeneratorResumeKind::Return {
+            received = self.await_value_now(modules, received)?;
+        }
+
+        let delegate = generator
+            .borrow()
+            .delegate
+            .clone()
+            .expect("yield* iterator record");
+        let result = match kind {
+            GeneratorResumeKind::Next if delegate.intrinsic_next => {
+                step_array_iterator(&delegate.iterator)
+            }
+            GeneratorResumeKind::Next => self.call_iterator_method(
+                modules,
+                &delegate.iterator,
+                delegate.next_method.clone(),
+                received,
+            )?,
+            GeneratorResumeKind::Throw => {
+                let method =
+                    self.get_optional_method(modules, &delegate.iterator, Value::string("throw"))?;
+                let Some(method) = method else {
+                    if let Some(return_method) = self.get_optional_method(
+                        modules,
+                        &delegate.iterator,
+                        Value::string("return"),
+                    )? {
+                        let close_result = self.call_value(
+                            modules,
+                            return_method,
+                            Vec::new(),
+                            delegate.iterator.clone(),
+                        )?;
+                        let close_result = if is_async {
+                            self.await_value_now(modules, close_result)?
+                        } else {
+                            close_result
+                        };
+                        if !close_result.is_object() {
+                            return Err(InterpError::Throw(type_error(
+                                "iterator return result is not an object",
+                            )));
+                        }
+                    }
+                    return Err(InterpError::Throw(type_error(
+                        "iterator does not provide a throw method",
+                    )));
+                };
+                self.call_iterator_method(modules, &delegate.iterator, method, received)?
+            }
+            GeneratorResumeKind::Return => {
+                let method =
+                    self.get_optional_method(modules, &delegate.iterator, Value::string("return"))?;
+                let Some(method) = method else {
+                    generator.borrow_mut().delegate = None;
+                    return self.complete_generator_request(received);
+                };
+                self.call_iterator_method(modules, &delegate.iterator, method, received)?
+            }
+        };
+
+        let result = if is_async && !delegate.async_from_sync {
+            self.await_value_now(modules, result)?
+        } else {
+            result
+        };
+        if !result.is_object() {
+            return Err(InterpError::Throw(type_error(
+                "iterator result is not an object",
+            )));
+        }
+        let done = self.get_property_value(modules, &result, &Value::string("done"), &result)?;
+        let done = is_truthy(&done);
+        let mut value =
+            self.get_property_value(modules, &result, &Value::string("value"), &result)?;
+        if is_async && delegate.async_from_sync {
+            value = self.await_value_now(modules, value)?;
+        }
+
+        if done {
+            generator.borrow_mut().delegate = None;
+            if kind == GeneratorResumeKind::Return {
+                self.complete_generator_request(value)
+            } else {
+                self.top().stack.push(value);
+                Ok(Step::More)
+            }
+        } else {
+            self.suspend_generator(modules, value, true)
+        }
+    }
+
+    fn get_yield_star_iterator(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        iterable: Value,
+        is_async: bool,
+    ) -> Result<GeneratorDelegate, InterpError> {
+        let indexable = matches!(
+            iterable.data(),
+            ValueData::Object(object) if object.borrow().is_exotic_array
+        ) || matches!(iterable.data(), ValueData::String(_));
+        if indexable {
+            return Ok(GeneratorDelegate {
+                iterator: make_iterator(&iterable),
+                next_method: Value::undefined(),
+                async_from_sync: is_async,
+                intrinsic_next: true,
+            });
+        }
+
+        if let ValueData::Generator(inner) = iterable.data() {
+            let inner_is_async = inner.borrow().is_async;
+            if !is_async && inner_is_async {
+                return Err(InterpError::Throw(type_error(
+                    "value is not synchronously iterable",
+                )));
+            }
+            let iterator = iterable.clone();
+            let next_method =
+                self.get_property_value(modules, &iterator, &Value::string("next"), &iterator)?;
+            return Ok(GeneratorDelegate {
+                iterator,
+                next_method,
+                async_from_sync: is_async && !inner_is_async,
+                intrinsic_next: false,
+            });
+        }
+
+        let (method, async_from_sync) = if is_async {
+            match self.get_optional_method(
+                modules,
+                &iterable,
+                Value::symbol(js_runtime::value::JsSymbol::async_iterator()),
+            )? {
+                Some(method) => (method, false),
+                None => (
+                    self.get_required_method(
+                        modules,
+                        &iterable,
+                        Value::symbol(js_runtime::value::JsSymbol::iterator()),
+                    )?,
+                    true,
+                ),
+            }
+        } else {
+            (
+                self.get_required_method(
+                    modules,
+                    &iterable,
+                    Value::symbol(js_runtime::value::JsSymbol::iterator()),
+                )?,
+                false,
+            )
+        };
+        let iterator = self.call_value(modules, method, Vec::new(), iterable)?;
+        if !iterator.is_object() {
+            return Err(InterpError::Throw(type_error(
+                "iterator method returned a non-object",
+            )));
+        }
+        let next_method =
+            self.get_property_value(modules, &iterator, &Value::string("next"), &iterator)?;
+        Ok(GeneratorDelegate {
+            iterator,
+            next_method,
+            async_from_sync,
+            intrinsic_next: false,
+        })
+    }
+
+    fn get_required_method(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        object: &Value,
+        key: Value,
+    ) -> Result<Value, InterpError> {
+        self.get_optional_method(modules, object, key)?
+            .ok_or_else(|| InterpError::Throw(type_error("value is not iterable")))
+    }
+
+    fn get_optional_method(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        object: &Value,
+        key: Value,
+    ) -> Result<Option<Value>, InterpError> {
+        let method = self.get_property_value(modules, object, &key, object)?;
+        if method.is_nullish() {
+            Ok(None)
+        } else if method.is_function() {
+            Ok(Some(method))
+        } else {
+            Err(InterpError::Throw(type_error(
+                "iterator method is not callable",
+            )))
+        }
+    }
+
+    fn call_iterator_method(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        iterator: &Value,
+        method: Value,
+        argument: Value,
+    ) -> Result<Value, InterpError> {
+        if !method.is_function() {
+            return Err(InterpError::Throw(type_error(
+                "iterator method is not callable",
+            )));
+        }
+        self.call_value(modules, method, vec![argument], iterator.clone())
     }
 
     pub(crate) fn get_property_value(
@@ -2598,13 +3019,13 @@ impl Interpreter {
                     self.error_trace = prior_trace;
                     self.top().stack.push(v)
                 }
-                Ok(NativeResult::ResumeGenerator(gen, arg)) => {
+                Ok(NativeResult::ResumeGenerator(gen, kind, arg)) => {
                     self.error_trace = prior_trace;
-                    self.checkout_generator(gen, arg);
+                    self.checkout_generator(gen, kind, arg);
                 }
-                Ok(NativeResult::ResumeAsyncGenerator(gen, arg, promise)) => {
+                Ok(NativeResult::ResumeAsyncGenerator(gen, kind, arg, promise)) => {
                     self.error_trace = prior_trace;
-                    self.checkout_generator(gen, arg);
+                    self.checkout_generator(gen, kind, arg);
                     self.top().async_generator_promise = Some(promise);
                 }
                 Err(e) => self.pending_err = Some(e),
@@ -2682,6 +3103,9 @@ impl Interpreter {
             },
             captured_this: f.this_cell.clone(),
             is_async: func.is_async,
+            delegate: None,
+            try_stack: Vec::new(),
+            pending_throw: None,
             done: false,
             started: false,
         }
@@ -2690,7 +3114,12 @@ impl Interpreter {
     /// Resume a paused generator: check its frame state out into a live
     /// `CallFrame`, push the `.next(arg)` argument (for non-first resumes), and
     /// push the frame so the dispatch loop continues it.
-    fn checkout_generator(&mut self, gen: Rc<RefCell<GeneratorState>>, arg: Value) {
+    fn checkout_generator(
+        &mut self,
+        gen: Rc<RefCell<GeneratorState>>,
+        kind: GeneratorResumeKind,
+        arg: Value,
+    ) {
         let (
             done,
             started,
@@ -2703,6 +3132,8 @@ impl Interpreter {
             private_brands,
             this,
             captured_this,
+            try_stack,
+            pending_throw,
         ) = {
             let mut s = gen.borrow_mut();
             if s.done {
@@ -2725,6 +3156,8 @@ impl Interpreter {
                 std::mem::take(&mut s.private_brands),
                 std::mem::replace(&mut s.this, Value::undefined()),
                 s.captured_this.take(),
+                std::mem::take(&mut s.try_stack),
+                s.pending_throw.take(),
             )
         };
         let _ = done;
@@ -2741,12 +3174,19 @@ impl Interpreter {
         frame.this = this;
         frame.captured_this = captured_this;
         frame.generator = Some(gen);
+        frame.try_stack = try_stack
+            .into_iter()
+            .map(|state| crate::frame::ActiveTry {
+                catch_pc: state.catch_pc,
+                finally_pc: state.finally_pc,
+            })
+            .collect();
+        frame.pending_throw = pending_throw;
         for v in stack {
             frame.stack.push(v);
         }
         if started {
-            // The `.next(arg)` argument is the value of the `yield` expression.
-            frame.stack.push(arg);
+            frame.generator_resume = Some((kind, arg));
         }
         self.frames.push(frame);
     }
