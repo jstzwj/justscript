@@ -152,6 +152,9 @@ impl Value {
     pub fn string(s: impl Into<JsString>) -> Value {
         Value::new(ValueData::String(s.into()))
     }
+    pub fn symbol(symbol: JsSymbol) -> Value {
+        Value::new(ValueData::Symbol(symbol))
+    }
     pub fn object(o: JsObject) -> Value {
         Value::new(ValueData::Object(o))
     }
@@ -180,6 +183,12 @@ impl Value {
     }
     pub fn as_function(&self) -> Option<&JsFunction> {
         match &self.data {
+            ValueData::Function(f) => Some(f),
+            _ => None,
+        }
+    }
+    pub fn as_function_mut(&mut self) -> Option<&mut JsFunction> {
+        match &mut self.data {
             ValueData::Function(f) => Some(f),
             _ => None,
         }
@@ -300,6 +309,8 @@ pub struct JsFunction {
     /// Host/native functions may retain one object as internal bound state
     /// (currently Promise resolving functions).
     pub bound_object: Option<JsObject>,
+    /// Constructor referenced by `extends`, evaluated when the class is defined.
+    pub superclass: Option<Box<Value>>,
     /// `true` for `function*` — calling it produces a generator object.
     pub is_generator: bool,
 }
@@ -316,6 +327,7 @@ impl JsFunction {
             native: None,
             bound_generator: None,
             bound_object: None,
+            superclass: None,
             is_generator: false,
         }
     }
@@ -365,14 +377,34 @@ impl Eq for JsString {}
 
 /// A unique Symbol value. Identity is by address (the `Arc` pointer), matching
 /// the spec's "distinct symbol" semantics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct JsSymbol {
+    pub id: u64,
     pub description: Option<String>,
 }
 
 impl JsSymbol {
     pub fn new(description: Option<String>) -> JsSymbol {
-        JsSymbol { description }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(3);
+        JsSymbol {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            description,
+        }
+    }
+
+    pub fn to_string_tag() -> JsSymbol {
+        JsSymbol {
+            id: 1,
+            description: Some("Symbol.toStringTag".into()),
+        }
+    }
+
+    pub fn iterator() -> JsSymbol {
+        JsSymbol {
+            id: 2,
+            description: Some("Symbol.iterator".into()),
+        }
     }
 }
 

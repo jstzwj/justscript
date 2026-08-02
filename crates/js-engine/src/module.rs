@@ -232,6 +232,13 @@ pub(crate) struct ModuleMetadata {
     pub uninitialized_slots: HashSet<usize>,
     pub immutable_slots: HashSet<usize>,
     pub has_top_level_await: bool,
+    pub dynamic_requests: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) enum DynamicResolution {
+    Resolved(usize),
+    Unresolved(String),
 }
 
 pub(crate) struct RuntimeModule {
@@ -239,11 +246,18 @@ pub(crate) struct RuntimeModule {
     pub compiled: Rc<CompiledModule>,
     pub metadata: ModuleMetadata,
     pub dependencies: HashMap<String, usize>,
+    pub dynamic_dependencies: HashMap<String, DynamicResolution>,
     pub locals: Vec<Cell>,
     pub namespace: Option<Value>,
     pub namespace_cell: Cell,
     pub deferred_namespace: Option<Value>,
     pub status: ModuleStatus,
+    pub pending_async_dependencies: usize,
+    pub async_parent_modules: Vec<usize>,
+    pub async_evaluation_order: Option<u64>,
+    pub evaluation_value: Option<Value>,
+    pub evaluation_error: Option<Value>,
+    pub dynamic_import_waiters: Vec<js_runtime::object::JsObject>,
 }
 
 #[derive(Default)]
@@ -254,6 +268,7 @@ pub(crate) struct ModuleGraph {
 
 pub(crate) fn analyze_module(compiled: &CompiledModule) -> Result<ModuleMetadata, ModuleError> {
     let mut metadata = ModuleMetadata::default();
+    metadata.dynamic_requests = compiled.bytecode.dynamic_import_requests.clone();
     metadata.has_top_level_await = compiled
         .bytecode
         .main

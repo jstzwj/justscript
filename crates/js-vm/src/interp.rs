@@ -11,9 +11,10 @@ use crate::{EngineFault, JsException, RuntimeError, RuntimeFrame};
 use js_bytecode::{BytecodeFunction, BytecodeModule, Opcode};
 use js_diagnostics::DiagResult;
 use js_runtime::context::RealmContext;
+use js_runtime::object::PropertyDescriptor;
 use js_runtime::value::{GeneratorState, JsFunction, Value, ValueData};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -42,12 +43,36 @@ pub enum NativeResult {
 pub(crate) enum Step {
     More,
     Done(Value),
+    Suspend(Value),
 }
 
-pub(crate) struct PromiseJob {
-    pub reaction: js_runtime::object::PromiseReaction,
-    pub argument: Value,
-    pub rejected: bool,
+#[derive(Debug)]
+pub enum ModuleExecution {
+    Completed(Value),
+    Suspended,
+}
+
+pub struct DynamicImportRequest {
+    pub resolution: Result<usize, String>,
+    pub promise: js_runtime::object::JsObject,
+}
+
+struct SuspendedModule {
+    frames: Vec<CallFrame>,
+    awaited: Value,
+}
+
+pub(crate) enum PromiseJob {
+    Reaction {
+        reaction: js_runtime::object::PromiseReaction,
+        argument: Value,
+        rejected: bool,
+    },
+    ResolveThenable {
+        promise: js_runtime::object::JsObject,
+        thenable: Value,
+        then: Value,
+    },
 }
 
 struct DeferredModuleGraph {
@@ -165,6 +190,9 @@ pub struct Interpreter {
     error_trace: Vec<RuntimeFrame>,
     /// PromiseJobs run FIFO at explicit microtask checkpoints.
     jobs: VecDeque<PromiseJob>,
+    suspended_modules: HashMap<usize, SuspendedModule>,
+    dynamic_imports: Option<Vec<HashMap<String, Result<usize, String>>>>,
+    dynamic_import_requests: VecDeque<DynamicImportRequest>,
     deferred_modules: Option<DeferredModuleGraph>,
 }
 
@@ -187,12 +215,17 @@ impl Interpreter {
             steps: 0,
             error_trace: Vec::new(),
             jobs: VecDeque::new(),
+            suspended_modules: HashMap::new(),
+            dynamic_imports: None,
+            dynamic_import_requests: VecDeque::new(),
             deferred_modules: None,
         };
         // Install the global builtins (console, Math, Object, JSON, parseInt, …).
         {
             let mut realm = interp.ctx.realm.borrow_mut();
             crate::builtins::install_globals(&mut realm.globals);
+            let global_this = Value::object(realm.global_object.clone());
+            realm.globals.insert("globalThis".into(), global_this);
         }
         interp
     }
@@ -216,6 +249,49 @@ impl Interpreter {
             dependencies,
             evaluated,
         });
+    }
+
+    pub fn configure_dynamic_imports(
+        &mut self,
+        resolutions: Vec<HashMap<String, Result<usize, String>>>,
+    ) {
+        self.dynamic_imports = Some(resolutions);
+    }
+
+    pub fn take_dynamic_import_requests(&mut self) -> Vec<DynamicImportRequest> {
+        self.dynamic_import_requests.drain(..).collect()
+    }
+
+    pub fn has_dynamic_import_requests(&self) -> bool {
+        !self.dynamic_import_requests.is_empty()
+    }
+
+    pub fn has_promise_jobs(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    pub fn resolve_host_promise(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        promise: js_runtime::object::JsObject,
+        value: Value,
+    ) -> Result<(), InterpError> {
+        crate::builtins::resolve_promise(self, modules, promise, value)
+    }
+
+    pub fn resolve_host_promise_report(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        promise: js_runtime::object::JsObject,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        self.resolve_host_promise(modules, promise, value)
+            .map_err(|error| self.runtime_error(modules, module_index, error))
+    }
+
+    pub fn reject_host_promise(&mut self, promise: js_runtime::object::JsObject, reason: Value) {
+        crate::builtins::reject_promise(self, promise, reason);
     }
 
     pub fn mark_module_evaluated(&mut self, module_index: usize) {
@@ -302,13 +378,166 @@ impl Interpreter {
                 .join("; ");
             return Err(InterpError::Internal(format!("invalid bytecode: {detail}")));
         }
+        let mut outcome = self.start_module_in_graph(modules, module_index, locals)?;
+        loop {
+            match outcome {
+                ModuleExecution::Completed(value) => return Ok(value),
+                ModuleExecution::Suspended => {
+                    self.drain_jobs(modules)?;
+                    outcome = self.resume_module_in_graph(modules, module_index)?;
+                }
+            }
+        }
+    }
+
+    pub fn start_module_in_graph(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        locals: Vec<js_runtime::value::Cell>,
+    ) -> Result<ModuleExecution, InterpError> {
+        let module = modules.get(module_index).copied().ok_or_else(|| {
+            InterpError::Internal(format!(
+                "module index {module_index} is outside the bytecode graph"
+            ))
+        })?;
+        if locals.len() != module.main.locals.slot_count() as usize {
+            return Err(InterpError::Internal(format!(
+                "module environment has {} cells, expected {}",
+                locals.len(),
+                module.main.locals.slot_count()
+            )));
+        }
+        if self.suspended_modules.contains_key(&module_index) {
+            return Err(InterpError::Internal(format!(
+                "module {module_index} is already suspended"
+            )));
+        }
         self.error_trace.clear();
         self.steps = 0;
         self.frames.clear();
-        let span = module.main.span;
-        let frame = CallFrame::with_locals(module_index, 0, locals, span);
-        self.frames.push(frame);
-        self.dispatch(modules)
+        self.frames.push(CallFrame::with_locals(
+            module_index,
+            0,
+            locals,
+            module.main.span,
+        ));
+        self.dispatch_module(modules, module_index)
+    }
+
+    pub fn start_module_in_graph_report(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        locals: Vec<js_runtime::value::Cell>,
+    ) -> Result<ModuleExecution, RuntimeError> {
+        self.start_module_in_graph(modules, module_index, locals)
+            .map_err(|error| self.runtime_error(modules, module_index, error))
+    }
+
+    pub fn resume_module_in_graph(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Result<ModuleExecution, InterpError> {
+        let suspended = self
+            .suspended_modules
+            .remove(&module_index)
+            .ok_or_else(|| {
+                InterpError::Internal(format!("module {module_index} is not suspended"))
+            })?;
+        match crate::builtins::promise_result(&suspended.awaited) {
+            Some(crate::builtins::AwaitedPromise::Pending) => {
+                self.suspended_modules.insert(module_index, suspended);
+                return Ok(ModuleExecution::Suspended);
+            }
+            Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => {
+                self.frames = suspended.frames;
+                self.top().stack.push(value);
+            }
+            Some(crate::builtins::AwaitedPromise::Rejected(value)) => {
+                self.frames = suspended.frames;
+                self.handle_exception(modules, InterpError::Throw(value), 0)?;
+            }
+            None => unreachable!("await continuation must hold a Promise"),
+        }
+        self.dispatch_module(modules, module_index)
+    }
+
+    pub fn resume_module_in_graph_report(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Result<ModuleExecution, RuntimeError> {
+        self.resume_module_in_graph(modules, module_index)
+            .map_err(|error| self.runtime_error(modules, module_index, error))
+    }
+
+    pub fn module_is_ready(&self, module_index: usize) -> bool {
+        self.suspended_modules
+            .get(&module_index)
+            .is_some_and(|suspended| {
+                !matches!(
+                    crate::builtins::promise_result(&suspended.awaited),
+                    Some(crate::builtins::AwaitedPromise::Pending)
+                )
+            })
+    }
+
+    pub fn run_promise_jobs(&mut self, modules: &BytecodeGraph<'_>) -> Result<(), InterpError> {
+        self.drain_jobs(modules)
+    }
+
+    pub fn run_promise_jobs_report(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Result<(), RuntimeError> {
+        self.run_promise_jobs(modules)
+            .map_err(|error| self.runtime_error(modules, module_index, error))
+    }
+
+    fn runtime_error(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        error: InterpError,
+    ) -> RuntimeError {
+        let fallback = modules
+            .get(module_index)
+            .and_then(|module| module.source.clone());
+        let stack = std::mem::take(&mut self.error_trace);
+        let source = stack
+            .first()
+            .and_then(|frame| frame.source.clone())
+            .or(fallback);
+        match error {
+            InterpError::Throw(value) => RuntimeError::Exception(JsException {
+                value,
+                source,
+                stack,
+            }),
+            InterpError::Internal(message) => {
+                RuntimeError::Fault(EngineFault::new(message, source, stack))
+            }
+        }
+    }
+
+    fn dispatch_module(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Result<ModuleExecution, InterpError> {
+        match self.dispatch(modules)? {
+            Step::Done(value) => Ok(ModuleExecution::Completed(value)),
+            Step::Suspend(awaited) => {
+                let frames = std::mem::take(&mut self.frames);
+                self.suspended_modules
+                    .insert(module_index, SuspendedModule { frames, awaited });
+                Ok(ModuleExecution::Suspended)
+            }
+            Step::More => unreachable!(),
+        }
     }
 
     /// Execute a module and retain source identity, throw location and the
@@ -360,11 +589,11 @@ impl Interpreter {
     /// Main dispatch loop: runs instructions until the top-level frame returns.
     /// Exceptions surface as `Err` from [`Self::step`]; [`Self::handle_exception`]
     /// either installs a catch/finally (continue) or propagates (pop frame).
-    fn dispatch(&mut self, modules: &BytecodeGraph<'_>) -> Result<Value, InterpError> {
+    fn dispatch(&mut self, modules: &BytecodeGraph<'_>) -> Result<Step, InterpError> {
         loop {
             match self.step(modules) {
                 Ok(Step::More) => {}
-                Ok(Step::Done(v)) => return Ok(v),
+                Ok(done @ (Step::Done(_) | Step::Suspend(_))) => return Ok(done),
                 Err(e) => match self.handle_exception(modules, e, 0) {
                     Ok(()) => {}
                     Err(e) => return Err(e),
@@ -555,6 +784,12 @@ impl Interpreter {
                         let b = o.borrow();
                         // For arrays, expose numeric indices (skip "length").
                         if let Some(namespace) = &b.module_namespace {
+                            if namespace.values().any(|binding| !binding.is_initialized()) {
+                                return Err(InterpError::Throw(type_error_named(
+                                    "ReferenceError",
+                                    "cannot access binding before initialization",
+                                )));
+                            }
                             namespace.keys().cloned().collect()
                         } else if b.is_exotic_array {
                             (0..b.properties.len().saturating_sub(1))
@@ -641,6 +876,17 @@ impl Interpreter {
                 let a = self.top().stack.pop();
                 self.top().stack.push(b);
                 self.top().stack.push(a);
+            }
+            Opcode::SetClassHeritage => {
+                let mut class = self.top().stack.pop();
+                let superclass = self.top().stack.pop();
+                if !superclass.is_null() && !superclass.is_function() {
+                    return Err(InterpError::Throw(type_error(
+                        "class extends value is not a constructor or null",
+                    )));
+                }
+                class.as_function_mut().unwrap().superclass = Some(Box::new(superclass));
+                self.top().stack.push(class);
             }
 
             // ---- arithmetic / binary ----
@@ -779,7 +1025,7 @@ impl Interpreter {
                 let ret = if was_construct && !ret.is_object() {
                     this_obj
                 } else if is_async {
-                    crate::builtins::promise_fulfilled(ret)
+                    crate::builtins::promise_resolved(self, modules, ret)?
                 } else {
                     ret
                 };
@@ -842,6 +1088,10 @@ impl Interpreter {
             }
             Opcode::Await => {
                 let awaited = self.top().stack.pop();
+                let awaited = crate::builtins::promise_resolved(self, modules, awaited)?;
+                if self.frames.len() == 1 && self.top().func_index == 0 {
+                    return Ok(Step::Suspend(awaited));
+                }
                 self.drain_jobs(modules)?;
                 match crate::builtins::promise_result(&awaited) {
                     Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => {
@@ -855,7 +1105,7 @@ impl Interpreter {
                             "awaited Promise is still pending after the job checkpoint".into(),
                         ));
                     }
-                    None => self.top().stack.push(awaited),
+                    None => unreachable!("PromiseResolve always returns a Promise"),
                 }
             }
 
@@ -876,6 +1126,36 @@ impl Interpreter {
                     (a, this, callee)
                 };
                 self.invoke(modules, callee, args, this, false);
+            }
+            Opcode::CallSuper => {
+                let args = {
+                    let count = ins.operand as usize;
+                    let mut args: Vec<_> = (0..count).map(|_| self.top().stack.pop()).collect();
+                    args.reverse();
+                    args
+                };
+                let superclass = self
+                    .frames
+                    .last()
+                    .and_then(|frame| frame.superclass.clone())
+                    .ok_or_else(|| {
+                        InterpError::Internal("super() has no runtime superclass".into())
+                    })?;
+                let base = self.current_this();
+                let result = self.call_value_mode(modules, superclass, args, base.clone(), true)?;
+                let frame = self.frames.last_mut().unwrap();
+                frame.super_base = Some(base.clone());
+                frame.this = if result.is_object() {
+                    result.clone()
+                } else {
+                    base
+                };
+                frame.stack.push(result);
+            }
+            Opcode::SetSuperProp => {
+                let key = self.top().stack.pop();
+                let value = self.top().stack.pop();
+                self.set_super_property(modules, &key, value)?;
             }
             Opcode::NewObject => {
                 let o = js_runtime::object::ObjectData::new_handle();
@@ -949,7 +1229,7 @@ impl Interpreter {
                 let key = self.top().stack.pop();
                 let obj = self.top().stack.pop();
                 self.ensure_deferred_namespace(modules, &obj)?;
-                let value = get_property_checked(&obj, &key).map_err(binding_error_value)?;
+                let value = self.get_property_value(modules, &obj, &key)?;
                 self.top().stack.push(value);
             }
             Opcode::SetProp => {
@@ -966,18 +1246,63 @@ impl Interpreter {
                     )));
                 }
             }
+            Opcode::DefineGetter | Opcode::DefineSetter => {
+                let key = self.top().stack.pop();
+                let object = self.top().stack.pop();
+                let function = self.top().stack.pop();
+                define_accessor(&object, &key, function, ins.op == Opcode::DefineGetter);
+            }
+            Opcode::CopyDataProperties => {
+                let source = self.top().stack.pop();
+                let target = self.top().stack.pop();
+                copy_data_properties(&target, &source);
+                self.top().stack.push(target);
+            }
             Opcode::DeleteProp => {
                 let key = self.top().stack.pop();
                 let object = self.top().stack.pop();
                 self.ensure_deferred_namespace(modules, &object)?;
                 let deleted = delete_property(&object, &key);
+                if !deleted && module.is_module {
+                    return Err(InterpError::Throw(type_error(
+                        "cannot delete a non-configurable property",
+                    )));
+                }
                 self.top().stack.push(Value::boolean(deleted));
             }
             Opcode::New => {
                 let (callee, args) = pop_args(self, ins.operand);
+                if let Some(value) = crate::builtins::construct_builtin(&callee, &args) {
+                    set_constructor_chain(&value, &callee);
+                    self.top().stack.push(value);
+                    return Ok(Step::More);
+                }
                 // Construct a fresh object bound as `this`.
                 let this = Value::object(js_runtime::object::ObjectData::new_handle());
+                set_constructor_chain(&this, &callee);
                 self.invoke(modules, callee, args, this, true);
+            }
+            Opcode::DynamicImport => {
+                let specifier = to_string(&self.top().stack.pop());
+                let module_index = self.top().module_index;
+                let resolution = self
+                    .dynamic_imports
+                    .as_ref()
+                    .and_then(|modules| modules.get(module_index))
+                    .and_then(|requests| requests.get(&specifier))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Err(format!(
+                            "dynamic import `{specifier}` was not resolved by the module host"
+                        ))
+                    });
+                let promise = crate::builtins::promise_pending();
+                self.dynamic_import_requests
+                    .push_back(DynamicImportRequest {
+                        resolution,
+                        promise: promise.clone(),
+                    });
+                self.top().stack.push(Value::object(promise));
             }
 
             Opcode::LogicalAnd | Opcode::LogicalOr | Opcode::NullishCoal => {
@@ -995,6 +1320,64 @@ impl Interpreter {
         self.frames.last_mut().unwrap()
     }
 
+    fn get_property_value(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        object: &Value,
+        key: &Value,
+    ) -> Result<Value, InterpError> {
+        let Some(handle) = obj_as_object(object) else {
+            return get_property_checked(object, key).map_err(binding_error_value);
+        };
+        let mut current = Some(handle.clone());
+        while let Some(candidate) = current {
+            let (descriptor, prototype) = {
+                let data = candidate.borrow();
+                if let ValueData::Symbol(symbol) = key.data() {
+                    let descriptor = data.symbol_properties.get(&symbol.id).cloned();
+                    let prototype = data.proto.clone();
+                    drop(data);
+                    if let Some(descriptor) = descriptor {
+                        return match descriptor {
+                            js_runtime::object::PropertyDescriptor::Data { value, .. } => Ok(value),
+                            js_runtime::object::PropertyDescriptor::Accessor { get, .. } => {
+                                match get {
+                                    Some(getter) if getter.is_function() => {
+                                        self.call_value(modules, getter, Vec::new(), object.clone())
+                                    }
+                                    _ => Ok(Value::undefined()),
+                                }
+                            }
+                        };
+                    }
+                    current = prototype.as_ref().and_then(obj_as_object).cloned();
+                    continue;
+                }
+                let name = prop_name(key);
+                if let Some(namespace) = &data.module_namespace {
+                    return namespace
+                        .get(&name)
+                        .map_or_else(|| Ok(Value::undefined()), |cell| cell.get())
+                        .map_err(binding_error_value);
+                }
+                (data.properties.get(&name).cloned(), data.proto.clone())
+            };
+            if let Some(descriptor) = descriptor {
+                return match descriptor {
+                    js_runtime::object::PropertyDescriptor::Data { value, .. } => Ok(value),
+                    js_runtime::object::PropertyDescriptor::Accessor { get, .. } => match get {
+                        Some(getter) if getter.is_function() => {
+                            self.call_value(modules, getter, Vec::new(), object.clone())
+                        }
+                        _ => Ok(Value::undefined()),
+                    },
+                };
+            }
+            current = prototype.as_ref().and_then(obj_as_object).cloned();
+        }
+        get_property_checked(object, key).map_err(binding_error_value)
+    }
+
     /// Call a JS `callee` with `args`/`this` and run it to completion
     /// synchronously (used by native builtins that take callbacks, e.g.
     /// `Array.map`). Runs a sub-dispatch loop until the callee's frame returns,
@@ -1006,22 +1389,107 @@ impl Interpreter {
         args: Vec<Value>,
         this: Value,
     ) -> Result<Value, InterpError> {
+        self.call_value_mode(modules, callee, args, this, false)
+    }
+
+    fn call_value_mode(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        callee: Value,
+        args: Vec<Value>,
+        this: Value,
+        is_construct: bool,
+    ) -> Result<Value, InterpError> {
+        let host_frame = self.frames.is_empty();
+        if host_frame {
+            let module_index = callee
+                .as_function()
+                .map(|function| function.module_index as usize)
+                .unwrap_or(0);
+            let module = modules.get(module_index).copied().ok_or_else(|| {
+                InterpError::Internal(format!(
+                    "PromiseJob callback refers to missing module {module_index}"
+                ))
+            })?;
+            self.frames
+                .push(CallFrame::for_module(module_index, 0, 0, module.main.span));
+        }
         let target = self.frames.len();
-        self.invoke(modules, callee, args, this, false);
+        self.invoke(modules, callee, args, this, is_construct);
         // `invoke` may have pushed a frame (bytecode callee) or already pushed
         // a result (native/done-generator). Step until the frame unwinds.
         while self.frames.len() > target {
             match self.step(modules) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(_)) => break,
+                Ok(Step::Suspend(_)) => unreachable!("nested module execution cannot suspend"),
                 Err(e) => match self.handle_exception(modules, e, target) {
-                    Ok(()) => {}             // caught inside the callee
-                    Err(e) => return Err(e), // escaped the callee → propagate
+                    Ok(()) => {} // caught inside the callee
+                    Err(e) => {
+                        if host_frame {
+                            self.frames.clear();
+                        }
+                        return Err(e);
+                    } // escaped the callee → propagate
                 },
             }
         }
         // The callee's return value now sits on top of the caller's stack.
-        Ok(self.top().stack.pop())
+        let value = self.top().stack.pop();
+        if host_frame {
+            self.frames.pop();
+        }
+        Ok(value)
+    }
+
+    fn set_super_property(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        key: &Value,
+        value: Value,
+    ) -> Result<(), InterpError> {
+        let (base, receiver) = {
+            let frame = self.frames.last().unwrap();
+            (
+                frame
+                    .super_base
+                    .clone()
+                    .unwrap_or_else(|| frame.this.clone()),
+                frame.this.clone(),
+            )
+        };
+        let name = prop_name(key);
+        let setter = obj_as_object(&base).and_then(|object| {
+            object
+                .borrow()
+                .properties
+                .get(&name)
+                .and_then(|descriptor| match descriptor {
+                    PropertyDescriptor::Accessor { set, .. } => set.clone(),
+                    _ => None,
+                })
+        });
+        if let Some(setter) = setter {
+            self.call_value(modules, setter, vec![value], receiver)?;
+            return Ok(());
+        }
+        if let ValueData::Object(object) = receiver.data() {
+            if let Some(namespace) = &object.borrow().module_namespace {
+                if let Some(binding) = namespace.get(&name) {
+                    binding.get().map_err(binding_error_value)?;
+                }
+                return Err(InterpError::Throw(type_error(
+                    "cannot assign through super to a module namespace",
+                )));
+            }
+        }
+        if set_property_checked(&receiver, key, value) {
+            Ok(())
+        } else {
+            Err(InterpError::Throw(type_error(
+                "super property assignment failed",
+            )))
+        }
     }
 
     pub(crate) fn enqueue_promise_job(&mut self, job: PromiseJob) {
@@ -1030,30 +1498,58 @@ impl Interpreter {
 
     fn drain_jobs(&mut self, modules: &BytecodeGraph<'_>) -> Result<(), InterpError> {
         while let Some(job) = self.jobs.pop_front() {
-            let handler = if job.rejected {
-                job.reaction.on_rejected.clone()
-            } else {
-                job.reaction.on_fulfilled.clone()
-            };
-            let outcome = match handler {
-                Some(handler) => self
-                    .call_value(
-                        modules,
-                        handler,
-                        vec![job.argument.clone()],
-                        Value::undefined(),
-                    )
-                    .map(|value| (false, value)),
-                None => Ok((job.rejected, job.argument)),
-            };
-            match outcome {
-                Ok((rejected, value)) => {
-                    crate::builtins::settle_promise(self, job.reaction.result, rejected, value)
+            match job {
+                PromiseJob::Reaction {
+                    reaction,
+                    argument,
+                    rejected,
+                } => {
+                    let handler = if rejected {
+                        reaction.on_rejected.clone()
+                    } else {
+                        reaction.on_fulfilled.clone()
+                    };
+                    let outcome = match handler {
+                        Some(handler) => self
+                            .call_value(
+                                modules,
+                                handler,
+                                vec![argument.clone()],
+                                Value::undefined(),
+                            )
+                            .map(|value| (false, value)),
+                        None => Ok((rejected, argument)),
+                    };
+                    match outcome {
+                        Ok((true, value)) => {
+                            crate::builtins::reject_promise(self, reaction.result, value)
+                        }
+                        Ok((false, value)) => {
+                            crate::builtins::resolve_promise(self, modules, reaction.result, value)?
+                        }
+                        Err(InterpError::Throw(value)) => {
+                            crate::builtins::reject_promise(self, reaction.result, value)
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-                Err(InterpError::Throw(value)) => {
-                    crate::builtins::settle_promise(self, job.reaction.result, true, value)
+                PromiseJob::ResolveThenable {
+                    promise,
+                    thenable,
+                    then,
+                } => {
+                    let (resolve, reject) = crate::builtins::resolving_functions(&promise);
+                    if let Err(error) =
+                        self.call_value(modules, then, vec![resolve, reject], thenable)
+                    {
+                        match error {
+                            InterpError::Throw(reason) => {
+                                crate::builtins::reject_promise(self, promise, reason)
+                            }
+                            error => return Err(error),
+                        }
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -1115,6 +1611,7 @@ impl Interpreter {
             match self.step(modules) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(_)) => break,
+                Ok(Step::Suspend(_)) => unreachable!("nested module execution cannot suspend"),
                 Err(error) => match self.handle_exception(modules, error, target_depth) {
                     Ok(()) => {}
                     Err(error) => return Err(error),
@@ -1162,7 +1659,18 @@ impl Interpreter {
         for spec in &func.upvalues {
             let frame = self.frames.last().unwrap();
             let cell = if spec.is_local {
-                frame.locals[spec.index as usize].clone()
+                frame
+                    .locals
+                    .get(spec.index as usize)
+                    .cloned()
+                    .or_else(|| {
+                        self.deferred_modules
+                            .as_ref()
+                            .and_then(|graph| graph.locals.get(frame.module_index))
+                            .and_then(|locals| locals.get(spec.index as usize))
+                            .cloned()
+                    })
+                    .expect("captured local must exist in the frame or module environment")
             } else {
                 frame.upvalues[spec.index as usize].clone()
             };
@@ -1275,6 +1783,7 @@ impl Interpreter {
             nf.this = this;
         }
         nf.is_construct = is_construct;
+        nf.superclass = f.superclass.as_deref().cloned();
         self.frames.push(nf);
     }
 
@@ -1598,7 +2107,8 @@ pub(crate) fn eq_strict(a: Value, b: Value) -> bool {
         (Null, Null) | (Undefined, Undefined) => true,
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
         (Function(x), Function(y)) => x.id == y.id,
-        (Symbol(_), _) | (_, Symbol(_)) => false, // symbols compare by identity (TODO)
+        (Symbol(x), Symbol(y)) => x.id == y.id,
+        (Symbol(_), _) | (_, Symbol(_)) => false,
         _ => false,
     }
 }
@@ -1659,6 +2169,10 @@ pub(crate) fn to_string(v: &Value) -> String {
         ValueData::Integer(i) => i.to_string(),
         ValueData::Number(n) => format_number(*n),
         ValueData::String(s) => s.as_str().to_string(),
+        ValueData::Symbol(symbol) => format!(
+            "Symbol({})",
+            symbol.description.as_deref().unwrap_or_default()
+        ),
         ValueData::Object(o) => {
             let b = o.borrow();
             if b.is_exotic_array {
@@ -1773,7 +2287,26 @@ fn get_property_checked(
     obj: &Value,
     key: &Value,
 ) -> Result<Value, js_runtime::value::BindingError> {
+    if let ValueData::Symbol(symbol) = key.data() {
+        let Some(handle) = obj_as_object(obj) else {
+            return Ok(Value::undefined());
+        };
+        let mut current = Some(handle.clone());
+        while let Some(object) = current {
+            let data = object.borrow();
+            if let Some(PropertyDescriptor::Data { value, .. }) =
+                data.symbol_properties.get(&symbol.id)
+            {
+                return Ok(value.clone());
+            }
+            current = data.proto.as_ref().and_then(obj_as_object).cloned();
+        }
+        return Ok(Value::undefined());
+    }
     let name = prop_name(key);
+    if let Some(value) = crate::builtins::native_static_value(obj, &name) {
+        return Ok(value);
+    }
     // Static methods on global constructor functions (Number.isInteger etc.).
     if let Some(nid) = crate::builtins::native_static_id(obj, &name) {
         let mut f = JsFunction::new(name.clone(), 0, 1);
@@ -1850,7 +2383,21 @@ fn is_object_value(value: &Value) -> bool {
 }
 
 /// ECMAScript `HasProperty`: own lookup followed by the prototype chain.
-fn has_property(obj: &Value, key: &Value) -> bool {
+pub(crate) fn has_property(obj: &Value, key: &Value) -> bool {
+    if let ValueData::Symbol(symbol) = key.data() {
+        let Some(handle) = obj_as_object(obj) else {
+            return false;
+        };
+        let mut current = Some(handle.clone());
+        while let Some(object) = current {
+            let data = object.borrow();
+            if data.symbol_properties.contains_key(&symbol.id) {
+                return true;
+            }
+            current = data.proto.as_ref().and_then(obj_as_object).cloned();
+        }
+        return false;
+    }
     let name = prop_name(key);
     if crate::builtins::native_static_id(obj, &name).is_some()
         || crate::builtins::builtin_method_id(obj, &name).is_some()
@@ -1877,10 +2424,24 @@ fn has_property(obj: &Value, key: &Value) -> bool {
 }
 
 /// Delete an own property, respecting its `[[Configurable]]` attribute.
-fn delete_property(obj: &Value, key: &Value) -> bool {
+pub(crate) fn delete_property(obj: &Value, key: &Value) -> bool {
     let Some(handle) = obj_as_object(obj) else {
         return true;
     };
+    if let ValueData::Symbol(symbol) = key.data() {
+        let configurable = match handle.borrow().symbol_properties.get(&symbol.id) {
+            Some(js_runtime::object::PropertyDescriptor::Data { attr, .. })
+            | Some(js_runtime::object::PropertyDescriptor::Accessor { attr, .. }) => {
+                attr.configurable
+            }
+            None => return true,
+        };
+        if configurable {
+            handle.borrow_mut().symbol_properties.remove(&symbol.id);
+            return true;
+        }
+        return false;
+    }
     let name = prop_name(key);
     let configurable = {
         let data = handle.borrow();
@@ -1907,18 +2468,106 @@ fn type_error(message: &str) -> Value {
     crate::builtins::error_ctor(&Value::undefined(), &[Value::string(message)], "TypeError")
 }
 
+fn type_error_named(name: &str, message: &str) -> Value {
+    crate::builtins::error_ctor(&Value::undefined(), &[Value::string(message)], name)
+}
+
 /// `obj[key] = value` for object/array targets.
 pub(crate) fn set_property(obj: &Value, key: &Value, value: Value) {
     let _ = set_property_checked(obj, key, value);
 }
 
-fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bool {
+fn define_accessor(object: &Value, key: &Value, function: Value, getter: bool) {
+    let Some(handle) = obj_as_object(object) else {
+        return;
+    };
+    let name = prop_name(key);
+    let mut data = handle.borrow_mut();
+    let (mut get, mut set) = match data.properties.remove(&name) {
+        Some(js_runtime::object::PropertyDescriptor::Accessor { get, set, .. }) => (get, set),
+        _ => (None, None),
+    };
+    if getter {
+        get = Some(function);
+    } else {
+        set = Some(function);
+    }
+    data.properties.insert(
+        name,
+        js_runtime::object::PropertyDescriptor::Accessor {
+            get,
+            set,
+            attr: js_runtime::object::Attribute::writable(),
+        },
+    );
+}
+
+fn set_constructor_chain(object: &Value, constructor: &Value) {
+    fn collect(value: &Value, identities: &mut Vec<js_runtime::object::ConstructorIdentity>) {
+        let Some(function) = value.as_function() else {
+            return;
+        };
+        let identity = js_runtime::object::ConstructorIdentity {
+            module_index: function.module_index,
+            function_id: function.id,
+            native_id: function.native,
+        };
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+        if let Some(superclass) = &function.superclass {
+            collect(superclass, identities);
+        }
+    }
+
+    let ValueData::Object(object) = object.data() else {
+        return;
+    };
+    collect(constructor, &mut object.borrow_mut().constructor_chain);
+}
+
+fn copy_data_properties(target: &Value, source: &Value) {
+    let (Some(target), Some(source)) = (obj_as_object(target), obj_as_object(source)) else {
+        return;
+    };
+    let properties: Vec<_> = source
+        .borrow()
+        .properties
+        .iter()
+        .filter_map(|(name, descriptor)| match descriptor {
+            js_runtime::object::PropertyDescriptor::Data { value, attr } if attr.enumerable => {
+                Some((name.clone(), value.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut target = target.borrow_mut();
+    for (name, value) in properties {
+        target
+            .properties
+            .insert(name, js_runtime::object::PropertyDescriptor::data(value));
+    }
+}
+
+pub(crate) fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bool {
     let Some(handle) = obj_as_object(obj) else {
         return true; // silently ignore writes to primitives.
     };
     let name = prop_name(key);
     if handle.borrow().module_namespace.is_some() {
         return false;
+    }
+    if let ValueData::Symbol(symbol) = key.data() {
+        if handle.borrow().non_extensible
+            && !handle.borrow().symbol_properties.contains_key(&symbol.id)
+        {
+            return false;
+        }
+        handle.borrow_mut().symbol_properties.insert(
+            symbol.id,
+            js_runtime::object::PropertyDescriptor::data(value),
+        );
+        return true;
     }
     let is_array = handle.borrow().is_exotic_array;
     let new_len = if is_array {

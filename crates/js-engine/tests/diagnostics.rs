@@ -39,7 +39,7 @@ fn bytecode_rejection_is_a_compile_phase_report() {
     let report = engine
         .compile_named(
             "unsupported.js",
-            "class Child extends Parent {}",
+            "function* values() { yield* []; }",
             ProgramKind::Script,
         )
         .err()

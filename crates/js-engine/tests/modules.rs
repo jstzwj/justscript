@@ -259,6 +259,147 @@ fn promise_constructor_resolving_function_feeds_top_level_await() {
 }
 
 #[test]
+fn top_level_await_assimilates_plain_thenables() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        "await { then: function(resolve) { resolve(42); } };",
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert_eq!(integer(&result.value), 42);
+}
+
+#[test]
+fn top_level_await_rejects_when_a_thenable_throws() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+let caught = false;
+try {
+    await { then: function() { throw new RangeError('bad'); } };
+} catch (error) {
+    caught = error instanceof RangeError;
+}
+caught;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+#[test]
+fn promise_reaction_adopts_the_returned_promise() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+let caught = false;
+try {
+    await Promise.resolve().then(function() {
+        return Promise.reject(new RangeError('first'));
+    });
+} catch (error) {
+    caught = error instanceof RangeError;
+}
+caught;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+#[test]
+fn await_expression_in_call_argument_uses_the_resolved_value() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+let thenable = { then: function(resolve) { resolve(42); } };
+assert.sameValue(await thenable, 42);
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    engine.install_test262_harness();
+    engine.run_module("main.js", &loader).unwrap();
+}
+
+#[test]
+fn suspended_async_dependency_does_not_block_a_sibling_module() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("async.js", "check = false; await 0; check = true;");
+    loader.insert("sync.js", "export const observed = check;");
+    loader.insert(
+        "main.js",
+        "import './async.js'; import { observed } from './sync.js'; observed;",
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(false)));
+}
+
+#[test]
+fn async_parent_modules_resume_in_depth_first_evaluation_order() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("async.js", "await 0; order = 'async';");
+    loader.insert("direct-1.js", "import './async.js'; order += ':direct-1';");
+    loader.insert("direct-2.js", "import './async.js'; order += ':direct-2';");
+    loader.insert(
+        "indirect.js",
+        "import './direct-1.js'; order += ':indirect';",
+    );
+    loader.insert(
+        "main.js",
+        r#"
+import './direct-1.js';
+import './direct-2.js';
+import './indirect.js';
+order;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    match result.value.data() {
+        ValueData::String(value) => {
+            assert_eq!(value.as_str(), "async:direct-1:direct-2:indirect")
+        }
+        other => panic!("expected a string, found {other:?}"),
+    }
+}
+
+#[test]
+fn await_can_supply_builtin_constructors_to_new() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+(new (await Number)).valueOf() + ':' +
+(new (await String)).valueOf() + ':' +
+(new (await Boolean)).valueOf() + ':' +
+(new (await Array)).length + ':' +
+(new (await Map)).size + ':' +
+(new (await Set)).size;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    match result.value.data() {
+        ValueData::String(value) => assert_eq!(value.as_str(), "0::false:0:0:0"),
+        other => panic!("expected a string, found {other:?}"),
+    }
+}
+
+#[test]
 fn import_defer_does_not_evaluate_until_namespace_is_observed() {
     let mut loader = MemoryModuleLoader::new();
     loader.insert(

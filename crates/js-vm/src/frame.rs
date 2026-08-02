@@ -40,6 +40,10 @@ pub struct CallFrame {
     pub try_stack: Vec<ActiveTry>,
     /// An exception awaiting re-raise after a `finally` block completes.
     pub pending_throw: Option<Value>,
+    /// Runtime class heritage for derived constructors/methods.
+    pub superclass: Option<Value>,
+    /// Base object initialized by the most recent `super()` call.
+    pub super_base: Option<Value>,
 }
 
 /// A live `try` handler: where to go on a caught exception, and the `finally`
@@ -77,6 +81,8 @@ impl CallFrame {
             generator: None,
             try_stack: Vec::new(),
             pending_throw: None,
+            superclass: None,
+            super_base: None,
         }
     }
 

@@ -47,6 +47,7 @@ fn compile_program_inner(
         loops: Vec::new(),
         scopes: Vec::new(),
         module_function_initializers: Vec::new(),
+        dynamic_import_requests: Vec::new(),
     };
     // <main> is its own (outermost) scope.
     ctx.scopes.push(Scope::default());
@@ -85,6 +86,8 @@ fn compile_program_inner(
         main,
         functions: ctx.functions,
         module_function_initializers: ctx.module_function_initializers,
+        dynamic_import_requests: ctx.dynamic_import_requests,
+        is_module: program.kind == js_syntax::ast::ProgramKind::Module,
     })
 }
 
@@ -349,7 +352,13 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 ctx,
             );
             if let Some(name) = &c.name {
+                if let Some(superclass) = &c.superclass {
+                    compile_expr(superclass, func, ctx);
+                }
                 func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+                if c.superclass.is_some() {
+                    func.emit_bare(Opcode::SetClassHeritage);
+                }
                 let slot = ctx.declare_local(func, name);
                 func.emit(Instruction::new(Opcode::StaLocal, slot));
             }
@@ -399,7 +408,13 @@ fn compile_default_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut Comp
                 func,
                 ctx,
             );
+            if let Some(superclass) = &class.superclass {
+                compile_expr(superclass, func, ctx);
+            }
             func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+            if class.superclass.is_some() {
+                func.emit_bare(Opcode::SetClassHeritage);
+            }
             let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
             func.emit(Instruction::new(Opcode::StaLocal, slot));
         }
@@ -550,12 +565,7 @@ fn compile_class_value(
     func: &mut BytecodeFunction,
     ctx: &mut CompilerCtx,
 ) -> u32 {
-    if let Some(sc) = superclass {
-        ctx.errors.push(Diagnostic::error(
-            sc.span(),
-            "class inheritance (`extends`/`super`) is not supported yet",
-        ));
-    }
+    let _ = superclass;
 
     use js_syntax::ast::expr::{ClassMemberKind, ClassMemberValue};
 
@@ -572,7 +582,7 @@ fn compile_class_value(
     }
 
     // Compile non-static methods (except the constructor) as nested functions.
-    let mut methods: Vec<(js_syntax::ast::pat::PropKey, bool, u32)> = Vec::new();
+    let mut methods: Vec<(js_syntax::ast::pat::PropKey, bool, ClassMemberKind, u32)> = Vec::new();
     for m in members {
         if m.static_ {
             ctx.errors.push(Diagnostic::error(
@@ -602,7 +612,7 @@ fn compile_class_value(
                 func,
                 ctx,
             );
-            methods.push((m.key.clone(), m.computed, id));
+            methods.push((m.key.clone(), m.computed, m.kind, id));
         }
     }
 
@@ -658,12 +668,16 @@ fn compile_class_value(
         }
     }
     // Method assignments: `this.m = <fn>`.
-    for (key, computed, mid) in &methods {
+    for (key, computed, kind, mid) in &methods {
         ctor.emit(Instruction::new(Opcode::LdaFunction, *mid as u16)); // [fn]
         ctor.emit_bare(Opcode::Dup); // [fn, fn]
         ctor.emit_bare(Opcode::LdaThis); // [fn, fn, this]
         compile_prop_key_push(key, *computed, &mut ctor, ctx); // [fn, fn, this, key]
-        ctor.emit_bare(Opcode::SetProp); // [fn]
+        ctor.emit_bare(match kind {
+            ClassMemberKind::Get => Opcode::DefineGetter,
+            ClassMemberKind::Set => Opcode::DefineSetter,
+            _ => Opcode::SetProp,
+        }); // [fn]
         ctor.emit_bare(Opcode::Pop);
     }
 
@@ -833,22 +847,48 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Object { props, .. } => {
             func.emit_bare(Opcode::NewObject);
             for p in props {
-                let value_expr = match &p.value {
-                    ObjectPropValue::Expr(e) => e,
-                    ObjectPropValue::Method(_) | ObjectPropValue::Spread(_) => {
-                        ctx.errors.push(Diagnostic::error(
-                            p.span,
-                            "object methods/spread are not supported in the bytecode VM yet",
-                        ));
-                        continue;
+                match &p.value {
+                    ObjectPropValue::Spread(source) => {
+                        compile_expr(source, func, ctx);
+                        func.emit_bare(Opcode::CopyDataProperties);
                     }
-                };
-                // SetProp order is [value, obj, key]; we want to keep `obj`.
-                func.emit_bare(Opcode::Dup); // [obj, obj]
-                compile_expr(value_expr, func, ctx); // [obj, obj, value]
-                func.emit_bare(Opcode::Swap);
-                compile_prop_key_push(&p.key, p.computed, func, ctx); // [obj, value, obj, key]
-                func.emit_bare(Opcode::SetProp); // [obj]
+                    ObjectPropValue::Expr(value) => {
+                        func.emit_bare(Opcode::Dup);
+                        compile_expr(value, func, ctx);
+                        func.emit_bare(Opcode::Swap);
+                        compile_prop_key_push(&p.key, p.computed, func, ctx);
+                        func.emit_bare(Opcode::SetProp);
+                    }
+                    ObjectPropValue::Method(method) => {
+                        let name = match &p.key {
+                            js_syntax::ast::pat::PropKey::Ident(name)
+                            | js_syntax::ast::pat::PropKey::String(name)
+                            | js_syntax::ast::pat::PropKey::Private(name) => Some(name.as_str()),
+                            _ => None,
+                        };
+                        let id = compile_function_value(
+                            method.span,
+                            name,
+                            &method.params,
+                            FunctionBody::Block(&method.body),
+                            false,
+                            method.is_async,
+                            method.is_generator,
+                            func,
+                            ctx,
+                        );
+                        func.emit_bare(Opcode::Dup);
+                        func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+                        func.emit_bare(Opcode::Swap);
+                        compile_prop_key_push(&p.key, p.computed, func, ctx);
+                        let opcode = match p.kind {
+                            js_syntax::ast::expr::ObjectPropKind::Get => Opcode::DefineGetter,
+                            js_syntax::ast::expr::ObjectPropKind::Set => Opcode::DefineSetter,
+                            js_syntax::ast::expr::ObjectPropKind::Init => Opcode::SetProp,
+                        };
+                        func.emit_bare(opcode);
+                    }
+                }
             }
         }
         Expr::Member(m) => {
@@ -909,9 +949,14 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     if *op == AssignOp::Assign {
                         compile_expr(right, func, ctx); // [v]
                         func.emit_bare(Opcode::Dup); // [v, v]
-                        compile_expr(&m.object, func, ctx); // [v, v, obj]
-                        compile_member_key_push(&m.property, func, ctx); // [v, v, obj, key]
-                        func.emit_bare(Opcode::SetProp); // [v]
+                        if matches!(m.object.as_ref(), Expr::Super(_)) {
+                            compile_member_key_push(&m.property, func, ctx);
+                            func.emit_bare(Opcode::SetSuperProp);
+                        } else {
+                            compile_expr(&m.object, func, ctx); // [v, v, obj]
+                            compile_member_key_push(&m.property, func, ctx); // [v, v, obj, key]
+                            func.emit_bare(Opcode::SetProp); // [v]
+                        }
                     } else {
                         // Compound: load current, apply op, store, keep result.
                         compile_expr(&m.object, func, ctx); // [obj]
@@ -939,6 +984,23 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Call(call) => {
             // Method call `obj.m(args)` / `obj[k](args)`: keep `obj` as `this`.
             match call.callee.as_ref() {
+                Expr::Super(_) => {
+                    let mut count = 0u16;
+                    for argument in &call.args {
+                        match argument {
+                            CallArg::Expr(expression) => compile_expr(expression, func, ctx),
+                            CallArg::Spread(_) => {
+                                ctx.errors.push(Diagnostic::error(
+                                    expr.span(),
+                                    "spread arguments are not supported yet",
+                                ));
+                                func.emit_bare(Opcode::LdaUndefined);
+                            }
+                        }
+                        count += 1;
+                    }
+                    func.emit(Instruction::new(Opcode::CallSuper, count));
+                }
                 Expr::Member(m) => {
                     compile_expr(&m.object, func, ctx); // [obj]
                     func.emit_bare(Opcode::Dup); // [obj, obj]
@@ -1013,7 +1075,13 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 func,
                 ctx,
             );
+            if let Some(superclass) = &c.superclass {
+                compile_expr(superclass, func, ctx);
+            }
             func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+            if c.superclass.is_some() {
+                func.emit_bare(Opcode::SetClassHeritage);
+            }
         }
         Expr::This { .. } => func.emit_bare(Opcode::LdaThis),
         // The VM does not expose a new-target register yet. Preserve the
@@ -1039,6 +1107,15 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Await { arg, .. } => {
             compile_expr(arg, func, ctx);
             func.emit_bare(Opcode::Await);
+        }
+        Expr::ImportCall { source, .. } => {
+            if let Expr::Lit(Lit::String(_, specifier, _)) = source.as_ref() {
+                if !ctx.dynamic_import_requests.contains(specifier) {
+                    ctx.dynamic_import_requests.push(specifier.clone());
+                }
+            }
+            compile_expr(source, func, ctx);
+            func.emit_bare(Opcode::DynamicImport);
         }
         Expr::Regex { pattern, flags, .. } => {
             let combined = format!("{}\0{}", pattern, flags);
@@ -1779,6 +1856,7 @@ struct CompilerCtx {
     constants: ConstantPool,
     functions: Vec<BytecodeFunction>,
     module_function_initializers: Vec<(u16, u32)>,
+    dynamic_import_requests: Vec<String>,
     errors: Vec<Diagnostic>,
     /// Stack of enclosing loops/switches for `break`/`continue`. Each frame
     /// records forward-jump placeholders to patch at loop exit: `breaks` → after

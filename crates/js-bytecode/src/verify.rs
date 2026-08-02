@@ -10,7 +10,7 @@ use std::fmt;
 
 /// Version of the in-memory bytecode contract. This is intentionally separate
 /// from any future serialized file-format version.
-pub const BYTECODE_FORMAT_VERSION: u32 = 1;
+pub const BYTECODE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifyError {

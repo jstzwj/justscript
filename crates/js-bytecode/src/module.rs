@@ -134,6 +134,10 @@ pub struct BytecodeModule {
     /// Top-level function declarations initialized during ModuleDeclaration-
     /// Instantiation, before any module body starts evaluating.
     pub module_function_initializers: Vec<(u16, u32)>,
+    /// Literal dynamic-import specifiers discovered during lowering. The host
+    /// preloads these module records without evaluating them.
+    pub dynamic_import_requests: Vec<String>,
+    pub is_module: bool,
 }
 
 impl BytecodeModule {
@@ -144,6 +148,8 @@ impl BytecodeModule {
             main,
             functions: Vec::new(),
             module_function_initializers: Vec::new(),
+            dynamic_import_requests: Vec::new(),
+            is_module: false,
         }
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::config::{EngineConfig, ExecutionMode};
 use crate::module::{
-    analyze_module, fresh_module_cells, CompiledModule, ExportEntry, ImportedName, ModuleError,
-    ModuleGraph, ModuleLoader, ModuleStatus, RuntimeModule,
+    analyze_module, fresh_module_cells, CompiledModule, DynamicResolution, ExportEntry,
+    ImportedName, ModuleError, ModuleGraph, ModuleLoader, ModuleStatus, RuntimeModule,
 };
 use js_diagnostics::DiagnosticReport;
 use js_runtime::context::RealmContext;
@@ -177,6 +177,11 @@ impl Engine {
         let entry_index = self.load_module_graph(loader, &entry_key, &mut graph)?;
         instantiate_module_functions(&mut graph)?;
         link_module(&mut graph, entry_index).map_err(EngineError::Module)?;
+        for index in 0..graph.modules.len() {
+            if graph.modules[index].status == ModuleStatus::Unlinked {
+                link_module(&mut graph, index).map_err(EngineError::Module)?;
+            }
+        }
         materialize_namespaces(&mut graph)?;
 
         // Keep bytecode owners separate from mutable graph state while the VM
@@ -207,7 +212,26 @@ impl Engine {
             })
             .collect();
         interpreter.configure_module_graph(module_locals, module_dependencies);
-        let value = evaluate_module(&mut graph, entry_index, &bytecodes, &mut interpreter)?;
+        let dynamic_imports = graph
+            .modules
+            .iter()
+            .map(|module| {
+                module
+                    .dynamic_dependencies
+                    .iter()
+                    .map(|(specifier, resolution)| {
+                        let resolution = match resolution {
+                            DynamicResolution::Resolved(index) => Ok(*index),
+                            DynamicResolution::Unresolved(message) => Err(message.clone()),
+                        };
+                        (specifier.clone(), resolution)
+                    })
+                    .collect()
+            })
+            .collect();
+        interpreter.configure_dynamic_imports(dynamic_imports);
+        let value =
+            ModuleEvaluator::new(&mut graph, &bytecodes, &mut interpreter).evaluate(entry_index)?;
         Ok(RunResult {
             value,
             mode: self.config.mode,
@@ -235,6 +259,7 @@ impl Engine {
         );
         let metadata = analyze_module(&compiled).map_err(EngineError::Module)?;
         let requests = metadata.requests.clone();
+        let dynamic_requests = metadata.dynamic_requests.clone();
         let index = graph.modules.len();
         graph.by_key.insert(key.to_string(), index);
         let namespace = Value::object(js_runtime::object::ObjectData::module_namespace(
@@ -246,10 +271,17 @@ impl Engine {
             compiled,
             metadata,
             dependencies: Default::default(),
+            dynamic_dependencies: Default::default(),
             namespace: Some(namespace.clone()),
             namespace_cell: js_runtime::value::Cell::initialized(namespace, false),
             deferred_namespace: None,
             status: ModuleStatus::Unlinked,
+            pending_async_dependencies: 0,
+            async_parent_modules: Vec::new(),
+            async_evaluation_order: None,
+            evaluation_value: None,
+            evaluation_error: None,
+            dynamic_import_waiters: Vec::new(),
         });
 
         for request in requests {
@@ -272,6 +304,18 @@ impl Engine {
             graph.modules[index]
                 .dependencies
                 .insert(request.specifier, dependency);
+        }
+        for specifier in dynamic_requests {
+            let resolution = match loader.resolve(Some(key), &specifier) {
+                Ok(resolved) => match self.load_module_graph(loader, &resolved, graph) {
+                    Ok(dependency) => DynamicResolution::Resolved(dependency),
+                    Err(error) => DynamicResolution::Unresolved(error.to_string()),
+                },
+                Err(message) => DynamicResolution::Unresolved(message),
+            };
+            graph.modules[index]
+                .dynamic_dependencies
+                .insert(specifier, resolution);
         }
         Ok(index)
     }
@@ -652,62 +696,299 @@ fn collect_export_names(
     }
 }
 
-fn evaluate_module(
-    graph: &mut ModuleGraph,
-    index: usize,
-    bytecodes: &[&js_bytecode::BytecodeModule],
-    interpreter: &mut js_vm::Interpreter,
-) -> Result<Value, EngineError> {
-    match graph.modules[index].status {
-        ModuleStatus::Evaluated => return Ok(Value::undefined()),
-        ModuleStatus::Evaluating | ModuleStatus::EvaluatingAsync => return Ok(Value::undefined()),
-        ModuleStatus::Linked => {}
-        ModuleStatus::Errored => {
-            return Err(EngineError::Module(ModuleError::Link {
-                module: graph.modules[index].key.clone(),
-                message: "module is already in an errored state".into(),
-            }))
-        }
-        other => {
-            return Err(EngineError::Module(ModuleError::Link {
-                module: graph.modules[index].key.clone(),
-                message: format!("cannot evaluate module in state {other:?}"),
-            }))
+struct ModuleEvaluator<'a, 'b> {
+    graph: &'a mut ModuleGraph,
+    bytecodes: &'b [&'b js_bytecode::BytecodeModule],
+    interpreter: &'a mut js_vm::Interpreter,
+    next_async_order: u64,
+}
+
+impl<'a, 'b> ModuleEvaluator<'a, 'b> {
+    fn new(
+        graph: &'a mut ModuleGraph,
+        bytecodes: &'b [&'b js_bytecode::BytecodeModule],
+        interpreter: &'a mut js_vm::Interpreter,
+    ) -> Self {
+        Self {
+            graph,
+            bytecodes,
+            interpreter,
+            next_async_order: 0,
         }
     }
-    graph.modules[index].status = if graph.modules[index].metadata.has_top_level_await {
-        ModuleStatus::EvaluatingAsync
-    } else {
-        ModuleStatus::Evaluating
-    };
-    let dependency_order: Vec<_> = graph.modules[index]
-        .metadata
-        .requests
-        .iter()
-        .filter(|request| request.phase == js_syntax::ImportPhase::Eval)
-        .filter_map(|request| {
-            graph.modules[index]
-                .dependencies
-                .get(&request.specifier)
-                .copied()
-        })
-        .collect();
-    for dependency in dependency_order {
-        if let Err(error) = evaluate_module(graph, dependency, bytecodes, interpreter) {
-            graph.modules[index].status = ModuleStatus::Errored;
-            return Err(error);
+
+    fn evaluate(&mut self, entry: usize) -> Result<Value, EngineError> {
+        self.inner_evaluation(entry)?;
+        loop {
+            let mut progressed = self.process_dynamic_imports()?;
+            progressed |= self.interpreter.has_promise_jobs();
+            self.interpreter
+                .run_promise_jobs_report(self.bytecodes, entry)
+                .map_err(EngineError::from)?;
+            let mut ready: Vec<_> = self
+                .graph
+                .modules
+                .iter()
+                .enumerate()
+                .filter(|(index, module)| {
+                    module.status == ModuleStatus::EvaluatingAsync
+                        && self.interpreter.module_is_ready(*index)
+                })
+                .map(|(index, module)| (module.async_evaluation_order.unwrap_or(u64::MAX), index))
+                .collect();
+            ready.sort_unstable();
+            for (_, index) in ready {
+                if self.graph.modules[index].status != ModuleStatus::EvaluatingAsync
+                    || !self.interpreter.module_is_ready(index)
+                {
+                    continue;
+                }
+                progressed = true;
+                let outcome = self
+                    .interpreter
+                    .resume_module_in_graph_report(self.bytecodes, index);
+                match outcome {
+                    Ok(js_vm::ModuleExecution::Completed(value)) => {
+                        self.complete_module(index, value)?;
+                    }
+                    Ok(js_vm::ModuleExecution::Suspended) => {}
+                    Err(error) => self.fail_module(index, EngineError::from(error))?,
+                }
+            }
+
+            if self.graph.modules[entry].status == ModuleStatus::Evaluated
+                && !self.interpreter.has_dynamic_import_requests()
+                && !self.interpreter.has_promise_jobs()
+                && !self
+                    .graph
+                    .modules
+                    .iter()
+                    .any(|module| !module.dynamic_import_waiters.is_empty())
+            {
+                return Ok(self.graph.modules[entry]
+                    .evaluation_value
+                    .clone()
+                    .unwrap_or_else(Value::undefined));
+            }
+
+            if !progressed {
+                return Err(EngineError::Module(ModuleError::Unsupported {
+                    module: self.graph.modules[entry].key.clone(),
+                    feature: "top-level await is pending with no runnable PromiseJobs".into(),
+                }));
+            }
         }
     }
-    let locals = graph.modules[index].locals.clone();
-    match interpreter.run_module_in_graph_report(bytecodes, index, locals) {
-        Ok(value) => {
-            graph.modules[index].status = ModuleStatus::Evaluated;
-            interpreter.mark_module_evaluated(index);
-            Ok(value)
+
+    fn process_dynamic_imports(&mut self) -> Result<bool, EngineError> {
+        let requests = self.interpreter.take_dynamic_import_requests();
+        let progressed = !requests.is_empty();
+        for request in requests {
+            let target = match request.resolution {
+                Ok(target) => target,
+                Err(message) => {
+                    let reason = js_vm::builtins::error_ctor(
+                        &Value::undefined(),
+                        &[Value::string(message)],
+                        "TypeError",
+                    );
+                    self.interpreter
+                        .reject_host_promise(request.promise, reason);
+                    continue;
+                }
+            };
+            match self.graph.modules[target].status {
+                ModuleStatus::Evaluated => {
+                    let namespace = self.graph.modules[target]
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(Value::undefined);
+                    self.interpreter
+                        .resolve_host_promise_report(
+                            self.bytecodes,
+                            target,
+                            request.promise,
+                            namespace,
+                        )
+                        .map_err(EngineError::from)?;
+                }
+                ModuleStatus::Errored => {
+                    let reason = self.graph.modules[target]
+                        .evaluation_error
+                        .clone()
+                        .unwrap_or_else(|| {
+                            js_vm::builtins::error_ctor(
+                                &Value::undefined(),
+                                &[Value::string("dynamic module evaluation failed")],
+                                "TypeError",
+                            )
+                        });
+                    self.interpreter
+                        .reject_host_promise(request.promise, reason);
+                }
+                _ => {
+                    self.graph.modules[target]
+                        .dynamic_import_waiters
+                        .push(request.promise);
+                    if self.graph.modules[target].status == ModuleStatus::Linked {
+                        if let Err(error) = self.inner_evaluation(target) {
+                            self.fail_module(target, error)?;
+                        }
+                    }
+                }
+            }
         }
-        Err(error) => {
-            graph.modules[index].status = ModuleStatus::Errored;
-            Err(EngineError::from(error))
+        Ok(progressed)
+    }
+
+    fn fail_module(&mut self, index: usize, error: EngineError) -> Result<(), EngineError> {
+        let reason = match error {
+            EngineError::Exception(exception) => exception.value,
+            other => return Err(other),
+        };
+        self.graph.modules[index].status = ModuleStatus::Errored;
+        self.graph.modules[index].evaluation_error = Some(reason.clone());
+        let waiters = std::mem::take(&mut self.graph.modules[index].dynamic_import_waiters);
+        if waiters.is_empty() {
+            return Err(EngineError::Exception(js_vm::JsException {
+                value: reason,
+                source: self.graph.modules[index].compiled.source.clone().into(),
+                stack: Vec::new(),
+            }));
+        }
+        for promise in waiters {
+            self.interpreter
+                .reject_host_promise(promise, reason.clone());
+        }
+        Ok(())
+    }
+
+    fn inner_evaluation(&mut self, index: usize) -> Result<(), EngineError> {
+        match self.graph.modules[index].status {
+            ModuleStatus::Evaluated | ModuleStatus::Evaluating | ModuleStatus::EvaluatingAsync => {
+                return Ok(())
+            }
+            ModuleStatus::Linked => {}
+            ModuleStatus::Errored => {
+                return Err(EngineError::Module(ModuleError::Link {
+                    module: self.graph.modules[index].key.clone(),
+                    message: "module is already in an errored state".into(),
+                }))
+            }
+            other => {
+                return Err(EngineError::Module(ModuleError::Link {
+                    module: self.graph.modules[index].key.clone(),
+                    message: format!("cannot evaluate module in state {other:?}"),
+                }))
+            }
+        }
+        self.graph.modules[index].status = ModuleStatus::Evaluating;
+
+        let mut seen = HashSet::new();
+        let dependency_order: Vec<_> = self.graph.modules[index]
+            .metadata
+            .requests
+            .iter()
+            .filter(|request| request.phase == js_syntax::ImportPhase::Eval)
+            .filter_map(|request| {
+                self.graph.modules[index]
+                    .dependencies
+                    .get(&request.specifier)
+                    .copied()
+            })
+            .filter(|dependency| seen.insert(*dependency))
+            .collect();
+        for dependency in dependency_order {
+            self.inner_evaluation(dependency)?;
+            if self.graph.modules[dependency].status == ModuleStatus::EvaluatingAsync {
+                self.graph.modules[index].pending_async_dependencies += 1;
+                if !self.graph.modules[dependency]
+                    .async_parent_modules
+                    .contains(&index)
+                {
+                    self.graph.modules[dependency]
+                        .async_parent_modules
+                        .push(index);
+                }
+            }
+        }
+
+        if self.graph.modules[index].pending_async_dependencies == 0 {
+            self.start_module(index)
+        } else {
+            self.mark_async(index);
+            Ok(())
+        }
+    }
+
+    fn start_module(&mut self, index: usize) -> Result<(), EngineError> {
+        let locals = self.graph.modules[index].locals.clone();
+        match self
+            .interpreter
+            .start_module_in_graph_report(self.bytecodes, index, locals)
+            .map_err(EngineError::from)?
+        {
+            js_vm::ModuleExecution::Completed(value) => self.complete_module(index, value),
+            js_vm::ModuleExecution::Suspended => {
+                self.mark_async(index);
+                Ok(())
+            }
+        }
+    }
+
+    fn mark_async(&mut self, index: usize) {
+        self.graph.modules[index].status = ModuleStatus::EvaluatingAsync;
+        if self.graph.modules[index].async_evaluation_order.is_none() {
+            self.graph.modules[index].async_evaluation_order = Some(self.next_async_order);
+            self.next_async_order += 1;
+        }
+    }
+
+    fn complete_module(&mut self, index: usize, value: Value) -> Result<(), EngineError> {
+        self.graph.modules[index].status = ModuleStatus::Evaluated;
+        self.graph.modules[index].evaluation_value = Some(value);
+        self.interpreter.mark_module_evaluated(index);
+
+        let namespace = self.graph.modules[index]
+            .namespace
+            .clone()
+            .unwrap_or_else(Value::undefined);
+        let waiters = std::mem::take(&mut self.graph.modules[index].dynamic_import_waiters);
+        for promise in waiters {
+            self.interpreter
+                .resolve_host_promise_report(self.bytecodes, index, promise, namespace.clone())
+                .map_err(EngineError::from)?;
+        }
+
+        let mut available = Vec::new();
+        self.gather_available_ancestors(index, &mut available);
+        available.sort_by_key(|parent| {
+            self.graph.modules[*parent]
+                .async_evaluation_order
+                .unwrap_or(u64::MAX)
+        });
+        for parent in available {
+            if self.graph.modules[parent].status == ModuleStatus::EvaluatingAsync
+                && self.graph.modules[parent].pending_async_dependencies == 0
+            {
+                self.start_module(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn gather_available_ancestors(&mut self, index: usize, available: &mut Vec<usize>) {
+        let parents = std::mem::take(&mut self.graph.modules[index].async_parent_modules);
+        for parent in parents {
+            let pending = &mut self.graph.modules[parent].pending_async_dependencies;
+            *pending = pending.saturating_sub(1);
+            if *pending == 0
+                && self.graph.modules[parent].status == ModuleStatus::EvaluatingAsync
+                && !available.contains(&parent)
+            {
+                available.push(parent);
+                self.gather_available_ancestors(parent, available);
+            }
         }
     }
 }

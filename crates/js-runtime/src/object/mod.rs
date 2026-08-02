@@ -24,6 +24,13 @@ use std::rc::Rc;
 /// A shared, mutable handle to an object on the (future) GC heap.
 pub type JsObject = Rc<RefCell<ObjectData>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConstructorIdentity {
+    pub module_index: u32,
+    pub function_id: u32,
+    pub native_id: Option<u16>,
+}
+
 #[derive(Clone, Debug)]
 pub enum PromiseState {
     Pending,
@@ -54,6 +61,7 @@ pub struct ObjectData {
     /// Slow-path / dictionary-mode properties, used when an object transitions
     /// to "dictionary mode" or stores accessors / non-standard attributes.
     pub properties: HashMap<String, PropertyDescriptor>,
+    pub symbol_properties: HashMap<u64, PropertyDescriptor>,
     /// The internal prototype (`[[Prototype]]`), or `None` for the null proto.
     pub proto: Option<Value>,
     /// The object's class name (`[[Class]]`), e.g. `"Object"`, `"Array"`.
@@ -62,6 +70,8 @@ pub struct ObjectData {
     pub is_exotic_array: bool,
     /// True for callable objects.
     pub callable: bool,
+    /// Ordinary objects start extensible; namespace objects set this false.
+    pub non_extensible: bool,
     /// Sorted live bindings exposed by a Module Namespace Exotic Object.
     /// Presence identifies the exotic object; namespace objects have a null
     /// prototype and are non-extensible at the VM object-operation boundary.
@@ -71,6 +81,8 @@ pub struct ObjectData {
     pub deferred_module: Option<usize>,
     /// `Some` only for Promise instances.
     pub promise: Option<PromiseData>,
+    /// Constructor and inherited constructors used by `instanceof`.
+    pub constructor_chain: Vec<ConstructorIdentity>,
 }
 
 impl ObjectData {
@@ -100,6 +112,14 @@ impl ObjectData {
         object.class = "Module";
         object.module_namespace = Some(exports);
         object.deferred_module = deferred_module;
+        object.non_extensible = true;
+        object.symbol_properties.insert(
+            crate::value::JsSymbol::to_string_tag().id,
+            PropertyDescriptor::Data {
+                value: Value::string("Module"),
+                attr: Attribute::read_only(),
+            },
+        );
         Rc::new(RefCell::new(object))
     }
 

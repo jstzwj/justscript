@@ -16,5 +16,5 @@ pub mod stack;
 
 pub use error::{EngineFault, JsException, RuntimeError, RuntimeFrame};
 pub use frame::CallFrame;
-pub use interp::{InterpError, Interpreter};
+pub use interp::{DynamicImportRequest, InterpError, Interpreter, ModuleExecution};
 pub use stack::OperandStack;

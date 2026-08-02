@@ -49,6 +49,8 @@ pub enum Opcode {
     LdaFalse,
     /// Push a function value (function-table index `operand`).
     LdaFunction,
+    /// Stack `[superclass, class]` -> `[class]` and records class heritage.
+    SetClassHeritage,
     /// Push the current `this` binding.
     LdaThis,
     /// Load captured upvalue slot `operand` and push it.
@@ -106,8 +108,8 @@ pub enum Opcode {
     /// `yield` (generator): pop the yielded value, suspend the frame, push the
     /// value passed to the next `.next(v)` onto resumption.
     Yield,
-    /// `await`: perform Promise resolution and a job-queue checkpoint, then
-    /// push the fulfilled value or throw the rejection reason.
+    /// `await`: perform Promise resolution and suspend a top-level module;
+    /// resumption pushes the fulfillment or throws the rejection reason.
     Await,
     /// `throw expr` (pops a value): raise it as an exception.
     Throw,
@@ -137,10 +139,19 @@ pub enum Opcode {
     CallMethod,
     /// `new` call with `operand` args.
     New,
+    /// Call the current derived constructor's superclass.
+    CallSuper,
+    /// Set a property through the current method's super base.
+    SetSuperProp,
     /// Pop object + key, push the property.
     GetProp,
     /// Pop value + key + object.
     SetProp,
+    /// Define an accessor. Stack input is `[function, object, key]`.
+    DefineGetter,
+    DefineSetter,
+    /// Stack `[target, source]` -> `[target]`, copying enumerable own properties.
+    CopyDataProperties,
     /// Delete an own property. Stack input is `[object, key]`; pushes a bool.
     DeleteProp,
     /// Delete an unqualified global reference named by a string constant.
@@ -153,6 +164,8 @@ pub enum Opcode {
     GetGlobal,
     /// Set the named global `operand`.
     SetGlobal,
+    /// Pop a module specifier and push the host's dynamic-import Promise.
+    DynamicImport,
 
     // --- bookkeeping ----------------------------------------------------
     /// No-op / padding.
@@ -195,7 +208,11 @@ impl Opcode {
             Opcode::LdaUpvalue | Opcode::StaUpvalue => Upvalue,
             Opcode::LdaFunction => Function,
             Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => JumpTarget,
-            Opcode::Call | Opcode::CallMethod | Opcode::New | Opcode::NewArray => ArgumentCount,
+            Opcode::Call
+            | Opcode::CallMethod
+            | Opcode::New
+            | Opcode::CallSuper
+            | Opcode::NewArray => ArgumentCount,
             Opcode::TryBegin => Handler,
             _ => None,
         }
