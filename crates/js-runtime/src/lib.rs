@@ -16,6 +16,9 @@ pub mod realm;
 pub mod value;
 
 pub use context::{ExecutionContext, RealmContext};
-pub use object::{JsObject, Object, ObjectData, PropertyDescriptor, Shape};
+pub use object::{
+    JsObject, Object, ObjectData, PromiseData, PromiseReaction, PromiseState, PropertyDescriptor,
+    Shape,
+};
 pub use realm::Realm;
-pub use value::{JsBigInt, JsFunction, JsString, JsSymbol, Value, ValueData};
+pub use value::{BindingError, Cell, JsBigInt, JsFunction, JsString, JsSymbol, Value, ValueData};

@@ -4,8 +4,18 @@
 //! into a [`SourceFile`]), and a [`Span`] is a half-open byte range that can be
 //! resolved back to a line/column [`Loc`] for diagnostics.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Stable identity of one source inside a [`SourceMap`].
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct SourceId(pub u32);
+
+impl SourceId {
+    /// Sources constructed outside a map retain this sentinel identity.
+    pub const UNKNOWN: SourceId = SourceId(u32::MAX);
+}
 
 /// A byte offset into a source file.
 ///
@@ -115,6 +125,8 @@ impl Loc {
 /// and resolve [`Span`]s against it for diagnostics.
 #[derive(Clone, Debug)]
 pub struct SourceFile {
+    /// Stable identity within the owning [`SourceMap`].
+    pub id: SourceId,
     /// File name as given (e.g. `"repl"` or a real path).
     pub name: String,
     /// The full source text.
@@ -127,6 +139,10 @@ pub struct SourceFile {
 impl SourceFile {
     /// Build a source file from a name + text, precomputing line starts.
     pub fn new(name: impl Into<String>, src: impl Into<Arc<str>>) -> SourceFile {
+        SourceFile::with_id(SourceId::UNKNOWN, name, src)
+    }
+
+    pub fn with_id(id: SourceId, name: impl Into<String>, src: impl Into<Arc<str>>) -> SourceFile {
         let src = src.into();
         let mut line_starts = vec![BytePos::ZERO];
         for (i, b) in src.bytes().enumerate() {
@@ -135,6 +151,7 @@ impl SourceFile {
             }
         }
         SourceFile {
+            id,
             name: name.into(),
             src,
             line_starts,
@@ -167,6 +184,46 @@ impl SourceFile {
     }
 }
 
+/// Owns every source participating in one compilation/execution session.
+#[derive(Default)]
+pub struct SourceMap {
+    files: Vec<Arc<SourceFile>>,
+    latest_by_name: HashMap<String, SourceId>,
+}
+
+impl SourceMap {
+    pub fn new() -> SourceMap {
+        SourceMap::default()
+    }
+
+    /// Register a source snapshot. Reusing a name creates a new identity so
+    /// diagnostics never accidentally resolve old spans against new text.
+    pub fn add(&mut self, name: impl Into<String>, src: impl Into<Arc<str>>) -> Arc<SourceFile> {
+        let name = name.into();
+        let id = SourceId(self.files.len() as u32);
+        let file = Arc::new(SourceFile::with_id(id, name.clone(), src));
+        self.files.push(file.clone());
+        self.latest_by_name.insert(name, id);
+        file
+    }
+
+    pub fn get(&self, id: SourceId) -> Option<Arc<SourceFile>> {
+        self.files.get(id.0 as usize).cloned()
+    }
+
+    pub fn latest(&self, name: &str) -> Option<Arc<SourceFile>> {
+        self.latest_by_name.get(name).and_then(|id| self.get(*id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +242,16 @@ mod tests {
         let src = "hello world";
         let span = Span::new(BytePos(6), BytePos(11));
         assert_eq!(span.snippet(src), Some("world"));
+    }
+
+    #[test]
+    fn source_map_assigns_stable_snapshot_ids() {
+        let mut map = SourceMap::new();
+        let first = map.add("module.js", Arc::<str>::from("export const x = 1;"));
+        let second = map.add("module.js", Arc::<str>::from("export const x = 2;"));
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(map.get(first.id).unwrap().src.as_ref(), first.src.as_ref());
+        assert_eq!(map.latest("module.js").unwrap().id, second.id);
     }
 }

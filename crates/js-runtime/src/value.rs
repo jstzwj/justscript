@@ -9,10 +9,111 @@
 
 use crate::object::JsObject;
 use std::cell::RefCell;
+use std::fmt;
 use std::rc::Rc;
 
-/// A shared, mutable local-variable cell, captured by closures.
-pub type Cell = Rc<RefCell<Value>>;
+/// A shared ECMAScript binding cell, captured by closures and module imports.
+///
+/// An indirect cell is a read-only view of another binding. This models module
+/// import bindings without making the exporting binding itself immutable.
+#[derive(Clone)]
+pub struct Cell(Rc<BindingCell>);
+
+enum BindingCell {
+    Direct(RefCell<BindingState>),
+    Indirect(Cell),
+}
+
+struct BindingState {
+    value: Option<Value>,
+    mutable: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BindingError {
+    Uninitialized,
+    Immutable,
+}
+
+impl Cell {
+    pub fn initialized(value: Value, mutable: bool) -> Self {
+        Self(Rc::new(BindingCell::Direct(RefCell::new(BindingState {
+            value: Some(value),
+            mutable,
+        }))))
+    }
+
+    pub fn mutable(value: Value) -> Self {
+        Self::initialized(value, true)
+    }
+
+    pub fn uninitialized(mutable: bool) -> Self {
+        Self(Rc::new(BindingCell::Direct(RefCell::new(BindingState {
+            value: None,
+            mutable,
+        }))))
+    }
+
+    pub fn immutable_import(target: Cell) -> Self {
+        Self(Rc::new(BindingCell::Indirect(target)))
+    }
+
+    pub fn get(&self) -> Result<Value, BindingError> {
+        match self.0.as_ref() {
+            BindingCell::Direct(state) => state
+                .borrow()
+                .value
+                .clone()
+                .ok_or(BindingError::Uninitialized),
+            BindingCell::Indirect(target) => target.get(),
+        }
+    }
+
+    /// Initialize an uninitialized direct binding, or assign an initialized
+    /// mutable binding. Indirect import bindings are always immutable.
+    pub fn set(&self, value: Value) -> Result<(), BindingError> {
+        match self.0.as_ref() {
+            BindingCell::Direct(state) => {
+                let mut state = state.borrow_mut();
+                if state.value.is_none() {
+                    state.value = Some(value);
+                    return Ok(());
+                }
+                if !state.mutable {
+                    return Err(BindingError::Immutable);
+                }
+                state.value = Some(value);
+                Ok(())
+            }
+            BindingCell::Indirect(_) => Err(BindingError::Immutable),
+        }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        match self.0.as_ref() {
+            BindingCell::Direct(state) => state.borrow().value.is_some(),
+            BindingCell::Indirect(target) => target.is_initialized(),
+        }
+    }
+
+    pub fn ptr_eq(left: &Cell, right: &Cell) -> bool {
+        match (left.0.as_ref(), right.0.as_ref()) {
+            (BindingCell::Indirect(left), _) => Cell::ptr_eq(left, right),
+            (_, BindingCell::Indirect(right)) => Cell::ptr_eq(left, right),
+            _ => Rc::ptr_eq(&left.0, &right.0),
+        }
+    }
+}
+
+impl fmt::Debug for Cell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.get() {
+            Ok(value) => f.debug_tuple("Cell").field(&value).finish(),
+            Err(BindingError::Uninitialized) => f.write_str("Cell(<uninitialized>)"),
+            Err(BindingError::Immutable) => unreachable!(),
+        }
+    }
+}
 
 /// An opaque, cheaply-clonable JavaScript value.
 ///
@@ -156,6 +257,7 @@ pub enum ValueData {
 /// be a `Value` variant; the VM converts to/from its `CallFrame` on resume.
 #[derive(Debug)]
 pub struct GeneratorState {
+    pub module_index: u32,
     pub func_index: u32,
     pub pc: usize,
     pub locals: Vec<Cell>,
@@ -181,6 +283,8 @@ pub struct GeneratorState {
 #[derive(Clone, Debug)]
 pub struct JsFunction {
     pub name: String,
+    /// Index of the defining bytecode module in the active runtime graph.
+    pub module_index: u32,
     pub id: u32,
     pub param_count: u16,
     pub upvalues: Vec<Cell>,
@@ -193,6 +297,9 @@ pub struct JsFunction {
     /// For native generator methods: the generator this `.next`/`.return`/
     /// `.throw` was extracted from. `None` for ordinary calls.
     pub bound_generator: Option<Rc<RefCell<GeneratorState>>>,
+    /// Host/native functions may retain one object as internal bound state
+    /// (currently Promise resolving functions).
+    pub bound_object: Option<JsObject>,
     /// `true` for `function*` — calling it produces a generator object.
     pub is_generator: bool,
 }
@@ -201,12 +308,14 @@ impl JsFunction {
     pub fn new(name: impl Into<String>, id: u32, param_count: u16) -> JsFunction {
         JsFunction {
             name: name.into(),
+            module_index: 0,
             id,
             param_count,
             upvalues: Vec::new(),
             this_cell: None,
             native: None,
             bound_generator: None,
+            bound_object: None,
             is_generator: false,
         }
     }

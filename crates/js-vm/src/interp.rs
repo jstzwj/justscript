@@ -13,8 +13,11 @@ use js_diagnostics::DiagResult;
 use js_runtime::context::RealmContext;
 use js_runtime::value::{GeneratorState, JsFunction, Value, ValueData};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
+
+pub(crate) type BytecodeGraph<'a> = [&'a BytecodeModule];
 
 /// Native (Rust-implemented) function ids registered in the VM.
 mod native_id {
@@ -41,6 +44,18 @@ pub(crate) enum Step {
     Done(Value),
 }
 
+pub(crate) struct PromiseJob {
+    pub reaction: js_runtime::object::PromiseReaction,
+    pub argument: Value,
+    pub rejected: bool,
+}
+
+struct DeferredModuleGraph {
+    locals: Vec<Vec<js_runtime::value::Cell>>,
+    dependencies: Vec<Vec<usize>>,
+    evaluated: Vec<bool>,
+}
+
 /// A Rust-implemented builtin function. `this` is the call receiver (e.g. the
 /// array for `arr.push`); `f` is the callee value (so generator methods can
 /// read their bound generator).
@@ -48,7 +63,7 @@ pub trait NativeFn {
     fn call(
         &self,
         interp: &mut Interpreter,
-        module: &BytecodeModule,
+        modules: &BytecodeGraph<'_>,
         this: Value,
         f: &JsFunction,
         args: Vec<Value>,
@@ -63,7 +78,7 @@ impl NativeFn for GenThrow {
     fn call(
         &self,
         _interp: &mut Interpreter,
-        _module: &BytecodeModule,
+        _modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
         _args: Vec<Value>,
@@ -80,7 +95,7 @@ impl NativeFn for GenNext {
     fn call(
         &self,
         _interp: &mut Interpreter,
-        _module: &BytecodeModule,
+        _modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
@@ -97,7 +112,7 @@ impl NativeFn for GenReturn {
     fn call(
         &self,
         _interp: &mut Interpreter,
-        _module: &BytecodeModule,
+        _modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
@@ -148,6 +163,9 @@ pub struct Interpreter {
     /// needed for native callbacks, whose bytecode frames unwind before the
     /// error returns to the outer dispatch loop.
     error_trace: Vec<RuntimeFrame>,
+    /// PromiseJobs run FIFO at explicit microtask checkpoints.
+    jobs: VecDeque<PromiseJob>,
+    deferred_modules: Option<DeferredModuleGraph>,
 }
 
 /// Hard cap on instructions per program. Generous enough for legitimate
@@ -168,6 +186,8 @@ impl Interpreter {
             pending_err: None,
             steps: 0,
             error_trace: Vec::new(),
+            jobs: VecDeque::new(),
+            deferred_modules: None,
         };
         // Install the global builtins (console, Math, Object, JSON, parseInt, …).
         {
@@ -182,8 +202,97 @@ impl Interpreter {
         Interpreter::new(RealmContext::fresh())
     }
 
+    /// Register the instantiated module graph used by deferred namespace
+    /// objects. Ordinary dependencies are evaluated recursively when a
+    /// deferred namespace first becomes observable.
+    pub fn configure_module_graph(
+        &mut self,
+        locals: Vec<Vec<js_runtime::value::Cell>>,
+        dependencies: Vec<Vec<usize>>,
+    ) {
+        let evaluated = vec![false; locals.len()];
+        self.deferred_modules = Some(DeferredModuleGraph {
+            locals,
+            dependencies,
+            evaluated,
+        });
+    }
+
+    pub fn mark_module_evaluated(&mut self, module_index: usize) {
+        if let Some(graph) = &mut self.deferred_modules {
+            if let Some(evaluated) = graph.evaluated.get_mut(module_index) {
+                *evaluated = true;
+            }
+        }
+    }
+
+    /// Instantiate a top-level function declaration against an already-created
+    /// module environment. This is used during module linking, before any body
+    /// evaluation, as required by ModuleDeclarationInstantiation.
+    pub fn instantiate_module_function(
+        module: &BytecodeModule,
+        module_index: usize,
+        function_id: u32,
+        locals: &[js_runtime::value::Cell],
+    ) -> Result<Value, String> {
+        let function = func_ref(module, function_id as usize);
+        let mut upvalues = Vec::with_capacity(function.upvalues.len());
+        for spec in &function.upvalues {
+            if !spec.is_local {
+                return Err(format!(
+                    "top-level function {} has a non-local upvalue",
+                    function.name
+                ));
+            }
+            let cell = locals.get(spec.index as usize).cloned().ok_or_else(|| {
+                format!(
+                    "top-level function {} captures missing slot {}",
+                    function.name, spec.index
+                )
+            })?;
+            upvalues.push(cell);
+        }
+        let mut value = JsFunction::new(function.name.clone(), function_id, function.param_count);
+        value.module_index = module_index as u32;
+        value.upvalues = upvalues;
+        value.is_generator = function.is_generator;
+        Ok(Value::function(value))
+    }
+
+    pub(crate) fn mark_test262_done(&mut self) {
+        self.ctx.realm.borrow_mut().test262_done_called = true;
+    }
+
     /// Execute a compiled module's top-level function.
     pub fn run_module(&mut self, module: &BytecodeModule) -> Result<Value, InterpError> {
+        let modules = [module];
+        let locals = (0..module.main.locals.slot_count())
+            .map(|_| new_cell(Value::undefined()))
+            .collect();
+        self.run_module_in_graph(&modules, 0, locals)
+    }
+
+    /// Execute one top-level module using pre-instantiated environment cells.
+    /// Functions created during execution retain `module_index`, so imports can
+    /// call bytecode defined in another module from the same graph.
+    pub fn run_module_in_graph(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        locals: Vec<js_runtime::value::Cell>,
+    ) -> Result<Value, InterpError> {
+        let Some(module) = modules.get(module_index).copied() else {
+            return Err(InterpError::Internal(format!(
+                "module index {module_index} is outside the bytecode graph"
+            )));
+        };
+        if locals.len() != module.main.locals.slot_count() as usize {
+            return Err(InterpError::Internal(format!(
+                "module environment has {} cells, expected {}",
+                locals.len(),
+                module.main.locals.slot_count()
+            )));
+        }
         if let Err(errors) = js_bytecode::verify_module(module) {
             let detail = errors
                 .iter()
@@ -195,39 +304,68 @@ impl Interpreter {
         }
         self.error_trace.clear();
         self.steps = 0;
+        self.frames.clear();
         let span = module.main.span;
-        let frame = CallFrame::new(0, module.main.locals.slot_count(), span);
+        let frame = CallFrame::with_locals(module_index, 0, locals, span);
         self.frames.push(frame);
-        self.dispatch(module)
+        self.dispatch(modules)
     }
 
     /// Execute a module and retain source identity, throw location and the
     /// JavaScript call stack when execution does not complete normally.
     pub fn run_module_report(&mut self, module: &BytecodeModule) -> Result<Value, RuntimeError> {
-        match self.run_module(module) {
+        let modules = [module];
+        let locals = (0..module.main.locals.slot_count())
+            .map(|_| new_cell(Value::undefined()))
+            .collect();
+        self.run_module_in_graph_report(&modules, 0, locals)
+    }
+
+    pub fn run_module_in_graph_report(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+        locals: Vec<js_runtime::value::Cell>,
+    ) -> Result<Value, RuntimeError> {
+        let source = modules
+            .get(module_index)
+            .and_then(|module| module.source.clone());
+        match self.run_module_in_graph(modules, module_index, locals) {
             Ok(value) => Ok(value),
-            Err(InterpError::Throw(value)) => Err(RuntimeError::Exception(JsException {
-                value,
-                source: module.source.clone(),
-                stack: std::mem::take(&mut self.error_trace),
-            })),
-            Err(InterpError::Internal(message)) => Err(RuntimeError::Fault(EngineFault::new(
-                message,
-                module.source.clone(),
-                std::mem::take(&mut self.error_trace),
-            ))),
+            Err(InterpError::Throw(value)) => {
+                let stack = std::mem::take(&mut self.error_trace);
+                let source = stack
+                    .first()
+                    .and_then(|frame| frame.source.clone())
+                    .or(source);
+                Err(RuntimeError::Exception(JsException {
+                    value,
+                    source,
+                    stack,
+                }))
+            }
+            Err(InterpError::Internal(message)) => {
+                let stack = std::mem::take(&mut self.error_trace);
+                let source = stack
+                    .first()
+                    .and_then(|frame| frame.source.clone())
+                    .or(source);
+                Err(RuntimeError::Fault(EngineFault::new(
+                    message, source, stack,
+                )))
+            }
         }
     }
 
     /// Main dispatch loop: runs instructions until the top-level frame returns.
     /// Exceptions surface as `Err` from [`Self::step`]; [`Self::handle_exception`]
     /// either installs a catch/finally (continue) or propagates (pop frame).
-    fn dispatch(&mut self, module: &BytecodeModule) -> Result<Value, InterpError> {
+    fn dispatch(&mut self, modules: &BytecodeGraph<'_>) -> Result<Value, InterpError> {
         loop {
-            match self.step(module) {
+            match self.step(modules) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(v)) => return Ok(v),
-                Err(e) => match self.handle_exception(module, e, 0) {
+                Err(e) => match self.handle_exception(modules, e, 0) {
                     Ok(()) => {}
                     Err(e) => return Err(e),
                 },
@@ -241,7 +379,7 @@ impl Interpreter {
     /// caller-depth target so it never touches the suspended caller frame.
     fn handle_exception(
         &mut self,
-        module: &BytecodeModule,
+        modules: &BytecodeGraph<'_>,
         e: InterpError,
         stop_depth: usize,
     ) -> Result<(), InterpError> {
@@ -255,7 +393,7 @@ impl Interpreter {
                         .frames
                         .iter()
                         .rev()
-                        .map(|frame| runtime_frame(module, frame))
+                        .map(|frame| runtime_frame(modules, frame))
                         .collect();
                 }
                 return Err(other);
@@ -282,7 +420,18 @@ impl Interpreter {
                 }
                 None => {
                     let frame = self.frames.last().unwrap();
-                    self.error_trace.push(runtime_frame(module, frame));
+                    if func_ref(modules[frame.module_index], frame.func_index).is_async {
+                        let promise = crate::builtins::promise_rejected(thrown);
+                        self.frames.pop();
+                        if let Some(caller) = self.frames.last_mut() {
+                            caller.stack.push(promise);
+                            return Ok(());
+                        }
+                        return Err(InterpError::Internal(
+                            "async function escaped without a caller frame".into(),
+                        ));
+                    }
+                    self.error_trace.push(runtime_frame(modules, frame));
                     self.frames.pop(); // no handler here → unwind to caller
                 }
             }
@@ -292,7 +441,7 @@ impl Interpreter {
 
     /// One-instruction outcome of [`Self::step`]: keep going, or the running
     /// frame returned `Value` (the top-level script, in [`Self::dispatch`]).
-    fn step(&mut self, module: &BytecodeModule) -> Result<Step, InterpError> {
+    fn step(&mut self, modules: &BytecodeGraph<'_>) -> Result<Step, InterpError> {
         // Step budget: bound runaway loops so a stuck program surfaces as an
         // `Internal` error instead of hanging the runner.
         self.steps = self.steps.saturating_add(1);
@@ -305,6 +454,12 @@ impl Interpreter {
         if let Some(err) = self.pending_err.take() {
             return Err(err);
         }
+        let module_index = self.frames.last().unwrap().module_index;
+        let module = modules.get(module_index).copied().ok_or_else(|| {
+            InterpError::Internal(format!(
+                "frame refers to missing bytecode module {module_index}"
+            ))
+        })?;
         // Fetch + advance the PC without holding a long-lived borrow.
         let ins = {
             let frame = self.frames.last_mut().unwrap();
@@ -385,7 +540,7 @@ impl Interpreter {
                     // iterator-result lands on this frame's stack when the
                     // generator yields/returns (or synchronously if done).
                     let next_fn = get_property(&it, &Value::string("next"));
-                    self.invoke(module, next_fn, Vec::new(), it, false);
+                    self.invoke(modules, next_fn, Vec::new(), it, false);
                 } else {
                     // Array-iterator object: step by index synchronously.
                     let result = step_array_iterator(&it);
@@ -394,11 +549,14 @@ impl Interpreter {
             }
             Opcode::ObjectKeys => {
                 let v = self.top().stack.pop();
+                self.ensure_deferred_namespace(modules, &v)?;
                 let keys: Vec<String> = match v.data() {
                     ValueData::Object(o) => {
                         let b = o.borrow();
                         // For arrays, expose numeric indices (skip "length").
-                        if b.is_exotic_array {
+                        if let Some(namespace) = &b.module_namespace {
+                            namespace.keys().cloned().collect()
+                        } else if b.is_exotic_array {
                             (0..b.properties.len().saturating_sub(1))
                                 .map(|i| i.to_string())
                                 .collect()
@@ -440,7 +598,7 @@ impl Interpreter {
                 self.top().stack.push(v);
             }
             Opcode::LdaFunction => {
-                let f = self.function_value(module, ins.operand as u32);
+                let f = self.function_value(module, module_index, ins.operand as u32);
                 self.top().stack.push(Value::function(f));
             }
             Opcode::LdaThis => {
@@ -448,20 +606,28 @@ impl Interpreter {
                 self.top().stack.push(v);
             }
             Opcode::LdaUpvalue => {
-                let v = self.top().upvalues[ins.operand as usize].borrow().clone();
+                let v = self.top().upvalues[ins.operand as usize]
+                    .get()
+                    .map_err(binding_error_value)?;
                 self.top().stack.push(v);
             }
             Opcode::StaUpvalue => {
                 let v = self.top().stack.pop();
-                *self.top().upvalues[ins.operand as usize].borrow_mut() = v;
+                self.top().upvalues[ins.operand as usize]
+                    .set(v)
+                    .map_err(binding_error_value)?;
             }
             Opcode::LdaLocal => {
-                let v = self.top().locals[ins.operand as usize].borrow().clone();
+                let v = self.top().locals[ins.operand as usize]
+                    .get()
+                    .map_err(binding_error_value)?;
                 self.top().stack.push(v);
             }
             Opcode::StaLocal => {
                 let v = self.top().stack.pop();
-                *self.top().locals[ins.operand as usize].borrow_mut() = v;
+                self.top().locals[ins.operand as usize]
+                    .set(v)
+                    .map_err(binding_error_value)?;
             }
             Opcode::Pop => {
                 self.top().stack.pop();
@@ -508,6 +674,7 @@ impl Interpreter {
             Opcode::In => {
                 let object = self.top().stack.pop();
                 let key = self.top().stack.pop();
+                self.ensure_deferred_namespace(modules, &object)?;
                 if !is_object_value(&object) {
                     return Err(InterpError::Throw(type_error(
                         "right-hand side of 'in' is not an object",
@@ -601,9 +768,18 @@ impl Interpreter {
                     self.top().stack.push(iter_result(ret, true));
                     return Ok(Step::More);
                 }
+                let is_async = {
+                    let frame = self.frames.last().unwrap();
+                    func_ref(modules[frame.module_index], frame.func_index).is_async
+                };
+                if self.frames.len() == 1 {
+                    self.drain_jobs(modules)?;
+                }
                 self.frames.pop();
                 let ret = if was_construct && !ret.is_object() {
                     this_obj
+                } else if is_async {
+                    crate::builtins::promise_fulfilled(ret)
                 } else {
                     ret
                 };
@@ -664,11 +840,29 @@ impl Interpreter {
                 }
                 self.top().stack.push(iter_result(yielded, false));
             }
+            Opcode::Await => {
+                let awaited = self.top().stack.pop();
+                self.drain_jobs(modules)?;
+                match crate::builtins::promise_result(&awaited) {
+                    Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => {
+                        self.top().stack.push(value)
+                    }
+                    Some(crate::builtins::AwaitedPromise::Rejected(value)) => {
+                        return Err(InterpError::Throw(value));
+                    }
+                    Some(crate::builtins::AwaitedPromise::Pending) => {
+                        return Err(InterpError::Internal(
+                            "awaited Promise is still pending after the job checkpoint".into(),
+                        ));
+                    }
+                    None => self.top().stack.push(awaited),
+                }
+            }
 
             // ---- calls ----
             Opcode::Call => {
                 let (callee, args) = pop_args(self, ins.operand);
-                self.invoke(module, callee, args, Value::undefined(), false);
+                self.invoke(modules, callee, args, Value::undefined(), false);
             }
             Opcode::CallMethod => {
                 // Stack: [obj, fn, args...]
@@ -681,7 +875,7 @@ impl Interpreter {
                     let this = frame.stack.pop();
                     (a, this, callee)
                 };
-                self.invoke(module, callee, args, this, false);
+                self.invoke(modules, callee, args, this, false);
             }
             Opcode::NewObject => {
                 let o = js_runtime::object::ObjectData::new_handle();
@@ -754,7 +948,9 @@ impl Interpreter {
             Opcode::GetProp => {
                 let key = self.top().stack.pop();
                 let obj = self.top().stack.pop();
-                self.top().stack.push(get_property(&obj, &key));
+                self.ensure_deferred_namespace(modules, &obj)?;
+                let value = get_property_checked(&obj, &key).map_err(binding_error_value)?;
+                self.top().stack.push(value);
             }
             Opcode::SetProp => {
                 // Stack: [..., value, obj, key] (key on top). Pops key, obj,
@@ -763,11 +959,17 @@ impl Interpreter {
                 let key = self.top().stack.pop();
                 let obj = self.top().stack.pop();
                 let value = self.top().stack.pop();
-                set_property(&obj, &key, value);
+                self.ensure_deferred_namespace(modules, &obj)?;
+                if !set_property_checked(&obj, &key, value) {
+                    return Err(InterpError::Throw(type_error(
+                        "cannot assign to a module namespace property",
+                    )));
+                }
             }
             Opcode::DeleteProp => {
                 let key = self.top().stack.pop();
                 let object = self.top().stack.pop();
+                self.ensure_deferred_namespace(modules, &object)?;
                 let deleted = delete_property(&object, &key);
                 self.top().stack.push(Value::boolean(deleted));
             }
@@ -775,7 +977,7 @@ impl Interpreter {
                 let (callee, args) = pop_args(self, ins.operand);
                 // Construct a fresh object bound as `this`.
                 let this = Value::object(js_runtime::object::ObjectData::new_handle());
-                self.invoke(module, callee, args, this, true);
+                self.invoke(modules, callee, args, this, true);
             }
 
             Opcode::LogicalAnd | Opcode::LogicalOr | Opcode::NullishCoal => {
@@ -799,20 +1001,20 @@ impl Interpreter {
     /// then pops and returns its return value.
     pub(crate) fn call_value(
         &mut self,
-        module: &BytecodeModule,
+        modules: &BytecodeGraph<'_>,
         callee: Value,
         args: Vec<Value>,
         this: Value,
     ) -> Result<Value, InterpError> {
         let target = self.frames.len();
-        self.invoke(module, callee, args, this, false);
+        self.invoke(modules, callee, args, this, false);
         // `invoke` may have pushed a frame (bytecode callee) or already pushed
         // a result (native/done-generator). Step until the frame unwinds.
         while self.frames.len() > target {
-            match self.step(module) {
+            match self.step(modules) {
                 Ok(Step::More) => {}
                 Ok(Step::Done(_)) => break,
-                Err(e) => match self.handle_exception(module, e, target) {
+                Err(e) => match self.handle_exception(modules, e, target) {
                     Ok(()) => {}             // caught inside the callee
                     Err(e) => return Err(e), // escaped the callee → propagate
                 },
@@ -820,6 +1022,110 @@ impl Interpreter {
         }
         // The callee's return value now sits on top of the caller's stack.
         Ok(self.top().stack.pop())
+    }
+
+    pub(crate) fn enqueue_promise_job(&mut self, job: PromiseJob) {
+        self.jobs.push_back(job);
+    }
+
+    fn drain_jobs(&mut self, modules: &BytecodeGraph<'_>) -> Result<(), InterpError> {
+        while let Some(job) = self.jobs.pop_front() {
+            let handler = if job.rejected {
+                job.reaction.on_rejected.clone()
+            } else {
+                job.reaction.on_fulfilled.clone()
+            };
+            let outcome = match handler {
+                Some(handler) => self
+                    .call_value(
+                        modules,
+                        handler,
+                        vec![job.argument.clone()],
+                        Value::undefined(),
+                    )
+                    .map(|value| (false, value)),
+                None => Ok((job.rejected, job.argument)),
+            };
+            match outcome {
+                Ok((rejected, value)) => {
+                    crate::builtins::settle_promise(self, job.reaction.result, rejected, value)
+                }
+                Err(InterpError::Throw(value)) => {
+                    crate::builtins::settle_promise(self, job.reaction.result, true, value)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_deferred_namespace(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        value: &Value,
+    ) -> Result<(), InterpError> {
+        let module_index = match value.data() {
+            ValueData::Object(object) => object.borrow().deferred_module,
+            _ => None,
+        };
+        if let Some(module_index) = module_index {
+            self.ensure_deferred_module(modules, module_index)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_deferred_module(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Result<(), InterpError> {
+        let (dependencies, locals) = {
+            let graph = self.deferred_modules.as_mut().ok_or_else(|| {
+                InterpError::Internal("deferred namespace has no registered module graph".into())
+            })?;
+            let evaluated = graph.evaluated.get_mut(module_index).ok_or_else(|| {
+                InterpError::Internal(format!("missing deferred module {module_index}"))
+            })?;
+            if *evaluated {
+                return Ok(());
+            }
+            // Mark before descending so cycles terminate.
+            *evaluated = true;
+            (
+                graph.dependencies[module_index].clone(),
+                graph.locals[module_index].clone(),
+            )
+        };
+        for dependency in dependencies {
+            self.ensure_deferred_module(modules, dependency)?;
+        }
+        let module = modules.get(module_index).copied().ok_or_else(|| {
+            InterpError::Internal(format!(
+                "missing bytecode for deferred module {module_index}"
+            ))
+        })?;
+        let target_depth = self.frames.len();
+        self.frames.push(CallFrame::with_locals(
+            module_index,
+            0,
+            locals,
+            module.main.span,
+        ));
+        while self.frames.len() > target_depth {
+            match self.step(modules) {
+                Ok(Step::More) => {}
+                Ok(Step::Done(_)) => break,
+                Err(error) => match self.handle_exception(modules, error, target_depth) {
+                    Ok(()) => {}
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        // A nested module completion is delivered to the observing frame.
+        if let Some(frame) = self.frames.last_mut() {
+            let _ = frame.stack.pop();
+        }
+        Ok(())
     }
 
     /// Pop `b`, then `a`, apply `f`, push the result.
@@ -843,7 +1149,12 @@ impl Interpreter {
     /// Build a [`JsFunction`] value for function-table index `id`, capturing
     /// upvalue cells from the currently executing frame per the function's
     /// compiled [`UpvalueSpec`]s.
-    fn function_value(&mut self, module: &BytecodeModule, id: u32) -> JsFunction {
+    fn function_value(
+        &mut self,
+        module: &BytecodeModule,
+        module_index: usize,
+        id: u32,
+    ) -> JsFunction {
         let func = func_ref(module, id as usize);
         let is_arrow = func.is_arrow;
         // Capture upvalue cells from the current (enclosing) frame.
@@ -864,8 +1175,10 @@ impl Interpreter {
             None
         };
         let mut f = JsFunction::new(func.name.clone(), id, func.param_count);
+        f.module_index = module_index as u32;
         f.upvalues = upvalues;
         f.this_cell = this_cell;
+        f.is_generator = func.is_generator;
         f
     }
 
@@ -874,7 +1187,7 @@ impl Interpreter {
     fn current_this(&self) -> Value {
         let frame = self.frames.last().unwrap();
         if let Some(c) = &frame.captured_this {
-            return c.borrow().clone();
+            return c.get().unwrap_or_else(|_| Value::undefined());
         }
         frame.this.clone()
     }
@@ -884,7 +1197,7 @@ impl Interpreter {
     /// the result unless the constructor explicitly returns an object.
     fn invoke(
         &mut self,
-        module: &BytecodeModule,
+        modules: &BytecodeGraph<'_>,
         callee: Value,
         args: Vec<Value>,
         this: Value,
@@ -919,7 +1232,7 @@ impl Interpreter {
             // fixed after construction), so a `*const` borrow is stable for the
             // call's duration even though `self` is borrowed mutably inside it.
             let nf_ptr: *const dyn NativeFn = self.natives[nid as usize].as_ref();
-            let result = unsafe { (&*nf_ptr).call(self, module, this, &f, args) };
+            let result = unsafe { (&*nf_ptr).call(self, modules, this, &f, args) };
             match result {
                 Ok(NativeResult::Value(v)) => {
                     self.error_trace = prior_trace;
@@ -933,18 +1246,25 @@ impl Interpreter {
             }
             return;
         }
+        let module_index = f.module_index as usize;
+        let Some(module) = modules.get(module_index).copied() else {
+            self.pending_err = Some(InterpError::Internal(format!(
+                "function refers to missing bytecode module {module_index}"
+            )));
+            return;
+        };
         let id = f.id as usize;
         let func = func_ref(module, id);
         // Calling a `function*` creates a generator object (it does not run).
         if func.is_generator && !is_construct {
-            let state = self.make_generator_state(module, id, &f, args, this);
+            let state = self.make_generator_state(module, module_index, id, &f, args, this);
             self.top()
                 .stack
                 .push(Value::generator(Rc::new(RefCell::new(state))));
             return;
         }
         let (slot_count, param_count, span) = func_meta(module, id);
-        let mut nf = CallFrame::new(id, slot_count, span);
+        let mut nf = CallFrame::for_module(module_index, id, slot_count, span);
         for i in 0..(param_count as usize).min(args.len()) {
             nf.locals[i] = new_cell(args[i].clone());
         }
@@ -962,6 +1282,7 @@ impl Interpreter {
     fn make_generator_state(
         &self,
         module: &BytecodeModule,
+        module_index: usize,
         id: usize,
         f: &JsFunction,
         args: Vec<Value>,
@@ -976,6 +1297,7 @@ impl Interpreter {
             locals[i] = new_cell(args[i].clone());
         }
         GeneratorState {
+            module_index: module_index as u32,
             func_index: id as u32,
             pc: 0,
             locals,
@@ -996,7 +1318,18 @@ impl Interpreter {
     /// `CallFrame`, push the `.next(arg)` argument (for non-first resumes), and
     /// push the frame so the dispatch loop continues it.
     fn checkout_generator(&mut self, gen: Rc<RefCell<GeneratorState>>, arg: Value) {
-        let (done, started, func_index, pc, locals, stack, upvalues, this, captured_this) = {
+        let (
+            done,
+            started,
+            module_index,
+            func_index,
+            pc,
+            locals,
+            stack,
+            upvalues,
+            this,
+            captured_this,
+        ) = {
             let mut s = gen.borrow_mut();
             if s.done {
                 // Already finished: return {undefined, true}.
@@ -1009,6 +1342,7 @@ impl Interpreter {
             (
                 false,
                 started,
+                s.module_index,
                 s.func_index,
                 s.pc,
                 std::mem::take(&mut s.locals),
@@ -1019,7 +1353,12 @@ impl Interpreter {
             )
         };
         let _ = done;
-        let mut frame = CallFrame::new(func_index as usize, 0, js_syntax::Span::DUMMY);
+        let mut frame = CallFrame::for_module(
+            module_index as usize,
+            func_index as usize,
+            0,
+            js_syntax::Span::DUMMY,
+        );
         frame.pc = pc;
         frame.locals = locals;
         frame.upvalues = upvalues;
@@ -1081,10 +1420,12 @@ fn func_ref<'a>(module: &'a BytecodeModule, index: usize) -> &'a BytecodeFunctio
     }
 }
 
-fn runtime_frame(module: &BytecodeModule, frame: &CallFrame) -> RuntimeFrame {
+fn runtime_frame(modules: &BytecodeGraph<'_>, frame: &CallFrame) -> RuntimeFrame {
+    let module = modules[frame.module_index];
     RuntimeFrame {
         function: func_ref(module, frame.func_index).name.clone(),
         span: frame.span,
+        source: module.source.clone(),
     }
 }
 
@@ -1425,18 +1766,25 @@ pub(crate) fn prop_name(key: &Value) -> String {
 /// missing properties (no throw in the milestone subset). Strings expose
 /// `.length` and integer indexing.
 pub(crate) fn get_property(obj: &Value, key: &Value) -> Value {
+    get_property_checked(obj, key).unwrap_or_else(|_| Value::undefined())
+}
+
+fn get_property_checked(
+    obj: &Value,
+    key: &Value,
+) -> Result<Value, js_runtime::value::BindingError> {
     let name = prop_name(key);
     // Static methods on global constructor functions (Number.isInteger etc.).
     if let Some(nid) = crate::builtins::native_static_id(obj, &name) {
         let mut f = JsFunction::new(name.clone(), 0, 1);
         f.native = Some(nid);
-        return Value::function(f);
+        return Ok(Value::function(f));
     }
     // Known builtin instance methods on arrays/strings resolve to native fns.
     if let Some(bid) = crate::builtins::builtin_method_id(obj, &name) {
         let mut f = JsFunction::new(name.clone(), 0, 1);
         f.native = Some(bid);
-        return Value::function(f);
+        return Ok(Value::function(f));
     }
     // Generator objects expose `.next` / `.return` / `.throw` as bound native
     // methods.
@@ -1451,41 +1799,47 @@ pub(crate) fn get_property(obj: &Value, key: &Value) -> Value {
             let mut f = JsFunction::new(name.clone(), 0, 1);
             f.native = Some(nid);
             f.bound_generator = Some(g.clone());
-            return Value::function(f);
+            return Ok(Value::function(f));
         }
-        return Value::undefined();
+        return Ok(Value::undefined());
     }
     // Primitive string: `.length` and index access.
     if let ValueData::String(s) = obj.data() {
         if name == "length" {
-            return Value::integer(s.chars().count() as i32);
+            return Ok(Value::integer(s.chars().count() as i32));
         }
         if let Ok(i) = name.parse::<usize>() {
             if let Some(c) = s.as_str().chars().nth(i) {
-                return Value::string(c.to_string());
+                return Ok(Value::string(c.to_string()));
             }
         }
-        return Value::undefined();
+        return Ok(Value::undefined());
     }
     // Objects (incl. arrays): dictionary lookup + proto chain.
     let Some(handle) = obj_as_object(obj) else {
-        return Value::undefined();
+        return Ok(Value::undefined());
     };
     let mut cur = Some(handle.clone());
     while let Some(h) = cur {
         let b = h.borrow();
+        if let Some(namespace) = &b.module_namespace {
+            return match namespace.get(&name) {
+                Some(cell) => cell.get(),
+                None => Ok(Value::undefined()),
+            };
+        }
         if let Some(desc) = b.properties.get(&name) {
-            return match desc {
+            return Ok(match desc {
                 js_runtime::object::PropertyDescriptor::Data { value, .. } => value.clone(),
                 js_runtime::object::PropertyDescriptor::Accessor { get, .. } => {
                     // Accessors aren't invoked in the milestone subset.
                     get.clone().unwrap_or_else(Value::undefined)
                 }
-            };
+            });
         }
         cur = b.proto.as_ref().and_then(|v| obj_as_object(v)).cloned();
     }
-    Value::undefined()
+    Ok(Value::undefined())
 }
 
 fn is_object_value(value: &Value) -> bool {
@@ -1509,7 +1863,12 @@ fn has_property(obj: &Value, key: &Value) -> bool {
     let mut current = Some(handle.clone());
     while let Some(object) = current {
         let data = object.borrow();
-        if data.properties.contains_key(&name) {
+        if data
+            .module_namespace
+            .as_ref()
+            .is_some_and(|namespace| namespace.contains_key(&name))
+            || data.properties.contains_key(&name)
+        {
             return true;
         }
         current = data.proto.as_ref().and_then(obj_as_object).cloned();
@@ -1525,6 +1884,9 @@ fn delete_property(obj: &Value, key: &Value) -> bool {
     let name = prop_name(key);
     let configurable = {
         let data = handle.borrow();
+        if let Some(namespace) = &data.module_namespace {
+            return !namespace.contains_key(&name);
+        }
         match data.properties.get(&name) {
             Some(js_runtime::object::PropertyDescriptor::Data { attr, .. })
             | Some(js_runtime::object::PropertyDescriptor::Accessor { attr, .. }) => {
@@ -1547,10 +1909,17 @@ fn type_error(message: &str) -> Value {
 
 /// `obj[key] = value` for object/array targets.
 pub(crate) fn set_property(obj: &Value, key: &Value, value: Value) {
+    let _ = set_property_checked(obj, key, value);
+}
+
+fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bool {
     let Some(handle) = obj_as_object(obj) else {
-        return; // silently ignore writes to primitives.
+        return true; // silently ignore writes to primitives.
     };
     let name = prop_name(key);
+    if handle.borrow().module_namespace.is_some() {
+        return false;
+    }
     let is_array = handle.borrow().is_exotic_array;
     let new_len = if is_array {
         name.parse::<usize>().ok()
@@ -1581,6 +1950,19 @@ pub(crate) fn set_property(obj: &Value, key: &Value, value: Value) {
             );
         }
     }
+    true
+}
+
+fn binding_error_value(error: js_runtime::value::BindingError) -> InterpError {
+    let value = match error {
+        js_runtime::value::BindingError::Uninitialized => crate::builtins::error_ctor(
+            &Value::undefined(),
+            &[Value::string("cannot access binding before initialization")],
+            "ReferenceError",
+        ),
+        js_runtime::value::BindingError::Immutable => type_error("assignment to immutable binding"),
+    };
+    InterpError::Throw(value)
 }
 
 /// Build an iterator value for an iterable. Generators are their own iterator;

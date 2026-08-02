@@ -378,7 +378,10 @@ fn run_execute_one(args: &[String]) -> ExitCode {
         println!("SKIP\t{}", reason);
         return ExitCode::SUCCESS;
     }
-    let outcome = js_test262::execute_test_source(&src, &expect, variant);
+    let async_test = fm
+        .as_ref()
+        .is_some_and(|metadata| metadata.flags.iter().any(|flag| flag == "async"));
+    let outcome = js_test262::execute_test_file(&path, &src, &expect, variant, async_test);
     match outcome {
         js_test262::RuntimeOutcome::Pass => println!("PASS"),
         js_test262::RuntimeOutcome::Fail(r) => println!("FAIL\t{}", one_line(&r)),

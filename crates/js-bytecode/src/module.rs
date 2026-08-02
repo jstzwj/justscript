@@ -7,6 +7,10 @@ use js_syntax::SourceFile;
 use js_syntax::Span;
 use std::sync::Arc;
 
+/// Internal top-level slot used to retain `export default <expression>` and
+/// anonymous default declarations for module linking.
+pub const DEFAULT_EXPORT_LOCAL: &str = "*default*";
+
 /// A compiled description of one captured variable (closure upvalue).
 ///
 /// At function-creation time (`LdaFunction`), each upvalue is resolved to a
@@ -41,6 +45,9 @@ pub struct BytecodeFunction {
     /// True for `function*`: calling it produces a generator object instead of
     /// running the body. `yield` inside is a `Yield` opcode.
     pub is_generator: bool,
+    /// True for async functions. Calls return a Promise and `await` performs a
+    /// job-queue checkpoint in the interpreter.
+    pub is_async: bool,
     /// Exception-handler specs, indexed by `TryBegin`'s operand.
     pub handlers: Vec<HandlerSpec>,
 }
@@ -67,6 +74,7 @@ impl BytecodeFunction {
             upvalues: Vec::new(),
             is_arrow: false,
             is_generator: false,
+            is_async: false,
             handlers: Vec::new(),
         }
     }
@@ -123,6 +131,9 @@ pub struct BytecodeModule {
     pub main: BytecodeFunction,
     /// Nested function declarations, in discovery order.
     pub functions: Vec<BytecodeFunction>,
+    /// Top-level function declarations initialized during ModuleDeclaration-
+    /// Instantiation, before any module body starts evaluating.
+    pub module_function_initializers: Vec<(u16, u32)>,
 }
 
 impl BytecodeModule {
@@ -132,6 +143,7 @@ impl BytecodeModule {
             constants,
             main,
             functions: Vec::new(),
+            module_function_initializers: Vec::new(),
         }
     }
 }

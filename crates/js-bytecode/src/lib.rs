@@ -20,6 +20,6 @@ pub mod verify;
 pub use compiler::{compile_program, compile_program_with_source};
 pub use constant::ConstantPool;
 pub use local::LocalTable;
-pub use module::{BytecodeFunction, BytecodeModule};
+pub use module::{BytecodeFunction, BytecodeModule, DEFAULT_EXPORT_LOCAL};
 pub use opcode::{Instruction, Opcode, OperandKind};
 pub use verify::{verify_module, VerifyError, BYTECODE_FORMAT_VERSION};

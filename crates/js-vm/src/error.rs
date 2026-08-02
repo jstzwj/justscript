@@ -6,10 +6,11 @@ use std::fmt;
 use std::sync::Arc;
 
 /// One JavaScript frame captured while an exception leaves the VM.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RuntimeFrame {
     pub function: String,
     pub span: Span,
+    pub source: Option<Arc<SourceFile>>,
 }
 
 /// An uncaught JavaScript value. This is a language-level completion, not an
@@ -101,7 +102,7 @@ fn render_stack(
     stack: &[RuntimeFrame],
 ) -> fmt::Result {
     for frame in stack {
-        if let Some(source) = source {
+        if let Some(source) = frame.source.as_deref().or(source) {
             let loc = source.loc(frame.span.start);
             write!(
                 f,

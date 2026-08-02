@@ -18,7 +18,7 @@ use js_syntax::ast::expr::{AssignTarget, CallArg, Expr, MemberProp, ObjectPropVa
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::op::{BinOp, UpdateOp};
 use js_syntax::ast::pat::Pat;
-use js_syntax::ast::stmt::{Decl, ForInit, ForTarget, Stmt};
+use js_syntax::ast::stmt::{Decl, ExportSpec, ForInit, ForTarget, ImportSpec, Stmt};
 use js_syntax::ast::{AssignOp, FunctionDecl, Program};
 use js_syntax::SourceFile;
 use std::sync::Arc;
@@ -46,6 +46,7 @@ fn compile_program_inner(
         errors: Vec::new(),
         loops: Vec::new(),
         scopes: Vec::new(),
+        module_function_initializers: Vec::new(),
     };
     // <main> is its own (outermost) scope.
     ctx.scopes.push(Scope::default());
@@ -83,6 +84,7 @@ fn compile_program_inner(
         constants: ctx.constants,
         main,
         functions: ctx.functions,
+        module_function_initializers: ctx.module_function_initializers,
     })
 }
 
@@ -352,14 +354,57 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 func.emit(Instruction::new(Opcode::StaLocal, slot));
             }
         }
-        other => {
-            ctx.errors.push(Diagnostic::error(
-                other.span(),
-                "this declaration kind is not supported yet",
-            ));
-        }
+        Decl::Import { .. } => {}
+        Decl::Export { spec, .. } => match spec {
+            ExportSpec::Named { .. } | ExportSpec::All { .. } | ExportSpec::ReExport { .. } => {}
+            ExportSpec::Decl(inner) => compile_decl(inner, func, ctx),
+            ExportSpec::Default(expr) => {
+                compile_expr(expr, func, ctx);
+                let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
+                func.emit(Instruction::new(Opcode::StaLocal, slot));
+            }
+            ExportSpec::DefaultDecl(inner) => compile_default_decl(inner, func, ctx),
+        },
     }
     func.annotate_since(start_pc, decl.span());
+}
+
+fn compile_default_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    match decl {
+        Decl::Function(function) if function.name.is_none() => {
+            let id = compile_function_value(
+                function.span,
+                None,
+                &function.params,
+                FunctionBody::Block(&function.body),
+                false,
+                function.is_async,
+                function.is_generator,
+                func,
+                ctx,
+            );
+            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+            let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
+            if ctx.scopes.len() == 1 {
+                ctx.module_function_initializers.push((slot, id));
+            }
+            func.emit(Instruction::new(Opcode::StaLocal, slot));
+        }
+        Decl::Class(class) if class.name.is_none() => {
+            let id = compile_class_value(
+                class.span,
+                None,
+                &class.body,
+                class.superclass.as_deref(),
+                func,
+                ctx,
+            );
+            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+            let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
+            func.emit(Instruction::new(Opcode::StaLocal, slot));
+        }
+        _ => compile_decl(decl, func, ctx),
+    }
 }
 
 fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
@@ -369,6 +414,7 @@ fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &
         &f.params,
         FunctionBody::Block(&f.body),
         false,
+        f.is_async,
         f.is_generator,
         parent,
         ctx,
@@ -377,6 +423,9 @@ fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &
     if let Some(name) = &f.name {
         parent.emit(Instruction::new(Opcode::LdaFunction, id as u16));
         let slot = ctx.declare_local(parent, name);
+        if ctx.scopes.len() == 1 {
+            ctx.module_function_initializers.push((slot, id));
+        }
         parent.emit(Instruction::new(Opcode::StaLocal, slot));
     }
 }
@@ -397,6 +446,7 @@ fn compile_function_value(
     params: &[Pat],
     body: FunctionBody,
     is_arrow: bool,
+    is_async: bool,
     is_generator: bool,
     _parent: &mut BytecodeFunction,
     ctx: &mut CompilerCtx,
@@ -409,6 +459,7 @@ fn compile_function_value(
     let fname = name.unwrap_or("<anonymous>").to_string();
     let mut nested = BytecodeFunction::new(span, fname.clone(), 0);
     nested.is_arrow = is_arrow;
+    nested.is_async = is_async;
     nested.is_generator = is_generator;
     let _ = is_arrow;
 
@@ -546,6 +597,7 @@ fn compile_class_value(
                 &f.params,
                 FunctionBody::Block(&f.body),
                 false,
+                f.is_async,
                 f.is_generator,
                 func,
                 ctx,
@@ -935,6 +987,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 &f.params,
                 FunctionBody::Block(&f.body),
                 false,
+                f.is_async,
                 f.is_generator,
                 func,
                 ctx,
@@ -946,7 +999,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 js_syntax::ast::expr::ArrowBody::Block(stmts) => FunctionBody::Block(stmts),
                 js_syntax::ast::expr::ArrowBody::Expr(e) => FunctionBody::Expr(e),
             };
-            let id = compile_function_value(a.span, None, &a.params, body, true, false, func, ctx);
+            let id = compile_function_value(
+                a.span, None, &a.params, body, true, a.is_async, false, func, ctx,
+            );
             func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
         }
         Expr::Class(c) => {
@@ -982,8 +1037,8 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             func.emit_bare(Opcode::Yield);
         }
         Expr::Await { arg, .. } => {
-            // No Promise runtime: `await x` evaluates to `x` synchronously.
             compile_expr(arg, func, ctx);
+            func.emit_bare(Opcode::Await);
         }
         Expr::Regex { pattern, flags, .. } => {
             let combined = format!("{}\0{}", pattern, flags);
@@ -1491,7 +1546,37 @@ fn collect_decl_bindings(decl: &Decl, out: &mut Vec<String>) {
                 out.push(n.clone());
             }
         }
-        _ => {}
+        Decl::Import { spec, .. } => match spec {
+            ImportSpec::Bare { .. } => {}
+            ImportSpec::Namespace { ns, .. } => out.push(ns.clone()),
+            ImportSpec::Named { items, .. } => {
+                out.extend(items.iter().map(|item| item.local.clone()));
+            }
+            ImportSpec::Default {
+                local,
+                namespace,
+                named,
+                ..
+            } => {
+                out.push(local.clone());
+                out.extend(namespace.iter().cloned());
+                out.extend(named.iter().map(|item| item.local.clone()));
+            }
+        },
+        Decl::Export { spec, .. } => match spec {
+            ExportSpec::Decl(inner) => collect_decl_bindings(inner, out),
+            ExportSpec::Default(_) => out.push(crate::module::DEFAULT_EXPORT_LOCAL.to_string()),
+            ExportSpec::DefaultDecl(inner) => match inner.as_ref() {
+                Decl::Function(function) if function.name.is_none() => {
+                    out.push(crate::module::DEFAULT_EXPORT_LOCAL.to_string());
+                }
+                Decl::Class(class) if class.name.is_none() => {
+                    out.push(crate::module::DEFAULT_EXPORT_LOCAL.to_string());
+                }
+                inner => collect_decl_bindings(inner, out),
+            },
+            ExportSpec::Named { .. } | ExportSpec::All { .. } | ExportSpec::ReExport { .. } => {}
+        },
     }
 }
 
@@ -1693,6 +1778,7 @@ fn compound_to_binop(op: AssignOp) -> BinOp {
 struct CompilerCtx {
     constants: ConstantPool,
     functions: Vec<BytecodeFunction>,
+    module_function_initializers: Vec<(u16, u32)>,
     errors: Vec<Diagnostic>,
     /// Stack of enclosing loops/switches for `break`/`continue`. Each frame
     /// records forward-jump placeholders to patch at loop exit: `breaks` → after

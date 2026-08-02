@@ -16,6 +16,6 @@ pub mod runner;
 
 pub use frontmatter::{FrontMatter, NegativePhase};
 pub use runner::{
-    classify_runtime, execute_test_source, run, run_runtime, Expect, Outcome, RuntimeExpect,
-    RuntimeOutcome, RuntimeResult, RuntimeStats, Stats, TestResult, Variant,
+    classify_runtime, execute_test_file, execute_test_source, run, run_runtime, Expect, Outcome,
+    RuntimeExpect, RuntimeOutcome, RuntimeResult, RuntimeStats, Stats, TestResult, Variant,
 };

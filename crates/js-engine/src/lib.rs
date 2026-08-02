@@ -18,7 +18,9 @@ pub mod module;
 pub mod pipeline;
 
 pub use config::{EngineConfig, ExecutionMode};
-pub use module::CompiledModule;
+pub use module::{
+    CompiledModule, FileModuleLoader, MemoryModuleLoader, ModuleError, ModuleLoader, ModuleStatus,
+};
 pub use pipeline::{Engine, EngineError, ExecOutcome, ExecutionOutcome, RunResult};
 
 pub use js_runtime::value::Value;

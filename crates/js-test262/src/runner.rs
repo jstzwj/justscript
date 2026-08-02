@@ -268,6 +268,8 @@ pub enum RuntimeExpect {
     CleanRun,
     /// Throw an error whose `.name` matches this.
     Throws(String),
+    /// A module must fail during resolution/linking with the named error type.
+    ResolutionThrows(String),
 }
 
 /// Aggregated runtime statistics.
@@ -312,8 +314,9 @@ const SUPPORTED_INCLUDES: &[&str] = &["assert.js", "sta.js"];
 /// Walk `root`, execute every runnable test in a **dedicated child process**
 /// (so a single test's crash — stack overflow, OOM, hang — can't take the whole
 /// runner down), and classify each outcome. Tests that are pure front-end cases
-/// (parse/early/resolution negative), modules, async, or that need unsupported
-/// harness helpers are skipped up front (no child spawned).
+/// (parse/early negatives), async tests, or tests needing unsupported harness
+/// helpers are skipped up front (no child spawned). Module tests execute with
+/// a filesystem-backed host rooted at the test file's directory.
 pub fn run_runtime(root: &Path) -> (Vec<RuntimeResult>, RuntimeStats) {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("js-test262"));
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -491,19 +494,14 @@ pub fn classify_runtime(fm: &Option<FrontMatter>) -> (Option<RuntimeExpect>, Opt
         Some(NegativePhase::Early) => {
             return (None, Some("early-error negative (not implemented)".into()))
         }
-        Some(NegativePhase::Resolution) => {
-            return (
-                None,
-                Some("resolution-phase negative (module linker)".into()),
-            )
-        }
+        Some(NegativePhase::Resolution) => {}
         _ => {}
     }
     // Flags we can't honour.
     for flag in &f.flags {
         match flag.as_str() {
-            "module" => return (None, Some("module (no linker)".into())),
-            "async" => return (None, Some("async (no Promise scheduling)".into())),
+            "module" => {}
+            "async" => {}
             "raw" | "onlyStrict" | "noStrict" => {}
             _ => {}
         }
@@ -515,6 +513,11 @@ pub fn classify_runtime(fm: &Option<FrontMatter>) -> (Option<RuntimeExpect>, Opt
         }
     }
     let expect = match &f.negative_phase {
+        Some(NegativePhase::Resolution) => RuntimeExpect::ResolutionThrows(
+            f.negative_type
+                .clone()
+                .unwrap_or_else(|| "SyntaxError".into()),
+        ),
         Some(NegativePhase::Runtime) => match &f.negative_type {
             Some(t) => RuntimeExpect::Throws(t.clone()),
             None => RuntimeExpect::CleanRun,
@@ -547,6 +550,61 @@ pub fn execute_test_source(
     }
 }
 
+/// Execute a Test262 test with its host-visible file identity. Module tests use
+/// this path as the entry module so relative `_FIXTURE.js` requests resolve in
+/// exactly the same directory as the test.
+pub fn execute_test_file(
+    path: &Path,
+    src: &str,
+    expect: &Option<RuntimeExpect>,
+    variant: Variant,
+    async_test: bool,
+) -> RuntimeOutcome {
+    if variant != Variant::Module {
+        let source = variant.source(src);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut engine = js_engine::Engine::default_interpreter();
+            if variant != Variant::Raw {
+                engine.install_test262_harness();
+            }
+            let execution = engine.execute(&source);
+            (execution, engine.test262_done_called())
+        }));
+        return match outcome {
+            Ok((exec, done)) => classify_async_outcome(exec, expect, async_test, done),
+            Err(_) => RuntimeOutcome::Incomplete("engine PANICKED".into()),
+        };
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut engine = js_engine::Engine::default_interpreter();
+        engine.install_test262_harness();
+        let loader = js_engine::FileModuleLoader;
+        let execution = match engine.run_module(&path.display().to_string(), &loader) {
+            Ok(result) => js_engine::ExecutionOutcome::Completed(result.value),
+            Err(error) => js_engine::ExecutionOutcome::Failed(error),
+        };
+        (execution, engine.test262_done_called())
+    }));
+    match outcome {
+        Ok((exec, done)) => classify_async_outcome(exec, expect, async_test, done),
+        Err(_) => RuntimeOutcome::Incomplete("engine PANICKED".into()),
+    }
+}
+
+fn classify_async_outcome(
+    exec: js_engine::ExecOutcome,
+    expect: &Option<RuntimeExpect>,
+    async_test: bool,
+    done: bool,
+) -> RuntimeOutcome {
+    let outcome = classify_outcome(exec, expect);
+    if async_test && matches!(outcome, RuntimeOutcome::Pass) && !done {
+        RuntimeOutcome::Fail("async test completed without calling $DONE".into())
+    } else {
+        outcome
+    }
+}
+
 fn classify_outcome(
     exec: js_engine::ExecOutcome,
     expect: &Option<RuntimeExpect>,
@@ -571,6 +629,9 @@ fn classify_outcome(
             ExecutionOutcome::Failed(EngineError::Fault(error)) => {
                 RuntimeOutcome::Incomplete(format!("vm: {}", error.message))
             }
+            ExecutionOutcome::Failed(EngineError::Module(error)) => {
+                RuntimeOutcome::Incomplete(format!("module: {error}"))
+            }
         },
         Some(RuntimeExpect::Throws(want)) => match exec {
             ExecutionOutcome::Failed(EngineError::Exception(error)) => {
@@ -593,6 +654,33 @@ fn classify_outcome(
                         .unwrap_or_default()
                 ))
             }
+            ExecutionOutcome::Failed(EngineError::Fault(error)) => {
+                RuntimeOutcome::Incomplete(format!("vm: {}", error.message))
+            }
+            ExecutionOutcome::Failed(EngineError::Module(error)) => {
+                RuntimeOutcome::Incomplete(format!("module: {error}"))
+            }
+        },
+        Some(RuntimeExpect::ResolutionThrows(want)) => match exec {
+            ExecutionOutcome::Failed(EngineError::Module(_))
+            | ExecutionOutcome::Failed(EngineError::Compile(_))
+                if want == "SyntaxError" =>
+            {
+                RuntimeOutcome::Pass
+            }
+            ExecutionOutcome::Failed(EngineError::Exception(error)) => {
+                let got = error.value.error_name().unwrap_or_else(|| "Error".into());
+                RuntimeOutcome::Fail(format!("expected resolution {want}, threw runtime {got}"))
+            }
+            ExecutionOutcome::Completed(_) => {
+                RuntimeOutcome::Fail(format!("expected resolution {want}, nothing thrown"))
+            }
+            ExecutionOutcome::Failed(EngineError::Module(error)) => RuntimeOutcome::Fail(format!(
+                "expected resolution {want}, got module error: {error}"
+            )),
+            ExecutionOutcome::Failed(EngineError::Compile(_)) => RuntimeOutcome::Fail(format!(
+                "expected resolution {want}, got compile SyntaxError"
+            )),
             ExecutionOutcome::Failed(EngineError::Fault(error)) => {
                 RuntimeOutcome::Incomplete(format!("vm: {}", error.message))
             }

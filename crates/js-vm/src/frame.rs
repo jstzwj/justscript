@@ -1,21 +1,20 @@
 //! A single call frame: the function being executed, its program counter,
 //! locals and operand stack.
 //!
-//! Locals are **cells** (`Rc<RefCell<Value>>`) rather than bare values so that
+//! Locals are binding cells rather than bare values so that
 //! closures can capture them by reference: an inner function holds the same
 //! cell as its enclosing function, and writes from either side are mutually
 //! visible. Operand-stack values remain plain `Value`s.
 
 use crate::stack::OperandStack;
-use js_runtime::value::Value;
+use js_runtime::value::{Cell, Value};
 use js_syntax::Span;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// A shared, mutable local-variable cell.
-pub type Cell = Rc<RefCell<Value>>;
-
 pub struct CallFrame {
+    /// Index of the defining bytecode module in the active module graph.
+    pub module_index: usize,
     /// Index of the executing function within the module's function table
     /// (0 = top-level `<main>`).
     pub func_index: usize,
@@ -53,7 +52,17 @@ pub struct ActiveTry {
 
 impl CallFrame {
     pub fn new(func_index: usize, slot_count: u16, span: Span) -> CallFrame {
+        Self::for_module(0, func_index, slot_count, span)
+    }
+
+    pub fn for_module(
+        module_index: usize,
+        func_index: usize,
+        slot_count: u16,
+        span: Span,
+    ) -> CallFrame {
         CallFrame {
+            module_index,
             func_index,
             pc: 0,
             locals: (0..slot_count)
@@ -70,9 +79,20 @@ impl CallFrame {
             pending_throw: None,
         }
     }
+
+    pub fn with_locals(
+        module_index: usize,
+        func_index: usize,
+        locals: Vec<Cell>,
+        span: Span,
+    ) -> CallFrame {
+        let mut frame = Self::for_module(module_index, func_index, 0, span);
+        frame.locals = locals;
+        frame
+    }
 }
 
 /// Construct a fresh cell wrapping `v`.
 pub fn new_cell(v: Value) -> Cell {
-    Rc::new(RefCell::new(v))
+    Cell::mutable(v)
 }

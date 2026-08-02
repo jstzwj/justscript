@@ -61,6 +61,8 @@ The public engine API uses one failure taxonomy:
 
 - `EngineError::Compile` contains source-bound parser, early-error, or bytecode
   diagnostics.
+- `EngineError::Module` represents host resolution/loading and module linking
+  failures; it is distinct from JavaScript exceptions and VM faults.
 - `EngineError::Exception` is an uncaught JavaScript value with its throw site
   and JavaScript call stack. It is a language completion, not a compiler error.
 - `EngineError::Fault` represents a VM/backend bug or unsupported execution
@@ -68,7 +70,7 @@ The public engine API uses one failure taxonomy:
 
 `Engine::run` returns this taxonomy as a `Result`; `Engine::execute` exposes the
 same error through `ExecutionOutcome` for hosts that prefer exhaustive matching.
-The planned multi-module extension is recorded in
+The multi-module source migration is tracked in
 [`docs/multi-module-source-map.md`](docs/multi-module-source-map.md).
 
 ## Usage
@@ -93,6 +95,8 @@ scripts/test262-matrix.sh language-front-end
 Test262 conformance is reported as five non-aggregated profiles; see
 [`docs/test262-conformance.md`](docs/test262-conformance.md). The bytecode and
 execution-backend contract is documented in
-[`docs/bytecode-architecture.md`](docs/bytecode-architecture.md).
+[`docs/bytecode-architecture.md`](docs/bytecode-architecture.md); the module
+loader/linker/runtime contract is documented in
+[`docs/module-runtime.md`](docs/module-runtime.md).
 
 [Cranelift]: https://github.com/bytecodealliance/wasmtime/tree/main/cranelift

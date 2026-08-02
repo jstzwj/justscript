@@ -106,6 +106,9 @@ pub enum Opcode {
     /// `yield` (generator): pop the yielded value, suspend the frame, push the
     /// value passed to the next `.next(v)` onto resumption.
     Yield,
+    /// `await`: perform Promise resolution and a job-queue checkpoint, then
+    /// push the fulfilled value or throw the rejection reason.
+    Await,
     /// `throw expr` (pops a value): raise it as an exception.
     Throw,
     /// Push an exception handler (catch_pc + finally_pc from the function's

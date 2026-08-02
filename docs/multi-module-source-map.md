@@ -1,10 +1,10 @@
 # Multi-Module Source Map Memo
 
-Status: deferred until the module loader is implemented.
+Status: phase 1 implemented; `SourceSpan` migration remains.
 
 ## Context
 
-The diagnostic pipeline currently retains one `Arc<SourceFile>` per compiled
+The diagnostic pipeline retains one `Arc<SourceFile>` per compiled
 unit. AST spans are byte ranges local to that source, bytecode stores a
 parallel PC-to-`Span` table, and VM failures carry the same source plus their
 JavaScript stack. This is complete for scripts and independently compiled
@@ -14,7 +14,8 @@ The single-source assumptions that must not leak into the module loader are:
 
 - `DiagnosticReport` owns exactly one `SourceFile`.
 - `BytecodeModule` owns one optional `SourceFile`.
-- `JsException` and `EngineFault` resolve every frame against one source.
+- `JsException` and `EngineFault` retain a primary source, while each runtime
+  frame now also retains the source of its defining bytecode module.
 - A bare `Span` does not identify the file whose bytes it addresses.
 
 ## Decision
@@ -65,8 +66,8 @@ location rendering with compiler diagnostics, but does not turn them into
 
 ## Migration Order
 
-1. Add `SourceId`, `SourceSpan`, and an engine-owned `Arc<SourceMap>` without
-   changing AST `Span`.
+1. **Implemented in part:** add `SourceId` and an engine-owned `SourceMap`
+   without changing AST `Span`. `SourceSpan` is still pending.
 2. Make `ParseSess` identify its source by `SourceId`; return a `ParseUnit`
    containing the `Program` and ID.
 3. Change `Diagnostic`/`Note` locations and `DiagnosticReport` to resolve
@@ -74,10 +75,12 @@ location rendering with compiler diagnostics, but does not turn them into
    notes in others.
 4. Change bytecode source maps from `Vec<Span>` to `Vec<SourceSpan>` and remove
    `BytecodeModule::source`.
-5. Change runtime frames to carry `SourceSpan`; make `JsException` and
-   `EngineFault` retain the graph's `Arc<SourceMap>` rather than one file.
-6. Integrate the module loader's canonicalization/cache/link/evaluate states.
-   Cycles must reuse existing module records and source identities.
+5. **Transitional implementation:** runtime frames carry their own
+   `Arc<SourceFile>`, so cross-module stacks render correctly. Replace this with
+   `SourceSpan` plus the graph's shared `SourceMap`.
+6. **Implemented:** integrate loader canonicalization/cache and
+   link/evaluate states. Cycles reuse existing module records and source
+   identities.
 7. Remove the temporary single-source fields from `CompiledModule` and public
    reporting APIs after all callers use `SourceMap`.
 

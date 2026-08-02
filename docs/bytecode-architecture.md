@@ -15,8 +15,8 @@ The design borrows four boundaries from Hermes:
    entry function.
 3. Instructions have declared operand kinds; string, constant, function and
    control-flow indices are never interchangeable by convention alone.
-4. A future runtime module resolves bytecode-local identities to realm-local
-   objects and is the unit that JIT code attaches to.
+4. A runtime module resolves bytecode-local identities to realm-local cells and
+   is the unit that future JIT code attaches to.
 
 JustScript V1 remains stack-based while language coverage is completed. A
 register conversion is deferred until measurements show that dispatch traffic
@@ -53,16 +53,18 @@ Semantic operations have semantic opcodes. In particular `>>>`, `in`, `void`
 and the two forms of `delete` may not lower to `Shr`, `Add` or `Nop`. The same
 rule applies to future module, environment, Promise and class instructions.
 
-V1 keeps source spans parallel to instructions. The planned `SourceId` /
-`SourceMap` migration changes each entry to a cross-module `SourceSpan` without
-changing AST-local spans; see `multi-module-source-map.md`.
+V1 keeps source spans parallel to instructions. `SourceId` / `SourceMap` now
+assign stable identities to source snapshots, and runtime frames retain their
+own source across module calls. The remaining migration changes each bytecode
+entry to a compact cross-module `SourceSpan`; see `multi-module-source-map.md`.
 
 ## Required Runtime Structures
 
 The next runtime layer introduces these records before adding feature opcodes:
 
-- `RuntimeModule`: verified module, resolved string/property keys, function
-  objects, import/export cells and inline-cache storage.
+- `RuntimeModule`: the first implementation now owns verified bytecode,
+  import/export cells and link/evaluation state. Resolved string/property keys
+  and inline-cache storage remain future extensions.
 - `Environment`: declarative, function, module, object and global environment
   records with mutable/immutable binding cells and TDZ state.
 - `Completion`: normal, return, throw, break and continue, so `finally`,
@@ -74,12 +76,16 @@ The next runtime layer introduces these records before adding feature opcodes:
 ## Migration Sequence
 
 1. Stabilize opcode metadata, verification and interpreter-only semantics.
-2. Replace flat local/global lookup with environment records and binding
-   opcodes. This is required before modules, direct eval and strict semantics.
-3. Add `RuntimeModule`, module records and live import/export binding cells;
-   integrate the multi-source map design.
-4. Add completion records, generators/async frames, Promise jobs and the
-   Test262 async protocol.
+2. Add the first `RuntimeModule`, module graph and live import/export cells on
+   top of existing local cells; integrate source identities and cross-module
+   VM function dispatch.
+3. Replace the remaining flat local/global lookup with full environment records
+   and binding opcodes. This is still required for TDZ, direct eval and complete
+   strict/module semantics.
+4. **In progress:** `Await`, FIFO Promise reactions, async function wrapping,
+   top-level module state and the Test262 `$DONE` protocol are implemented for
+   synchronously drainable jobs. Suspended async frames and full Promise
+   resolution remain.
 5. Complete object internal methods, property descriptors, classes and Proxy;
    lowering calls the same runtime abstract operations.
 6. Fill standard built-ins, typed memory and host APIs against the runtime

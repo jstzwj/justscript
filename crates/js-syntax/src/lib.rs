@@ -15,5 +15,5 @@ pub mod token;
 pub use ast::*;
 pub use keyword::Keyword;
 pub use punctuator::Punctuator;
-pub use source::{BytePos, Loc, SourceFile, Span};
+pub use source::{BytePos, Loc, SourceFile, SourceId, SourceMap, Span};
 pub use token::{Token, TokenKind};

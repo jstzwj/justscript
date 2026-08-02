@@ -18,11 +18,31 @@ pub use shape::{Shape, ShapeProperty, ShapeTransition};
 
 use crate::value::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 /// A shared, mutable handle to an object on the (future) GC heap.
 pub type JsObject = Rc<RefCell<ObjectData>>;
+
+#[derive(Clone, Debug)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+#[derive(Clone, Debug)]
+pub struct PromiseReaction {
+    pub on_fulfilled: Option<Value>,
+    pub on_rejected: Option<Value>,
+    pub result: JsObject,
+}
+
+#[derive(Clone, Debug)]
+pub struct PromiseData {
+    pub state: PromiseState,
+    pub reactions: Vec<PromiseReaction>,
+}
 
 /// The concrete object payload.
 #[derive(Debug, Default)]
@@ -42,6 +62,15 @@ pub struct ObjectData {
     pub is_exotic_array: bool,
     /// True for callable objects.
     pub callable: bool,
+    /// Sorted live bindings exposed by a Module Namespace Exotic Object.
+    /// Presence identifies the exotic object; namespace objects have a null
+    /// prototype and are non-extensible at the VM object-operation boundary.
+    pub module_namespace: Option<BTreeMap<String, crate::value::Cell>>,
+    /// A deferred namespace triggers evaluation of this module index before
+    /// its first observable property operation.
+    pub deferred_module: Option<usize>,
+    /// `Some` only for Promise instances.
+    pub promise: Option<PromiseData>,
 }
 
 impl ObjectData {
@@ -57,6 +86,31 @@ impl ObjectData {
     /// Construct a fresh `JsObject` handle.
     pub fn new_handle() -> JsObject {
         Rc::new(RefCell::new(ObjectData::new()))
+    }
+
+    pub fn module_namespace(exports: BTreeMap<String, crate::value::Cell>) -> JsObject {
+        Self::module_namespace_with_deferred(exports, None)
+    }
+
+    pub fn module_namespace_with_deferred(
+        exports: BTreeMap<String, crate::value::Cell>,
+        deferred_module: Option<usize>,
+    ) -> JsObject {
+        let mut object = ObjectData::new();
+        object.class = "Module";
+        object.module_namespace = Some(exports);
+        object.deferred_module = deferred_module;
+        Rc::new(RefCell::new(object))
+    }
+
+    pub fn promise() -> JsObject {
+        let mut object = ObjectData::new();
+        object.class = "Promise";
+        object.promise = Some(PromiseData {
+            state: PromiseState::Pending,
+            reactions: Vec::new(),
+        });
+        Rc::new(RefCell::new(object))
     }
 }
 

@@ -43,6 +43,24 @@ runtime numbers from the sparse checkout are deliberately not recorded here.
 Until a complete run exists, a profile is **unmeasured**, never implicitly
 passing.
 
+### Language Runtime Module Subset
+
+The focused `test/language/module-code` runtime run is tracked as a diagnostic
+subset of `language-runtime`, not as a sixth profile and not as the complete
+language-runtime result.
+
+| Files / variants | Executed | Pass | Fail | Incomplete | Skip |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 599 / 602 | 407 | 290 | 61 | 56 | 195 |
+
+This snapshot includes real filesystem `_FIXTURE.js` loading, resolution
+negatives, isolated realms, Promise jobs and async `$DONE`. The 71.3% rate over
+executed cases must not be reported as the language-runtime or project-wide
+Test262 pass rate. Current actionable clusters are top-level await (55), module
+namespace internal methods (26), and source-phase imports (2); many of those
+depend on class inheritance, object methods/spread, Symbol/property descriptor
+support and dynamic import rather than the loader itself.
+
 The standards-based front-end repairs have removed all false accepts from the
 current `test/language` corpus. Block and Module Early Errors now compare the
 specification's `LexicallyDeclaredNames`, `VarDeclaredNames`, `ExportedNames`,

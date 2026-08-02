@@ -6,10 +6,10 @@
 //! (`map`/`filter`/`forEach`) are deferred — they need native→JS sub-dispatch.
 
 use crate::interp::{
-    array_get, array_len, eq_strict, make_array, to_string, InterpError, Interpreter, NativeFn,
-    NativeResult,
+    array_get, array_len, eq_strict, make_array, to_string, BytecodeGraph, InterpError,
+    Interpreter, NativeFn, NativeResult,
 };
-use js_bytecode::BytecodeModule;
+use js_runtime::object::{JsObject, PromiseData, PromiseReaction, PromiseState};
 use js_runtime::value::{JsFunction, Value, ValueData};
 
 /// Builtin method ids (must follow the generator ids 0..=2 in `default_natives`).
@@ -106,8 +106,15 @@ pub mod id {
     pub const ASSERT_NOT_SAME_VALUE: u16 = 89;
     pub const ASSERT_THROWS: u16 = 90;
     pub const DONE: u16 = 91;
+    pub const PROMISE_CTOR: u16 = 92;
+    pub const PROMISE_RESOLVE: u16 = 93;
+    pub const PROMISE_REJECT: u16 = 94;
+    pub const PROMISE_THEN: u16 = 95;
+    pub const PROMISE_CATCH: u16 = 96;
+    pub const PROMISE_RESOLVING_FULFILL: u16 = 97;
+    pub const PROMISE_RESOLVING_REJECT: u16 = 98;
     /// One-past-the-last id (for registering the dispatch table).
-    pub const COUNT: u16 = 92;
+    pub const COUNT: u16 = 99;
 }
 
 /// Resolve a static method on a global constructor function (Number/String).
@@ -125,6 +132,11 @@ pub fn native_static_id(obj: &Value, name: &str) -> Option<u16> {
         }),
         STRING_FN => Some(match name {
             "fromCharCode" => STR_FROM_CHAR_CODE,
+            _ => return None,
+        }),
+        PROMISE_CTOR => Some(match name {
+            "resolve" => PROMISE_RESOLVE,
+            "reject" => PROMISE_REJECT,
             _ => return None,
         }),
         _ => None,
@@ -161,6 +173,11 @@ pub fn builtin_method_id(this: &Value, name: &str) -> Option<u16> {
         ValueData::Object(o) if o.borrow().class == "RegExp" => Some(match name {
             "test" => REGEX_TEST,
             "exec" => REGEX_EXEC,
+            _ => return None,
+        }),
+        ValueData::Object(o) if o.borrow().class == "Promise" => Some(match name {
+            "then" => PROMISE_THEN,
+            "catch" => PROMISE_CATCH,
             _ => return None,
         }),
         ValueData::String(_) => Some(match name {
@@ -216,7 +233,7 @@ impl NativeFn for Builtin {
     fn call(
         &self,
         interp: &mut Interpreter,
-        module: &BytecodeModule,
+        module: &BytecodeGraph<'_>,
         this: Value,
         _f: &JsFunction,
         args: Vec<Value>,
@@ -281,10 +298,21 @@ impl NativeFn for Builtin {
                     .powf(arg_f64(&args, 1).unwrap_or(0.0)),
             ),
             MATH_SIGN => math_sign(arg_f64(&args, 0).unwrap_or(f64::NAN)),
-            OBJECT_KEYS => object_keys(&args),
-            OBJECT_VALUES => object_values(&args),
-            OBJECT_ENTRIES => object_entries(&args),
-            OBJECT_ASSIGN => object_assign(args),
+            OBJECT_KEYS | OBJECT_VALUES | OBJECT_ENTRIES | OBJECT_ASSIGN => {
+                if let Some(target) = args.first() {
+                    interp.ensure_deferred_namespace(module, target)?;
+                    if matches!(self.id, OBJECT_KEYS | OBJECT_VALUES | OBJECT_ENTRIES) {
+                        validate_namespace_bindings(target)?;
+                    }
+                }
+                match self.id {
+                    OBJECT_KEYS => object_keys(&args),
+                    OBJECT_VALUES => object_values(&args),
+                    OBJECT_ENTRIES => object_entries(&args),
+                    OBJECT_ASSIGN => object_assign(args),
+                    _ => unreachable!(),
+                }
+            }
             JSON_STRINGIFY => json_stringify(&args),
             PARSE_INT => parse_int(&args),
             PARSE_FLOAT => parse_float(&args),
@@ -342,11 +370,222 @@ impl NativeFn for Builtin {
             ASSERT_SAME_VALUE => return assert_same_value(&args, false),
             ASSERT_NOT_SAME_VALUE => return assert_same_value(&args, true),
             ASSERT_THROWS => return assert_throws(interp, module, &args),
-            DONE => return done(&args),
+            DONE => return done(interp, &args),
+            PROMISE_CTOR => return promise_constructor(interp, module, &this, args),
+            PROMISE_RESOLVE => return Ok(NativeResult::Value(promise_resolve(args))),
+            PROMISE_REJECT => {
+                return Ok(NativeResult::Value(promise_rejected(
+                    args.into_iter().next().unwrap_or_else(Value::undefined),
+                )))
+            }
+            PROMISE_THEN => return promise_then(interp, &this, args),
+            PROMISE_CATCH => {
+                let on_rejected = args.into_iter().next().unwrap_or_else(Value::undefined);
+                return promise_then(interp, &this, vec![Value::undefined(), on_rejected]);
+            }
+            PROMISE_RESOLVING_FULFILL | PROMISE_RESOLVING_REJECT => {
+                let promise = _f.bound_object.clone().ok_or_else(|| {
+                    InterpError::Internal("Promise resolving function lost its promise".into())
+                })?;
+                settle_promise(
+                    interp,
+                    promise,
+                    self.id == PROMISE_RESOLVING_REJECT,
+                    args.into_iter().next().unwrap_or_else(Value::undefined),
+                );
+                return Ok(NativeResult::Value(Value::undefined()));
+            }
             _ => Value::undefined(),
         };
         Ok(NativeResult::Value(result))
     }
+}
+
+pub(crate) enum AwaitedPromise {
+    Pending,
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+fn promise_object(value: &Value) -> Option<JsObject> {
+    match value.data() {
+        ValueData::Object(object) if object.borrow().promise.is_some() => Some(object.clone()),
+        _ => None,
+    }
+}
+
+fn new_promise() -> JsObject {
+    js_runtime::object::ObjectData::promise()
+}
+
+pub(crate) fn promise_fulfilled(value: Value) -> Value {
+    let promise = new_promise();
+    promise.borrow_mut().promise.as_mut().unwrap().state = PromiseState::Fulfilled(value);
+    Value::object(promise)
+}
+
+pub(crate) fn promise_rejected(value: Value) -> Value {
+    let promise = new_promise();
+    promise.borrow_mut().promise.as_mut().unwrap().state = PromiseState::Rejected(value);
+    Value::object(promise)
+}
+
+pub(crate) fn promise_result(value: &Value) -> Option<AwaitedPromise> {
+    let promise = promise_object(value)?;
+    let state = promise.borrow().promise.as_ref().unwrap().state.clone();
+    Some(match state {
+        PromiseState::Pending => AwaitedPromise::Pending,
+        PromiseState::Fulfilled(value) => AwaitedPromise::Fulfilled(value),
+        PromiseState::Rejected(value) => AwaitedPromise::Rejected(value),
+    })
+}
+
+pub(crate) fn settle_promise(
+    interp: &mut Interpreter,
+    promise: JsObject,
+    rejected: bool,
+    value: Value,
+) {
+    let reactions = {
+        let mut object = promise.borrow_mut();
+        let data = object.promise.as_mut().expect("Promise object data");
+        if !matches!(data.state, PromiseState::Pending) {
+            return;
+        }
+        data.state = if rejected {
+            PromiseState::Rejected(value.clone())
+        } else {
+            PromiseState::Fulfilled(value.clone())
+        };
+        std::mem::take(&mut data.reactions)
+    };
+    for reaction in reactions {
+        interp.enqueue_promise_job(crate::interp::PromiseJob {
+            reaction,
+            argument: value.clone(),
+            rejected,
+        });
+    }
+}
+
+fn promise_resolve(args: Vec<Value>) -> Value {
+    let value = args.into_iter().next().unwrap_or_else(Value::undefined);
+    if promise_object(&value).is_some() {
+        value
+    } else {
+        promise_fulfilled(value)
+    }
+}
+
+fn promise_constructor(
+    interp: &mut Interpreter,
+    modules: &BytecodeGraph<'_>,
+    this: &Value,
+    args: Vec<Value>,
+) -> Result<NativeResult, InterpError> {
+    let Some(object) = (match this.data() {
+        ValueData::Object(object) => Some(object.clone()),
+        _ => None,
+    }) else {
+        return Err(InterpError::Throw(type_error_value(
+            "Promise constructor requires new",
+        )));
+    };
+    {
+        let mut object_data = object.borrow_mut();
+        object_data.class = "Promise";
+        object_data.promise = Some(PromiseData {
+            state: PromiseState::Pending,
+            reactions: Vec::new(),
+        });
+    }
+    let executor = args.into_iter().next().unwrap_or_else(Value::undefined);
+    if !executor.is_function() {
+        return Err(InterpError::Throw(type_error_value(
+            "Promise executor is not callable",
+        )));
+    }
+    let resolving = |name: &str, id: u16| {
+        let mut function = JsFunction::new(name, 0, 1);
+        function.native = Some(id);
+        function.bound_object = Some(object.clone());
+        Value::function(function)
+    };
+    let fulfill = resolving("resolve", id::PROMISE_RESOLVING_FULFILL);
+    let reject = resolving("reject", id::PROMISE_RESOLVING_REJECT);
+    if let Err(error) =
+        interp.call_value(modules, executor, vec![fulfill, reject], Value::undefined())
+    {
+        match error {
+            InterpError::Throw(reason) => settle_promise(interp, object.clone(), true, reason),
+            error => return Err(error),
+        }
+    }
+    Ok(NativeResult::Value(Value::object(object)))
+}
+
+fn promise_then(
+    interp: &mut Interpreter,
+    this: &Value,
+    args: Vec<Value>,
+) -> Result<NativeResult, InterpError> {
+    let promise = promise_object(this).ok_or_else(|| {
+        InterpError::Throw(type_error_value(
+            "Promise.prototype.then receiver is not a Promise",
+        ))
+    })?;
+    let callable = |value: Option<&Value>| value.filter(|value| value.is_function()).cloned();
+    let reaction = PromiseReaction {
+        on_fulfilled: callable(args.first()),
+        on_rejected: callable(args.get(1)),
+        result: new_promise(),
+    };
+    let state = {
+        let mut object = promise.borrow_mut();
+        let data = object.promise.as_mut().unwrap();
+        match &data.state {
+            PromiseState::Pending => {
+                data.reactions.push(reaction.clone());
+                None
+            }
+            state => Some(state.clone()),
+        }
+    };
+    if let Some(state) = state {
+        let (argument, rejected) = match state {
+            PromiseState::Fulfilled(value) => (value, false),
+            PromiseState::Rejected(value) => (value, true),
+            PromiseState::Pending => unreachable!(),
+        };
+        interp.enqueue_promise_job(crate::interp::PromiseJob {
+            reaction: reaction.clone(),
+            argument,
+            rejected,
+        });
+    }
+    Ok(NativeResult::Value(Value::object(reaction.result)))
+}
+
+fn type_error_value(message: &str) -> Value {
+    error_ctor(&Value::undefined(), &[Value::string(message)], "TypeError")
+}
+
+fn validate_namespace_bindings(value: &Value) -> Result<(), InterpError> {
+    let ValueData::Object(object) = value.data() else {
+        return Ok(());
+    };
+    let object = object.borrow();
+    let Some(namespace) = &object.module_namespace else {
+        return Ok(());
+    };
+    if namespace.values().any(|binding| !binding.is_initialized()) {
+        return Err(InterpError::Throw(error_ctor(
+            &Value::undefined(),
+            &[Value::string("cannot access binding before initialization")],
+            "ReferenceError",
+        )));
+    }
+    Ok(())
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -653,7 +892,7 @@ fn str_concat(this: &Value, args: Vec<Value>) -> Value {
 
 fn arr_sort(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -810,7 +1049,7 @@ fn str_starts_ends(this: &Value, args: Vec<Value>, is_starts: bool) -> Value {
 /// - function replacement `fn(match, p1, p2, …, offset, string)`.
 fn str_replace(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1033,7 +1272,7 @@ fn str_at(this: &Value, args: Vec<Value>) -> Value {
 /// Call `cb(element, index, array)` and return its result.
 fn call_cb(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     cb: &Value,
     arr: &Value,
     element: Value,
@@ -1049,7 +1288,7 @@ fn call_cb(
 
 fn arr_map(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1065,7 +1304,7 @@ fn arr_map(
 
 fn arr_filter(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1084,7 +1323,7 @@ fn arr_filter(
 
 fn arr_for_each(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1099,7 +1338,7 @@ fn arr_for_each(
 
 fn arr_reduce(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1125,7 +1364,7 @@ fn arr_reduce(
 
 fn arr_find_cb(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
 ) -> Result<NativeResult, InterpError> {
@@ -1145,7 +1384,7 @@ fn arr_find_cb(
 /// stop on first falsy) share this shape.
 fn arr_some_every(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     this: &Value,
     args: Vec<Value>,
     is_every: bool,
@@ -1273,6 +1512,7 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
     globals.insert("Number".to_string(), native_fn("Number", NUMBER_FN));
     globals.insert("String".to_string(), native_fn("String", STRING_FN));
     globals.insert("Boolean".to_string(), native_fn("Boolean", BOOLEAN_FN));
+    globals.insert("Promise".to_string(), native_fn("Promise", PROMISE_CTOR));
     // Error constructors.
     globals.insert("Error".to_string(), native_fn("Error", ERROR_CTOR));
     globals.insert(
@@ -1347,7 +1587,9 @@ fn object_keys(args: &[Value]) -> Value {
     let keys: Vec<Value> = match target.data() {
         ValueData::Object(o) => {
             let b = o.borrow();
-            if b.is_exotic_array {
+            if let Some(namespace) = &b.module_namespace {
+                namespace.keys().map(|k| Value::string(k.clone())).collect()
+            } else if b.is_exotic_array {
                 (0..array_len(&target))
                     .map(|i| Value::string(i.to_string()))
                     .collect()
@@ -1371,7 +1613,12 @@ fn object_values(args: &[Value]) -> Value {
     let vals: Vec<Value> = match target.data() {
         ValueData::Object(o) => {
             let b = o.borrow();
-            if b.is_exotic_array {
+            if let Some(namespace) = &b.module_namespace {
+                namespace
+                    .values()
+                    .filter_map(|binding| binding.get().ok())
+                    .collect()
+            } else if b.is_exotic_array {
                 (0..array_len(&target))
                     .map(|i| array_get(&target, i))
                     .collect()
@@ -1402,6 +1649,14 @@ fn object_entries(args: &[Value]) -> Value {
     let mut entries: Vec<Value> = Vec::new();
     if let ValueData::Object(o) = target.data() {
         let b = o.borrow();
+        if let Some(namespace) = &b.module_namespace {
+            for (key, binding) in namespace {
+                if let Ok(value) = binding.get() {
+                    entries.push(make_array(vec![Value::string(key.clone()), value]));
+                }
+            }
+            return make_array(entries);
+        }
         for (k, d) in b.properties.iter() {
             if k == "length" && b.is_exotic_array {
                 continue;
@@ -1730,7 +1985,7 @@ fn assert_same_value(args: &[Value], negate: bool) -> Result<NativeResult, Inter
 /// is wrong.
 fn assert_throws(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    module: &BytecodeGraph<'_>,
     args: &[Value],
 ) -> Result<NativeResult, InterpError> {
     let ctor = args.get(0).cloned().unwrap_or_else(Value::undefined);
@@ -1806,7 +2061,8 @@ fn thrown_name(v: &Value) -> Option<String> {
 /// `undefined`) it signals success; any other argument is a failure, surfaced
 /// as a throw so the runner observes it. (Async scheduling itself isn't
 /// supported, but synchronous `$DONE(value)` rejection paths still matter.)
-fn done(args: &[Value]) -> Result<NativeResult, InterpError> {
+fn done(interp: &mut Interpreter, args: &[Value]) -> Result<NativeResult, InterpError> {
+    interp.mark_test262_done();
     match args.get(0) {
         Some(v) if !matches!(v.data(), ValueData::Undefined) => Err(InterpError::Throw(v.clone())),
         _ => Ok(NativeResult::Value(Value::undefined())),

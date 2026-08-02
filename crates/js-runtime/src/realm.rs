@@ -30,6 +30,8 @@ pub struct Realm {
     pub symbol_proto: Option<JsObject>,
     /// `%BigIntPrototype%`.
     pub bigint_proto: Option<JsObject>,
+    /// Host-observable completion signal used by Test262's async protocol.
+    pub test262_done_called: bool,
 }
 
 impl Realm {
@@ -46,6 +48,7 @@ impl Realm {
             boolean_proto: None,
             symbol_proto: None,
             bigint_proto: None,
+            test262_done_called: false,
         };
         builtins::install_all(&mut realm);
         realm
