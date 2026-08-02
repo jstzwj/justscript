@@ -11,11 +11,15 @@
 
 pub mod cursor;
 pub mod lexer;
+mod unicode_id;
 pub mod validate;
 
 pub use cursor::Cursor;
 pub use lexer::{tokenize, Lexer};
 pub use validate::{parse_number, validate_numeric_literal, NumericError};
+
+/// Unicode property version used for ECMAScript IdentifierName tokenization.
+pub const IDENTIFIER_UNICODE_VERSION: (u8, u8, u8) = unicode_id::UNICODE_VERSION;
 
 #[cfg(test)]
 mod tests;

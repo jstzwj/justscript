@@ -22,9 +22,11 @@ use js_syntax::ast::{ClassDecl, FunctionDecl, Program, ProgramItem, ProgramKind}
 use js_syntax::Span;
 
 use crate::static_semantics::{
-    bound_names, contains_arguments, contains_use_strict, is_simple_parameter_list,
-    program_contains_use_strict, statements_contain_arguments, switch_lexically_declared_names,
-    switch_var_declared_names, var_declared_names,
+    bound_names, contains_arguments, contains_use_strict, import_local_names,
+    is_simple_parameter_list, module_static_semantics, program_contains_use_strict,
+    statement_list_lexically_declared_names, statement_list_var_declared_names,
+    statements_contain_arguments, switch_lexically_declared_names, switch_var_declared_names,
+    var_declared_names,
 };
 
 /// Run all early-error checks against a parsed [`Program`].
@@ -41,12 +43,16 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
         yield_ctx: vec![false],
         super_prop: vec![false],
         super_call: vec![false],
+        new_target_allowed: false,
         private_env: Vec::new(),
         static_block_depth: 0,
         labels: Vec::new(),
         breakable_depth: 0,
         iteration_depth: 0,
     };
+    if is_module {
+        c.check_module_body(&program.body, program.span);
+    }
     for item in &program.body {
         if !is_module && program_item_is_using_declaration(item) {
             c.err(
@@ -64,9 +70,14 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
 /// hoisted `var`/`function` declarations.
 #[derive(Default)]
 struct Scope {
-    lexical: std::collections::HashMap<String, Span>,
+    lexical: std::collections::HashMap<String, LexicalBinding>,
     vars: std::collections::HashSet<String>,
     is_function: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LexicalBinding {
+    ordinary_function: bool,
 }
 
 impl Scope {
@@ -96,6 +107,9 @@ struct Checker {
     super_prop: Vec<bool>,
     /// `super()` call allowed here (in a derived class's constructor).
     super_call: Vec<bool>,
+    /// `new.target` is valid in function code and class static blocks. Arrow
+    /// functions inherit this context; scripts and modules do not.
+    new_target_allowed: bool,
     /// Lexically enclosing class private environments. The current class is
     /// last; nested classes can also see names from their enclosing classes.
     private_env: Vec<std::collections::HashSet<String>>,
@@ -112,6 +126,57 @@ struct Checker {
 impl Checker {
     fn err(&mut self, span: Span, msg: impl Into<String>) {
         self.errors.push(Diagnostic::error(span, msg));
+    }
+
+    fn check_module_body(&mut self, body: &[ProgramItem], span: Span) {
+        let semantics = module_static_semantics(body);
+        let mut declared = semantics.var_declared_names.clone();
+        let mut seen_lexical = std::collections::HashSet::new();
+        for name in &semantics.lexically_declared_names {
+            if !seen_lexical.insert(name.clone()) {
+                self.err(
+                    span,
+                    format!("module has multiple lexical declarations for `{name}`"),
+                );
+            }
+            if semantics.var_declared_names.contains(name) {
+                self.err(
+                    span,
+                    format!("module lexical declaration `{name}` conflicts with a var declaration"),
+                );
+            }
+            declared.insert(name.clone());
+        }
+
+        let mut seen_exports = std::collections::HashSet::new();
+        for name in &semantics.exported_names {
+            if !seen_exports.insert(name.clone()) {
+                self.err(span, format!("module exports `{name}` more than once"));
+            }
+        }
+        for name in &semantics.exported_bindings {
+            if !declared.contains(name) {
+                self.err(
+                    span,
+                    format!("exported binding `{name}` is not declared by this module"),
+                );
+            }
+        }
+        for name in &semantics.imported_local_names {
+            self.check_strict_binding_name(name, span);
+        }
+        for name in &semantics.invalid_local_export_names {
+            self.err(
+                span,
+                format!("string export name `{name}` cannot reference a local binding"),
+            );
+        }
+        for (attribute_span, key) in &semantics.duplicate_attribute_keys {
+            self.err(
+                *attribute_span,
+                format!("import attribute key `{key}` occurs more than once"),
+            );
+        }
     }
 
     // ---- scope helpers --------------------------------------------------
@@ -140,13 +205,24 @@ impl Checker {
     /// current scope. Errors on a same-scope collision with another lexical or
     /// a `var`/`function` binding.
     fn declare_lexical(&mut self, name: &str, span: Span) {
+        self.declare_lexical_kind(name, span, false);
+    }
+
+    fn declare_block_function(&mut self, name: &str, span: Span, ordinary: bool) {
+        self.declare_lexical_kind(name, span, ordinary);
+    }
+
+    fn declare_lexical_kind(&mut self, name: &str, span: Span, ordinary_function: bool) {
         let scope = self.scopes.last_mut().unwrap();
-        if let Some(_prev) = scope.lexical.get(name) {
-            self.err(
-                span,
-                format!("identifier `{}` has already been declared", name),
-            );
-            return;
+        if let Some(previous) = scope.lexical.get(name) {
+            let annex_b_pair = !self.strict && previous.ordinary_function && ordinary_function;
+            if !annex_b_pair {
+                self.err(
+                    span,
+                    format!("identifier `{}` has already been declared", name),
+                );
+                return;
+            }
         }
         if scope.vars.contains(name) {
             self.err(
@@ -155,7 +231,9 @@ impl Checker {
             );
             return;
         }
-        scope.lexical.insert(name.to_string(), span);
+        scope
+            .lexical
+            .insert(name.to_string(), LexicalBinding { ordinary_function });
     }
 
     /// Declare a hoisted `var`/`function` binding in the nearest function
@@ -180,7 +258,15 @@ impl Checker {
     fn check_item(&mut self, item: &ProgramItem) {
         match item {
             ProgramItem::Stmt(s) => self.check_stmt(s),
-            ProgramItem::Decl(d) => self.check_decl(d),
+            ProgramItem::Decl(d) => {
+                if !self.is_module && matches!(d, Decl::Import { .. } | Decl::Export { .. }) {
+                    self.err(
+                        d.span(),
+                        "import/export declarations are only valid in module code",
+                    );
+                }
+                self.check_decl(d);
+            }
         }
     }
 
@@ -218,6 +304,7 @@ impl Checker {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Block { body, .. } => {
+                self.check_statement_list_names(body, stmt.span());
                 self.enter(false);
                 for s in body {
                     self.check_stmt(s);
@@ -399,6 +486,7 @@ impl Checker {
                 finalizer,
                 ..
             } => {
+                self.check_statement_list_names(&block.body, block.span);
                 self.enter(false);
                 for s in &block.body {
                     self.check_stmt(s);
@@ -406,6 +494,7 @@ impl Checker {
                 self.leave();
                 if let Some(h) = handler {
                     // The catch parameter shares a scope with the catch body.
+                    self.check_statement_list_names(&h.body, h.span);
                     self.enter(false);
                     if let Some(p) = &h.param {
                         let names = bound_names(p);
@@ -420,6 +509,7 @@ impl Checker {
                     self.leave();
                 }
                 if let Some(f) = finalizer {
+                    self.check_statement_list_names(f, stmt.span());
                     self.enter(false);
                     for s in f {
                         self.check_stmt(s);
@@ -557,7 +647,13 @@ impl Checker {
             }
             Decl::Function(f) => {
                 if let Some(name) = &f.name {
-                    self.declare_var(name, f.span);
+                    if self.is_module && self.scopes.len() == 1 {
+                        self.declare_lexical(name, f.span);
+                    } else if self.scopes.last().is_some_and(|scope| scope.is_function) {
+                        self.declare_var(name, f.span);
+                    } else {
+                        self.declare_block_function(name, f.span, !f.is_async && !f.is_generator);
+                    }
                     // A declaration's BindingIdentifier belongs to the
                     // surrounding scope, so it remains inside a class static
                     // block even though the function's parameters and body do
@@ -578,7 +674,56 @@ impl Checker {
                 }
                 self.check_class(c);
             }
-            Decl::Import { .. } | Decl::Export { .. } => {}
+            Decl::Import { spec, .. } => {
+                for name in import_local_names(spec) {
+                    self.declare_lexical(&name, decl.span());
+                    self.check_strict_binding_name(&name, decl.span());
+                }
+            }
+            Decl::Export { spec, .. } => match spec {
+                js_syntax::ast::stmt::ExportSpec::Default(expr) => self.check_expr(expr),
+                js_syntax::ast::stmt::ExportSpec::DefaultDecl(decl)
+                | js_syntax::ast::stmt::ExportSpec::Decl(decl) => self.check_decl(decl),
+                js_syntax::ast::stmt::ExportSpec::Named { .. }
+                | js_syntax::ast::stmt::ExportSpec::All { .. }
+                | js_syntax::ast::stmt::ExportSpec::ReExport { .. } => {}
+            },
+        }
+    }
+
+    /// Apply the Block/StatementList Early Errors as set operations. This is
+    /// intentionally a pre-pass: `VarDeclaredNames` recurses into nested
+    /// statements, while `LexicallyDeclaredNames` only contains declarations
+    /// directly owned by this StatementList.
+    fn check_statement_list_names(&mut self, statements: &[Stmt], span: Span) {
+        let lexical = statement_list_lexically_declared_names(statements);
+        let vars = statement_list_var_declared_names(statements);
+        let mut seen = std::collections::HashMap::new();
+        for declaration in lexical {
+            if let Some(previous_ordinary) =
+                seen.insert(declaration.name.clone(), declaration.ordinary_function)
+            {
+                let annex_b_pair =
+                    !self.strict && previous_ordinary && declaration.ordinary_function;
+                if !annex_b_pair {
+                    self.err(
+                        span,
+                        format!(
+                            "identifier `{}` has multiple lexical declarations in block",
+                            declaration.name
+                        ),
+                    );
+                }
+            }
+            if vars.contains(&declaration.name) {
+                self.err(
+                    span,
+                    format!(
+                        "lexical declaration `{}` conflicts with a var declaration in block",
+                        declaration.name
+                    ),
+                );
+            }
         }
     }
 
@@ -600,6 +745,7 @@ impl Checker {
         // BindingIdentifier, parameters, and body, not only its body statements.
         let enclosing_static_block_depth = self.static_block_depth;
         self.static_block_depth = 0;
+        let enclosing_new_target = std::mem::replace(&mut self.new_target_allowed, true);
         // Function name (strict): eval/arguments/FRW restrictions. A *method*
         // name is a property name (IdentifierName), not a BindingIdentifier, so
         // it is exempt — `{ eval(){} }` / `class C { arguments(){} }` are fine.
@@ -643,6 +789,7 @@ impl Checker {
         self.leave();
         self.restore_control_context(enclosing_control);
         self.static_block_depth = enclosing_static_block_depth;
+        self.new_target_allowed = enclosing_new_target;
     }
 
     /// Declare each parameter's binding names in the current (function) scope.
@@ -789,10 +936,13 @@ impl Checker {
                     // Each static block has its own var/lexical environment;
                     // declarations neither collide with nor leak into adjacent
                     // blocks or the surrounding scope.
+                    self.check_statement_list_names(body, m.span);
                     self.enter(true);
                     let enclosing_control = self.take_control_context();
                     self.super_prop.push(true);
                     self.super_call.push(false);
+                    let enclosing_new_target =
+                        std::mem::replace(&mut self.new_target_allowed, true);
                     self.static_block_depth += 1;
                     for s in body {
                         self.check_stmt(s);
@@ -800,6 +950,7 @@ impl Checker {
                     self.static_block_depth -= 1;
                     self.super_prop.pop();
                     self.super_call.pop();
+                    self.new_target_allowed = enclosing_new_target;
                     self.restore_control_context(enclosing_control);
                     self.leave();
                 }
@@ -1270,7 +1421,11 @@ impl Checker {
                     self.err(*span, "`import.meta` is only valid when parsing a module");
                 }
             }
-            Expr::NewTarget(_) => {}
+            Expr::NewTarget(span) => {
+                if !self.new_target_allowed {
+                    self.err(*span, "`new.target` is only valid within function code");
+                }
+            }
             Expr::Yield { arg, span, .. } => {
                 if self.static_block_depth > 0 {
                     self.err(*span, "a class static block may not contain `yield`");
@@ -1807,6 +1962,53 @@ mod tests {
             "switch (0) { case 0: var x; default: var x; }",
             "switch (0) { case 0: function x() {} default: function x() {} }",
             "switch (0) { case 0: let x; default: { let x; } }",
+        ] {
+            let errs = check_src(src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn block_declaration_sets_use_static_semantic_boundaries() {
+        for src in [
+            "{ function f() {} var f; }",
+            "{ var f; async function f() {} }",
+            "{ class f {} { var f; } }",
+            "{ { var f; } function* f() {} }",
+            "'use strict'; { function f() {} function f() {} }",
+            "try { function f() {} { var f; } } finally {}",
+            "try {} catch (f) { function f() {} }",
+        ] {
+            assert!(!check_src(src).is_empty(), "{src}");
+        }
+
+        for src in [
+            "let f; { function f() {} }",
+            "{ { let f; } var f; }",
+            "{ function f() {} function f() {} }",
+            "{ function f() {} } { var f; }",
+        ] {
+            let errs = check_src(src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn script_module_goal_and_new_target_boundaries() {
+        for src in [
+            "import x from 'x';",
+            "export var x;",
+            "new.target;",
+            "(() => new.target)();",
+        ] {
+            assert!(!check_src(src).is_empty(), "{src}");
+        }
+
+        for src in [
+            "function f() { new.target; }",
+            "function f() { return () => new.target; }",
+            "function f(x = new.target) {}",
+            "class C { static { new.target; } }",
         ] {
             let errs = check_src(src);
             assert!(errs.is_empty(), "{src}: {errs:?}");

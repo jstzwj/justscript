@@ -1,6 +1,6 @@
 //! Statement and declaration AST nodes.
 
-use crate::ast::expr::{ClassDecl, Expr, FunctionDecl};
+use crate::ast::expr::{ClassDecl, Expr, FunctionDecl, ImportPhase};
 use crate::ast::pat::Pat;
 use crate::Span;
 
@@ -209,26 +209,66 @@ pub enum ForTarget {
 #[derive(Clone, Debug)]
 pub enum ImportSpec {
     /// `import "mod"`
-    Bare { source: String },
+    Bare { request: ModuleRequest },
     /// `import * as ns from "mod"`
-    Namespace { ns: String, source: String },
+    Namespace { ns: String, request: ModuleRequest },
     /// `import { a, b as c } from "mod"`
     Named {
         items: Vec<ImportItem>,
-        source: String,
+        request: ModuleRequest,
     },
-    /// `import def from "mod"` / `import def, { a } from "mod"`
+    /// `import def from "mod"`, with an optional named or namespace import.
     Default {
         local: String,
+        namespace: Option<String>,
         named: Vec<ImportItem>,
-        source: String,
+        request: ModuleRequest,
     },
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportItem {
-    pub imported: String,
+    pub imported: ModuleExportName,
     pub local: String,
+}
+
+/// A normalized module request shared by static imports and indirect exports.
+#[derive(Clone, Debug)]
+pub struct ModuleRequest {
+    pub specifier: String,
+    /// Evaluation for ordinary imports/exports, defer for a deferred namespace
+    /// import. Retained here so linking never has to reconstruct syntax.
+    pub phase: ImportPhase,
+    /// Kept in source order. Linkers must compare requests using the attribute
+    /// keys and values, not source ordering.
+    pub attributes: Vec<ImportAttribute>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportAttribute {
+    pub span: Span,
+    pub key: String,
+    pub value: String,
+}
+
+/// `ModuleExportName` deliberately retains whether the source production was
+/// an IdentifierName or a StringLiteral; local named exports reject the latter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModuleExportName {
+    Identifier(String),
+    String(String),
+}
+
+impl ModuleExportName {
+    pub fn value(&self) -> &str {
+        match self {
+            ModuleExportName::Identifier(value) | ModuleExportName::String(value) => value,
+        }
+    }
+
+    pub fn is_string(&self) -> bool {
+        matches!(self, ModuleExportName::String(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -237,12 +277,17 @@ pub enum ExportSpec {
     Named { items: Vec<ExportItem> },
     /// `export default expr`
     Default(Expr),
-    /// `export * from "mod"`
-    All { source: String },
+    /// `export default function/class ...`
+    DefaultDecl(Box<Decl>),
+    /// `export * from "mod"` / `export * as name from "mod"`
+    All {
+        exported: Option<ModuleExportName>,
+        request: ModuleRequest,
+    },
     /// `export { a } from "mod"`
     ReExport {
         items: Vec<ExportItem>,
-        source: String,
+        request: ModuleRequest,
     },
     /// `export function/class/let/const ...`
     Decl(Box<Decl>),
@@ -250,6 +295,6 @@ pub enum ExportSpec {
 
 #[derive(Clone, Debug)]
 pub struct ExportItem {
-    pub local: String,
-    pub exported: String,
+    pub local: ModuleExportName,
+    pub exported: ModuleExportName,
 }

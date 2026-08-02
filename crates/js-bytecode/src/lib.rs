@@ -15,9 +15,11 @@ pub mod constant;
 pub mod local;
 pub mod module;
 pub mod opcode;
+pub mod verify;
 
 pub use compiler::{compile_program, compile_program_with_source};
 pub use constant::ConstantPool;
 pub use local::LocalTable;
 pub use module::{BytecodeFunction, BytecodeModule};
-pub use opcode::{Instruction, Opcode};
+pub use opcode::{Instruction, Opcode, OperandKind};
+pub use verify::{verify_module, VerifyError, BYTECODE_FORMAT_VERSION};

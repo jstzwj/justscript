@@ -85,6 +85,14 @@ cargo build --workspace --features js-codegen/jit --features js-codegen/aot
 
 # Run the test suite
 cargo test --workspace
+
+# Run one independently reported Test262 profile
+scripts/test262-matrix.sh language-front-end
 ```
+
+Test262 conformance is reported as five non-aggregated profiles; see
+[`docs/test262-conformance.md`](docs/test262-conformance.md). The bytecode and
+execution-backend contract is documented in
+[`docs/bytecode-architecture.md`](docs/bytecode-architecture.md).
 
 [Cranelift]: https://github.com/bytecodealliance/wasmtime/tree/main/cranelift

@@ -185,6 +185,14 @@ impl ParserTokenStream {
             && !self.token_span_contains_escape(self.tokens[i].token.span)
     }
 
+    /// Whether the token `n` positions ahead is an unescaped contextual
+    /// identifier terminal, such as `defer` in a deferred import declaration.
+    pub(crate) fn is_unescaped_ident_at(&self, n: usize, name: &str) -> bool {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        matches!(&self.tokens[i].token.kind, TokenKind::Ident(value) if value == name)
+            && !self.token_span_contains_escape(self.tokens[i].token.span)
+    }
+
     /// The same raw-spelling check for a token that has already been consumed.
     pub(crate) fn token_span_contains_escape(&self, span: js_syntax::Span) -> bool {
         span.snippet(&self.src)

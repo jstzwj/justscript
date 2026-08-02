@@ -880,3 +880,47 @@ fn regex_replace_callback() {
         ValueData::String(s) if s.as_str() == "hello WORLD"
     ));
 }
+
+#[test]
+fn unsigned_shift_has_distinct_semantics() {
+    assert!(matches!(
+        run("-1 >>> 0"),
+        ValueData::Number(n) if n == 4_294_967_295.0
+    ));
+}
+
+#[test]
+fn in_tests_property_presence_not_value() {
+    assert!(matches!(
+        run("var o = {present: undefined}; 'present' in o"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("var o = {}; 'missing' in o"),
+        ValueData::Boolean(false)
+    ));
+}
+
+#[test]
+fn void_preserves_side_effects_and_returns_undefined() {
+    assert!(matches!(
+        run("var n = 0; var result = void (n = 3); n === 3 && result === undefined"),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn delete_distinguishes_properties_and_bindings() {
+    assert!(matches!(
+        run("var o = {x: 1}; var deleted = delete o.x; deleted && !('x' in o)"),
+        ValueData::Boolean(true)
+    ));
+    assert!(matches!(
+        run("var bound = 1; delete bound"),
+        ValueData::Boolean(false)
+    ));
+    assert!(matches!(
+        run("delete unresolvableName"),
+        ValueData::Boolean(true)
+    ));
+}

@@ -8,10 +8,10 @@ use crate::Span;
 /// A boxed expression, used pervasively to break recursive type sizes.
 pub type BoxExpr = Box<Expr>;
 
-/// Which phase a dynamic `import`/`import.source`/`import.defer` call targets.
+/// Which phase a static or dynamic module request targets.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum ImportPhase {
-    /// `import(...)`.
+    /// An ordinary static import or `import(...)`.
     #[default]
     Eval,
     /// `import.source(...)`.

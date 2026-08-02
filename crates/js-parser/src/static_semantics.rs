@@ -7,7 +7,7 @@ use js_syntax::ast::lit::Lit;
 use js_syntax::ast::pat::{ArrayPatElement, ObjectPatProp, Pat};
 use js_syntax::ast::{
     expr::{ArrayExprElement, ArrowBody, AssignTarget, CallArg, Expr, MemberProp, ObjectPropValue},
-    stmt::{Decl, ExportSpec, ForInit, ForTarget, SwitchCase, VarKind},
+    stmt::{Decl, ExportSpec, ForInit, ForTarget, ImportSpec, SwitchCase, VarKind},
     ProgramItem, Stmt,
 };
 
@@ -41,55 +41,298 @@ fn collect_bound_names(pat: &Pat, names: &mut Vec<String>) {
     }
 }
 
+fn declaration_bound_names(decl: &Decl) -> Vec<String> {
+    match decl {
+        Decl::Var { declarations, .. } => declarations
+            .iter()
+            .flat_map(|declaration| bound_names(&declaration.name))
+            .collect(),
+        Decl::Function(function) => function.name.iter().cloned().collect(),
+        Decl::Class(class) => class.name.iter().cloned().collect(),
+        Decl::Import { spec, .. } => import_local_names(spec),
+        Decl::Export { spec, .. } => match spec {
+            ExportSpec::Decl(decl) | ExportSpec::DefaultDecl(decl) => declaration_bound_names(decl),
+            _ => Vec::new(),
+        },
+    }
+}
+
+pub(crate) fn import_local_names(spec: &ImportSpec) -> Vec<String> {
+    match spec {
+        ImportSpec::Bare { .. } => Vec::new(),
+        ImportSpec::Namespace { ns, .. } => vec![ns.clone()],
+        ImportSpec::Named { items, .. } => items.iter().map(|item| item.local.clone()).collect(),
+        ImportSpec::Default {
+            local,
+            namespace,
+            named,
+            ..
+        } => {
+            let mut names = vec![local.clone()];
+            names.extend(namespace.iter().cloned());
+            names.extend(named.iter().map(|item| item.local.clone()));
+            names
+        }
+    }
+}
+
+/// Static-semantic sets attached to a ModuleBody. Lists are retained where the
+/// specification checks duplicates; sets are used where only membership is
+/// significant.
+pub(crate) struct ModuleStaticSemantics {
+    pub(crate) lexically_declared_names: Vec<String>,
+    pub(crate) var_declared_names: std::collections::HashSet<String>,
+    pub(crate) exported_names: Vec<String>,
+    pub(crate) exported_bindings: Vec<String>,
+    pub(crate) imported_local_names: Vec<String>,
+    pub(crate) invalid_local_export_names: Vec<String>,
+    pub(crate) duplicate_attribute_keys: Vec<(js_syntax::Span, String)>,
+}
+
+pub(crate) fn module_static_semantics(body: &[ProgramItem]) -> ModuleStaticSemantics {
+    let mut lexically_declared_names = Vec::new();
+    let mut var_declared_names = std::collections::HashSet::new();
+    let mut exported_names = Vec::new();
+    let mut exported_bindings = Vec::new();
+    let mut imported_local_names = Vec::new();
+    let mut invalid_local_export_names = Vec::new();
+    let mut duplicate_attribute_keys = Vec::new();
+
+    for item in body {
+        match item {
+            ProgramItem::Stmt(stmt) => {
+                collect_direct_module_lexical_names(stmt, &mut lexically_declared_names);
+                collect_var_declared_names(stmt, &mut var_declared_names);
+            }
+            ProgramItem::Decl(decl) => {
+                collect_module_declared_names(
+                    decl,
+                    &mut lexically_declared_names,
+                    &mut var_declared_names,
+                    &mut imported_local_names,
+                );
+                collect_module_exports(decl, &mut exported_names, &mut exported_bindings);
+                collect_module_request_errors(decl, &mut duplicate_attribute_keys);
+                if let Decl::Export {
+                    spec: ExportSpec::Named { items },
+                    ..
+                } = decl
+                {
+                    invalid_local_export_names.extend(
+                        items
+                            .iter()
+                            .filter(|item| item.local.is_string())
+                            .map(|item| item.local.value().to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    ModuleStaticSemantics {
+        lexically_declared_names,
+        var_declared_names,
+        exported_names,
+        exported_bindings,
+        imported_local_names,
+        invalid_local_export_names,
+        duplicate_attribute_keys,
+    }
+}
+
+fn collect_module_request_errors(decl: &Decl, duplicates: &mut Vec<(js_syntax::Span, String)>) {
+    let request = match decl {
+        Decl::Import { spec, .. } => Some(match spec {
+            ImportSpec::Bare { request }
+            | ImportSpec::Namespace { request, .. }
+            | ImportSpec::Named { request, .. }
+            | ImportSpec::Default { request, .. } => request,
+        }),
+        Decl::Export { spec, .. } => match spec {
+            ExportSpec::All { request, .. } | ExportSpec::ReExport { request, .. } => Some(request),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(request) = request else {
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for attribute in &request.attributes {
+        if !seen.insert(attribute.key.clone()) {
+            duplicates.push((attribute.span, attribute.key.clone()));
+        }
+    }
+}
+
+fn collect_direct_module_lexical_names(stmt: &Stmt, names: &mut Vec<String>) {
+    let mut lexical = Vec::new();
+    collect_direct_lexically_declared_names(stmt, &mut lexical);
+    names.extend(lexical.into_iter().map(|entry| entry.name));
+}
+
+fn collect_module_declared_names(
+    decl: &Decl,
+    lexical: &mut Vec<String>,
+    vars: &mut std::collections::HashSet<String>,
+    imports: &mut Vec<String>,
+) {
+    match decl {
+        Decl::Var {
+            kind, declarations, ..
+        } => {
+            let names = declarations
+                .iter()
+                .flat_map(|declaration| bound_names(&declaration.name));
+            if *kind == VarKind::Var {
+                vars.extend(names);
+            } else {
+                lexical.extend(names);
+            }
+        }
+        Decl::Function(function) => lexical.extend(function.name.iter().cloned()),
+        Decl::Class(class) => lexical.extend(class.name.iter().cloned()),
+        Decl::Import { spec, .. } => {
+            let names = import_local_names(spec);
+            lexical.extend(names.iter().cloned());
+            imports.extend(names);
+        }
+        Decl::Export { spec, .. } => match spec {
+            ExportSpec::Decl(decl) => collect_module_declared_names(decl, lexical, vars, imports),
+            ExportSpec::DefaultDecl(decl) => {
+                let names = declaration_bound_names(decl);
+                if names.is_empty() {
+                    lexical.push("*default*".to_string());
+                } else {
+                    lexical.extend(names);
+                }
+            }
+            ExportSpec::Default(_) => lexical.push("*default*".to_string()),
+            ExportSpec::Named { .. } | ExportSpec::All { .. } | ExportSpec::ReExport { .. } => {}
+        },
+    }
+}
+
+fn collect_module_exports(
+    decl: &Decl,
+    exported_names: &mut Vec<String>,
+    exported_bindings: &mut Vec<String>,
+) {
+    let Decl::Export { spec, .. } = decl else {
+        return;
+    };
+    match spec {
+        ExportSpec::Named { items } => {
+            exported_names.extend(items.iter().map(|item| item.exported.value().to_string()));
+            exported_bindings.extend(
+                items
+                    .iter()
+                    .filter(|item| !item.local.is_string())
+                    .map(|item| item.local.value().to_string()),
+            );
+        }
+        ExportSpec::Default(_) => {
+            exported_names.push("default".to_string());
+            exported_bindings.push("*default*".to_string());
+        }
+        ExportSpec::DefaultDecl(decl) => {
+            exported_names.push("default".to_string());
+            let names = declaration_bound_names(decl);
+            if names.is_empty() {
+                exported_bindings.push("*default*".to_string());
+            } else {
+                exported_bindings.extend(names);
+            }
+        }
+        ExportSpec::All {
+            exported: Some(name),
+            ..
+        } => exported_names.push(name.value().to_string()),
+        ExportSpec::All { exported: None, .. } => {}
+        ExportSpec::ReExport { items, .. } => {
+            exported_names.extend(items.iter().map(|item| item.exported.value().to_string()));
+        }
+        ExportSpec::Decl(decl) => {
+            let names = declaration_bound_names(decl);
+            exported_names.extend(names.iter().cloned());
+            exported_bindings.extend(names);
+        }
+    }
+}
+
 pub(crate) fn is_simple_parameter_list(params: &[Pat]) -> bool {
     params.iter().all(|p| matches!(p, Pat::Ident { .. }))
 }
 
-/// One entry in the LexicallyDeclaredNames of a switch CaseBlock. Ordinary
+/// One entry in the LexicallyDeclaredNames of a StatementList. Ordinary
 /// functions are tagged because Annex B permits duplicate ordinary function
-/// declarations in sloppy switch bodies; no other lexical duplicate is legal.
-pub(crate) struct SwitchLexicalName {
+/// declarations in sloppy blocks; no other lexical duplicate is legal.
+pub(crate) struct LexicalName {
     pub(crate) name: String,
     pub(crate) ordinary_function: bool,
 }
 
-pub(crate) fn switch_lexically_declared_names(cases: &[SwitchCase]) -> Vec<SwitchLexicalName> {
+pub(crate) fn statement_list_lexically_declared_names(statements: &[Stmt]) -> Vec<LexicalName> {
     let mut names = Vec::new();
-    for stmt in cases.iter().flat_map(|case| &case.body) {
-        let Stmt::Decl(decl) = stmt else {
-            continue;
-        };
-        match decl.as_ref() {
-            Decl::Var {
-                kind, declarations, ..
-            } if *kind != VarKind::Var => {
-                for declaration in declarations {
-                    names.extend(bound_names(&declaration.name).into_iter().map(|name| {
-                        SwitchLexicalName {
+    for stmt in statements {
+        collect_direct_lexically_declared_names(stmt, &mut names);
+    }
+    names
+}
+
+pub(crate) fn statement_list_var_declared_names(
+    statements: &[Stmt],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for stmt in statements {
+        collect_var_declared_names(stmt, &mut names);
+    }
+    names
+}
+
+fn collect_direct_lexically_declared_names(stmt: &Stmt, names: &mut Vec<LexicalName>) {
+    let Stmt::Decl(decl) = stmt else {
+        return;
+    };
+    match decl.as_ref() {
+        Decl::Var {
+            kind, declarations, ..
+        } if *kind != VarKind::Var => {
+            for declaration in declarations {
+                names.extend(
+                    bound_names(&declaration.name)
+                        .into_iter()
+                        .map(|name| LexicalName {
                             name,
                             ordinary_function: false,
-                        }
-                    }));
-                }
+                        }),
+                );
             }
-            Decl::Function(function) => {
-                if let Some(name) = &function.name {
-                    names.push(SwitchLexicalName {
-                        name: name.clone(),
-                        ordinary_function: !function.is_async && !function.is_generator,
-                    });
-                }
-            }
-            Decl::Class(class) => {
-                if let Some(name) = &class.name {
-                    names.push(SwitchLexicalName {
-                        name: name.clone(),
-                        ordinary_function: false,
-                    });
-                }
-            }
-            _ => {}
         }
+        Decl::Function(function) => {
+            if let Some(name) = &function.name {
+                names.push(LexicalName {
+                    name: name.clone(),
+                    ordinary_function: !function.is_async && !function.is_generator,
+                });
+            }
+        }
+        Decl::Class(class) => {
+            if let Some(name) = &class.name {
+                names.push(LexicalName {
+                    name: name.clone(),
+                    ordinary_function: false,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn switch_lexically_declared_names(cases: &[SwitchCase]) -> Vec<LexicalName> {
+    let mut names = Vec::new();
+    for stmt in cases.iter().flat_map(|case| &case.body) {
+        collect_direct_lexically_declared_names(stmt, &mut names);
     }
     names
 }
@@ -440,7 +683,9 @@ fn declaration_contains_arguments(decl: &Decl) -> bool {
         Decl::Function(_) | Decl::Class(_) | Decl::Import { .. } => false,
         Decl::Export { spec, .. } => match spec {
             ExportSpec::Default(expr) => contains_arguments(expr),
-            ExportSpec::Decl(decl) => declaration_contains_arguments(decl),
+            ExportSpec::DefaultDecl(decl) | ExportSpec::Decl(decl) => {
+                declaration_contains_arguments(decl)
+            }
             _ => false,
         },
     }

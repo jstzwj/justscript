@@ -193,6 +193,26 @@ mod tests {
     }
 
     #[test]
+    fn static_binding_identifier_respects_strictness() {
+        for src in [
+            r#"var static = 1; var st\u0061tic = 2;"#,
+            r#"{ let static = 1; } { const st\u0061tic = 2; }"#,
+            r#"function f(static) { var static; }"#,
+        ] {
+            parse_script(src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+        }
+
+        for src in [
+            r#"'use strict'; var static;"#,
+            r#"function f() { 'use strict'; let st\u0061tic; }"#,
+            r#"class C { method() { var static; } }"#,
+        ] {
+            assert!(parse_script(src).is_err(), "{src}");
+        }
+        assert!(parse_module("var static;").is_err());
+    }
+
+    #[test]
     fn conditional_in_parameter_propagation() {
         parse("for (true ? '' in {} : false; false; ) ;")
             .expect("the consequent of a conditional expression always permits `in`");
@@ -511,11 +531,138 @@ import def, { x } from \"mod\";
 export var v = 1;
 export function f() {}
 export default 42;
-export { a, b as bb };
+export { a, c as cc };
 export * from \"mod\";
-export { a } from \"other\";
+export { a as other_a } from \"other\";
 ";
-        parse(src).expect("module import/export should parse");
+        parse_module(src).expect("module import/export should parse");
+    }
+
+    #[test]
+    fn module_body_static_semantics_and_contextual_terminals() {
+        for src in [
+            "import def, * as ns from 'mod'; export { def }; export * as other from 'other';",
+            "export default function() {}",
+            "export default async function*() {}",
+            "export default class {}",
+            "export * from 'a'; export * from 'b';",
+        ] {
+            parse_module(src).unwrap_or_else(|errors| panic!("{src}: {errors:?}"));
+        }
+
+        for src in [
+            r#"import { x, y as x } from 'mod';"#,
+            r#"import def, * as def from 'mod';"#,
+            r#"import { x as arguments } from 'mod';"#,
+            r#"import { eval } from 'mod';"#,
+            r#"import { x \u0061s y } from 'mod';"#,
+            r#"import * \u0061s ns from 'mod';"#,
+            r#"import {} \u0066rom 'mod';"#,
+            r#"var x; export { x as z }; export * as z from 'mod';"#,
+            r#"var x, y; export default x; export { y as default };"#,
+            r#"var x, y; export { x as z }; export { y as z };"#,
+            r#"export { Number };"#,
+            r#"function f() {} function f() {}"#,
+            r#"var f; function f() {}"#,
+            r#"class F {} export default function F() {}"#,
+            r#"export default function() {}();"#,
+            r#"export default function*() {}();"#,
+            r#"export d\u0065fault 0;"#,
+            r#"export {} \u0066rom 'mod';"#,
+            r#"\u0061wait 0;"#,
+        ] {
+            assert!(parse_module(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn module_requests_attributes_and_string_export_names() {
+        let valid = r#"
+import value from 'json' with { type: 'json' };
+import * as ns from 'text'
+with { type: 'text', "mode": "strict", };
+import { "☿" as mercury, default as fallback } from 'names' with {};
+import 'side-effect' with { if: '' };
+export { mercury as "☿", fallback as fallbackExport };
+export { "☿" as "planet" } from 'names' with { type: 'js' };
+export * as "all names" from 'names' with {};
+export default "ok";
+"#;
+        parse_module(valid).unwrap_or_else(|errors| panic!("{errors:?}"));
+        parse_module(r#"export { "\uD83D\uDE00" } from 'names';"#)
+            .expect("a paired surrogate ModuleExportName is well-formed");
+
+        for src in [
+            r#"import x from 'm' with { type: 'json', 'typ\u0065': '' };"#,
+            r#"import 'm' with { type: 'json', type: '' };"#,
+            r#"export * from 'm' with { type: 'json', "type": '' };"#,
+            r#"import x from 'm' with { type: json };"#,
+            r#"import { "name" } from 'm';"#,
+            r#"export { "name" };"#,
+            r#"export { "\uD83D" } from 'm';"#,
+            r#"export * as "\uDE00" from 'm';"#,
+            r#"import x from 'm' w\u0069th { type: 'json' };"#,
+        ] {
+            assert!(parse_module(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn static_deferred_import_phase_and_grammar_boundaries() {
+        use js_syntax::ast::{Decl, ImportPhase, ImportSpec, ProgramItem};
+
+        let deferred =
+            parse_module(r#"import defer * as namespace from 'module' with { type: 'js' };"#)
+                .expect("a deferred namespace import should parse");
+        let ProgramItem::Decl(Decl::Import {
+            spec: ImportSpec::Namespace { ns, request },
+            ..
+        }) = &deferred.body[0]
+        else {
+            panic!("expected a namespace import");
+        };
+        assert_eq!(ns, "namespace");
+        assert_eq!(request.phase, ImportPhase::Defer);
+        assert_eq!(request.specifier, "module");
+        assert_eq!(request.attributes.len(), 1);
+
+        let ordinary = parse_module(r#"import * as namespace from 'module';"#)
+            .expect("an ordinary namespace import should parse");
+        let ProgramItem::Decl(Decl::Import {
+            spec: ImportSpec::Namespace { request, .. },
+            ..
+        }) = &ordinary.body[0]
+        else {
+            panic!("expected an ordinary namespace import");
+        };
+        assert_eq!(request.phase, ImportPhase::Eval);
+
+        let default_defer = parse_module(r#"import defer from 'module';"#)
+            .expect("`defer` remains a valid ordinary default binding");
+        let ProgramItem::Decl(Decl::Import {
+            spec: ImportSpec::Default { local, request, .. },
+            ..
+        }) = &default_defer.body[0]
+        else {
+            panic!("expected a default import");
+        };
+        assert_eq!(local, "defer");
+        assert_eq!(request.phase, ImportPhase::Eval);
+
+        parse_module("import defer\n* as namespace from 'module';")
+            .expect("the deferred import production has no newline restriction");
+
+        for src in [
+            r#"import defer value from 'module';"#,
+            r#"import defer { value } from 'module';"#,
+            r#"import defer as namespace from 'module';"#,
+            r#"import value, defer * as namespace from 'module';"#,
+            r#"import defer value, * as namespace from 'module';"#,
+            r#"export defer * as namespace from 'module';"#,
+            r#"import d\u0065fer * as namespace from 'module';"#,
+        ] {
+            assert!(parse_module(src).is_err(), "{src}");
+        }
     }
 
     #[test]

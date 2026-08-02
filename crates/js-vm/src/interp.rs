@@ -184,7 +184,17 @@ impl Interpreter {
 
     /// Execute a compiled module's top-level function.
     pub fn run_module(&mut self, module: &BytecodeModule) -> Result<Value, InterpError> {
+        if let Err(errors) = js_bytecode::verify_module(module) {
+            let detail = errors
+                .iter()
+                .take(3)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(InterpError::Internal(format!("invalid bytecode: {detail}")));
+        }
         self.error_trace.clear();
+        self.steps = 0;
         let span = module.main.span;
         let frame = CallFrame::new(0, module.main.locals.slot_count(), span);
         self.frames.push(frame);
@@ -479,6 +489,7 @@ impl Interpreter {
             Opcode::BitXor => self.binop(bitxor),
             Opcode::Shl => self.binop(shl),
             Opcode::Shr => self.binop(shr),
+            Opcode::Ushr => self.binop(ushr),
 
             // ---- comparison ----
             Opcode::Eq => self.cmp(eq_loose),
@@ -494,6 +505,18 @@ impl Interpreter {
                     .stack
                     .push(Value::boolean(crate::builtins::instanceof_check(&a, &b)));
             }
+            Opcode::In => {
+                let object = self.top().stack.pop();
+                let key = self.top().stack.pop();
+                if !is_object_value(&object) {
+                    return Err(InterpError::Throw(type_error(
+                        "right-hand side of 'in' is not an object",
+                    )));
+                }
+                self.top()
+                    .stack
+                    .push(Value::boolean(has_property(&object, &key)));
+            }
 
             // ---- unary ----
             Opcode::Neg => self.unary(neg),
@@ -504,6 +527,10 @@ impl Interpreter {
             }
             Opcode::BitNot => self.unary(bitnot),
             Opcode::Typeof => self.unary(typeof_),
+            Opcode::Void => {
+                self.top().stack.pop();
+                self.top().stack.push(Value::undefined());
+            }
 
             // ---- globals ----
             Opcode::GetGlobal => {
@@ -528,6 +555,14 @@ impl Interpreter {
                     _ => String::new(),
                 };
                 self.ctx.realm.borrow_mut().globals.insert(name, v);
+            }
+            Opcode::DeleteGlobal => {
+                let name = match module.constants.get(ins.operand).data() {
+                    ValueData::String(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                };
+                self.ctx.realm.borrow_mut().globals.remove(&name);
+                self.top().stack.push(Value::boolean(true));
             }
 
             // ---- control flow ----
@@ -729,6 +764,12 @@ impl Interpreter {
                 let obj = self.top().stack.pop();
                 let value = self.top().stack.pop();
                 set_property(&obj, &key, value);
+            }
+            Opcode::DeleteProp => {
+                let key = self.top().stack.pop();
+                let object = self.top().stack.pop();
+                let deleted = delete_property(&object, &key);
+                self.top().stack.push(Value::boolean(deleted));
             }
             Opcode::New => {
                 let (callee, args) = pop_args(self, ins.operand);
@@ -1150,12 +1191,30 @@ fn shl(a: Value, b: Value) -> Value {
 fn shr(a: Value, b: Value) -> Value {
     Value::integer(to_int32(&a).wrapping_shr((to_uint32(&b) & 31) as u32))
 }
+fn ushr(a: Value, b: Value) -> Value {
+    let result = to_uint32(&a).wrapping_shr(to_uint32(&b) & 31);
+    if result <= i32::MAX as u32 {
+        Value::integer(result as i32)
+    } else {
+        Value::number(result as f64)
+    }
+}
 
 fn to_int32(v: &Value) -> i32 {
-    num_f64(v) as i32
+    let value = to_uint32(v);
+    if value >= 0x8000_0000 {
+        (value as i64 - 0x1_0000_0000) as i32
+    } else {
+        value as i32
+    }
 }
 fn to_uint32(v: &Value) -> u32 {
-    num_f64(v) as u32
+    let number = num_f64(v);
+    if !number.is_finite() || number == 0.0 {
+        return 0;
+    }
+    // ECMA-262 ToUint32 truncates toward zero, then reduces modulo 2^32.
+    number.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 fn neg(a: Value) -> Value {
@@ -1427,6 +1486,63 @@ pub(crate) fn get_property(obj: &Value, key: &Value) -> Value {
         cur = b.proto.as_ref().and_then(|v| obj_as_object(v)).cloned();
     }
     Value::undefined()
+}
+
+fn is_object_value(value: &Value) -> bool {
+    matches!(
+        value.data(),
+        ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_)
+    )
+}
+
+/// ECMAScript `HasProperty`: own lookup followed by the prototype chain.
+fn has_property(obj: &Value, key: &Value) -> bool {
+    let name = prop_name(key);
+    if crate::builtins::native_static_id(obj, &name).is_some()
+        || crate::builtins::builtin_method_id(obj, &name).is_some()
+    {
+        return true;
+    }
+    let Some(handle) = obj_as_object(obj) else {
+        return false;
+    };
+    let mut current = Some(handle.clone());
+    while let Some(object) = current {
+        let data = object.borrow();
+        if data.properties.contains_key(&name) {
+            return true;
+        }
+        current = data.proto.as_ref().and_then(obj_as_object).cloned();
+    }
+    false
+}
+
+/// Delete an own property, respecting its `[[Configurable]]` attribute.
+fn delete_property(obj: &Value, key: &Value) -> bool {
+    let Some(handle) = obj_as_object(obj) else {
+        return true;
+    };
+    let name = prop_name(key);
+    let configurable = {
+        let data = handle.borrow();
+        match data.properties.get(&name) {
+            Some(js_runtime::object::PropertyDescriptor::Data { attr, .. })
+            | Some(js_runtime::object::PropertyDescriptor::Accessor { attr, .. }) => {
+                attr.configurable
+            }
+            None => return true,
+        }
+    };
+    if configurable {
+        handle.borrow_mut().properties.remove(&name);
+        true
+    } else {
+        false
+    }
+}
+
+fn type_error(message: &str) -> Value {
+    crate::builtins::error_ctor(&Value::undefined(), &[Value::string(message)], "TypeError")
 }
 
 /// `obj[key] = value` for object/array targets.

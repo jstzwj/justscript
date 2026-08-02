@@ -650,10 +650,15 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Lit(lit) => compile_lit(lit, func, ctx),
         Expr::Ident { name, .. } => load_ident(name, func, ctx),
         Expr::Paren { expr, .. } => compile_expr(expr, func, ctx),
-        Expr::Unary { op, arg, .. } => {
-            compile_expr(arg, func, ctx);
-            func.emit_bare(Opcode::for_unaryop(*op));
-        }
+        Expr::Unary { op, arg, .. } => match op {
+            js_syntax::ast::op::UnaryOp::Delete => compile_delete(arg, func, ctx),
+            _ => {
+                compile_expr(arg, func, ctx);
+                func.emit_bare(
+                    Opcode::for_unaryop(*op).expect("non-delete unary opcode must lower"),
+                );
+            }
+        },
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -1062,12 +1067,41 @@ fn emit_binop(op: BinOp, func: &mut BytecodeFunction) {
         BitXor => func.emit_bare(Opcode::BitXor),
         Shl => func.emit_bare(Opcode::Shl),
         Shr => func.emit_bare(Opcode::Shr),
-        Ushr => func.emit_bare(Opcode::Shr),
+        Ushr => func.emit_bare(Opcode::Ushr),
         Instanceof => func.emit_bare(Opcode::Instanceof),
-        And | Or | NullishCoal | In => {
-            // Unsupported for milestone-1; emit Add as a harmless placeholder —
-            // the caller already left both operands on the stack.
-            func.emit_bare(Opcode::Add);
+        In => func.emit_bare(Opcode::In),
+        // These normally arrive as `Expr::Logical` and are lowered with
+        // control flow. Keep explicit opcodes here so malformed AST input can
+        // never silently acquire arithmetic semantics.
+        And => func.emit_bare(Opcode::LogicalAnd),
+        Or => func.emit_bare(Opcode::LogicalOr),
+        NullishCoal => func.emit_bare(Opcode::NullishCoal),
+    }
+}
+
+/// Lower `delete` according to the kind of Reference produced by its operand.
+/// A property reference needs both base and key; an environment binding is not
+/// configurable; an unresolvable/global reference is handled without first
+/// performing `GetValue`, and a non-reference expression evaluates only for
+/// side effects before producing `true`.
+fn compile_delete(arg: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    match arg {
+        Expr::Member(member) => {
+            compile_expr(&member.object, func, ctx);
+            compile_member_key_push(&member.property, func, ctx);
+            func.emit_bare(Opcode::DeleteProp);
+        }
+        Expr::Ident { name, .. } => match ctx.resolve_var(name) {
+            VarRef::Local(_) | VarRef::Upvalue(_) => func.emit_bare(Opcode::LdaFalse),
+            VarRef::Global => {
+                let name = ctx.constants.intern_str(name);
+                func.emit(Instruction::new(Opcode::DeleteGlobal, name));
+            }
+        },
+        _ => {
+            compile_expr(arg, func, ctx);
+            func.emit_bare(Opcode::Pop);
+            func.emit_bare(Opcode::LdaTrue);
         }
     }
 }

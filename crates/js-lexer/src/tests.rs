@@ -32,10 +32,12 @@ fn lex_numbers() {
 
 #[test]
 fn lex_string_unescapes() {
-    let toks = nontrivia("'a\\nb'");
-    match &toks[0] {
-        TokenKind::String(s) => assert_eq!(s, "a\nb"),
-        other => panic!("expected string, got {other:?}"),
+    for (source, expected) in [("'a\\nb'", "a\nb"), (r"'\uD83D\uDE00'", "😀")] {
+        let toks = nontrivia(source);
+        match &toks[0] {
+            TokenKind::String(s) => assert_eq!(s, expected),
+            other => panic!("expected string, got {other:?}"),
+        }
     }
 }
 

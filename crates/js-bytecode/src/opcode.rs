@@ -76,6 +76,10 @@ pub enum Opcode {
     BitXor,
     Shl,
     Shr,
+    Ushr,
+    /// ECMAScript `in`: tests a property key against an object and its
+    /// prototype chain. Throws when the right operand is not an object.
+    In,
     // logical short-circuit (handled specially in the interp/codegen)
     LogicalAnd,
     LogicalOr,
@@ -87,6 +91,8 @@ pub enum Opcode {
     Not,
     BitNot,
     Typeof,
+    /// Evaluate the operand for side effects and produce `undefined`.
+    Void,
 
     // --- control flow ---------------------------------------------------
     /// Unconditional jump to instruction index `operand`.
@@ -132,6 +138,10 @@ pub enum Opcode {
     GetProp,
     /// Pop value + key + object.
     SetProp,
+    /// Delete an own property. Stack input is `[object, key]`; pushes a bool.
+    DeleteProp,
+    /// Delete an unqualified global reference named by a string constant.
+    DeleteGlobal,
     /// `a instanceof B`: pop B, pop a, push boolean.
     Instanceof,
     /// Create a RegExp object from constant `operand` (pattern + "\0" + flags).
@@ -153,7 +163,41 @@ pub enum Opcode {
     ArrayExtend,
 }
 
+/// The meaning of [`Instruction::operand`] for an opcode.
+///
+/// Keeping this metadata beside the opcode list gives the verifier, debugger,
+/// interpreter and future native backends one authoritative bytecode contract.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum OperandKind {
+    None,
+    Constant,
+    Local,
+    Upvalue,
+    Function,
+    JumpTarget,
+    ArgumentCount,
+    Handler,
+}
+
 impl Opcode {
+    pub const fn operand_kind(self) -> OperandKind {
+        use OperandKind::*;
+        match self {
+            Opcode::LdaConst
+            | Opcode::NewRegex
+            | Opcode::GetGlobal
+            | Opcode::SetGlobal
+            | Opcode::DeleteGlobal => Constant,
+            Opcode::LdaLocal | Opcode::StaLocal => Local,
+            Opcode::LdaUpvalue | Opcode::StaUpvalue => Upvalue,
+            Opcode::LdaFunction => Function,
+            Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => JumpTarget,
+            Opcode::Call | Opcode::CallMethod | Opcode::New | Opcode::NewArray => ArgumentCount,
+            Opcode::TryBegin => Handler,
+            _ => None,
+        }
+    }
+
     /// Map a parsed [`BinOp`] to its lowering opcode, where possible.
     pub fn for_binop(op: BinOp) -> Opcode {
         use BinOp::*;
@@ -180,22 +224,23 @@ impl Opcode {
             BitXor => Opcode::BitXor,
             Shl => Opcode::Shl,
             Shr => Opcode::Shr,
-            Ushr => Opcode::Shr, // TODO: unsigned variant
-            In => Opcode::Nop,
+            Ushr => Opcode::Ushr,
+            In => Opcode::In,
             Instanceof => Opcode::Instanceof,
         }
     }
 
     /// Map a parsed [`UnaryOp`] to its lowering opcode.
-    pub fn for_unaryop(op: UnaryOp) -> Opcode {
+    pub fn for_unaryop(op: UnaryOp) -> Option<Opcode> {
         use UnaryOp::*;
-        match op {
+        Some(match op {
             Neg => Opcode::Neg,
             Pos => Opcode::Pos,
             Not => Opcode::Not,
             BitNot => Opcode::BitNot,
             Typeof => Opcode::Typeof,
-            Void | Delete => Opcode::Nop, // TODO
-        }
+            Void => Opcode::Void,
+            Delete => return None,
+        })
     }
 }

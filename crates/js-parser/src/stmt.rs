@@ -6,12 +6,13 @@
 use crate::expr;
 use crate::token_stream::ParserTokenStream;
 use js_diagnostics::Diagnostic;
-use js_syntax::ast::expr::Expr;
+use js_syntax::ast::expr::{Expr, ImportPhase};
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::pat::Pat;
 use js_syntax::ast::stmt::{
-    CatchClause, Decl, ExportItem, ExportSpec, ForInit, ForTarget, ImportItem, ImportSpec, Stmt,
-    SwitchCase, TryBlock, VarDeclarator, VarKind,
+    CatchClause, Decl, ExportItem, ExportSpec, ForInit, ForTarget, ImportAttribute, ImportItem,
+    ImportSpec, ModuleExportName, ModuleRequest, Stmt, SwitchCase, TryBlock, VarDeclarator,
+    VarKind,
 };
 use js_syntax::ast::{FunctionDecl, ProgramItem};
 use js_syntax::keyword::Keyword;
@@ -117,7 +118,7 @@ fn parse_statement_inner(
         if matches!(kw, Keyword::Async) && async_function_ahead(tokens) {
             tokens.bump(); // `async`
             tokens.bump(); // `function`
-            let decl = parse_function_decl(tokens, span, true)?;
+            let decl = parse_function_decl(tokens, span, true, false)?;
             return Ok(Stmt::Decl(Box::new(decl)));
         }
         // Only consume the keyword for actual statement-leading keywords.
@@ -135,7 +136,9 @@ fn parse_statement_inner(
             Keyword::Let => Stmt::Decl(Box::new(parse_var(tokens, span, VarKind::Let)?)),
             Keyword::Const => Stmt::Decl(Box::new(parse_var(tokens, span, VarKind::Const)?)),
             Keyword::Return => parse_return(tokens, span)?,
-            Keyword::Function => Stmt::Decl(Box::new(parse_function_decl(tokens, span, false)?)),
+            Keyword::Function => {
+                Stmt::Decl(Box::new(parse_function_decl(tokens, span, false, false)?))
+            }
             Keyword::Class => Stmt::Decl(Box::new(Decl::Class(Box::new(
                 crate::class::parse_class_decl(tokens, span, Vec::new())?,
             )))),
@@ -333,7 +336,7 @@ pub fn parse_program_item(tokens: &mut ParserTokenStream) -> Result<ProgramItem,
                 let span = tokens.span();
                 tokens.bump();
                 if kw == Keyword::Function {
-                    let decl = parse_function_decl(tokens, span, false)?;
+                    let decl = parse_function_decl(tokens, span, false, false)?;
                     return Ok(ProgramItem::Decl(decl));
                 }
                 let c = crate::class::parse_class_decl(tokens, span, Vec::new())?;
@@ -343,7 +346,7 @@ pub fn parse_program_item(tokens: &mut ParserTokenStream) -> Result<ProgramItem,
                 let span = tokens.span();
                 tokens.bump(); // async
                 tokens.bump(); // function
-                let decl = parse_function_decl(tokens, span, true)?;
+                let decl = parse_function_decl(tokens, span, true, false)?;
                 return Ok(ProgramItem::Decl(decl));
             }
             Keyword::Var | Keyword::Let | Keyword::Const
@@ -406,24 +409,219 @@ fn ident_name(tokens: &mut ParserTokenStream) -> Result<String, Vec<Diagnostic>>
     }
 }
 
-/// `from "module"` — consume the `from` keyword and the module specifier string.
-fn parse_module_source(tokens: &mut ParserTokenStream) -> Result<String, Vec<Diagnostic>> {
-    if !tokens.eat_keyword(Keyword::From) {
+fn module_export_name(tokens: &mut ParserTokenStream) -> Result<ModuleExportName, Vec<Diagnostic>> {
+    let span = tokens.span();
+    match tokens.peek_kind().clone() {
+        TokenKind::Ident(name) => {
+            tokens.bump();
+            Ok(ModuleExportName::Identifier(name))
+        }
+        TokenKind::Keyword(keyword) => {
+            tokens.bump();
+            Ok(ModuleExportName::Identifier(keyword.as_str().to_string()))
+        }
+        TokenKind::String(value) => {
+            let well_formed = tokens
+                .token_span_snippet(span)
+                .is_some_and(string_literal_value_is_well_formed);
+            if !well_formed {
+                return Err(vec![Diagnostic::error(
+                    span,
+                    "a string ModuleExportName must be well-formed Unicode",
+                )]);
+            }
+            tokens.bump();
+            Ok(ModuleExportName::String(value))
+        }
+        other => Err(vec![Diagnostic::error(
+            span,
+            format!("expected a module export name, found {:?}", other),
+        )]),
+    }
+}
+
+fn eat_unescaped_keyword(tokens: &mut ParserTokenStream, keyword: Keyword) -> bool {
+    if tokens.is_unescaped_keyword_at(0, keyword) {
+        tokens.bump();
+        true
+    } else {
+        false
+    }
+}
+
+/// `from "module" WithClause?` — consume a complete module request.
+fn parse_module_request(tokens: &mut ParserTokenStream) -> Result<ModuleRequest, Vec<Diagnostic>> {
+    parse_module_request_at_phase(tokens, ImportPhase::Eval)
+}
+
+fn parse_module_request_at_phase(
+    tokens: &mut ParserTokenStream,
+    phase: ImportPhase,
+) -> Result<ModuleRequest, Vec<Diagnostic>> {
+    if !eat_unescaped_keyword(tokens, Keyword::From) {
         return Err(vec![Diagnostic::error(
             tokens.span(),
             "expected `from` in import/export",
         )]);
     }
-    match tokens.peek_kind().clone() {
+    parse_module_request_tail(tokens, phase)
+}
+
+fn parse_module_request_tail(
+    tokens: &mut ParserTokenStream,
+    phase: ImportPhase,
+) -> Result<ModuleRequest, Vec<Diagnostic>> {
+    let specifier = match tokens.peek_kind().clone() {
         TokenKind::String(src) => {
             tokens.bump();
-            Ok(src)
+            src
         }
         other => Err(vec![Diagnostic::error(
             tokens.span(),
             format!("expected a module specifier string, found {:?}", other),
-        )]),
+        )])?,
+    };
+    let attributes = parse_with_clause(tokens)?;
+    Ok(ModuleRequest {
+        specifier,
+        phase,
+        attributes,
+    })
+}
+
+fn parse_with_clause(
+    tokens: &mut ParserTokenStream,
+) -> Result<Vec<ImportAttribute>, Vec<Diagnostic>> {
+    if !eat_unescaped_keyword(tokens, Keyword::With) {
+        return Ok(Vec::new());
     }
+    expr::expect_punctuator(tokens, Punctuator::LBrace)?;
+    let mut attributes = Vec::new();
+    while !matches!(
+        tokens.peek_kind(),
+        TokenKind::Punctuator(Punctuator::RBrace)
+    ) {
+        let start = tokens.span();
+        let key = match tokens.peek_kind().clone() {
+            TokenKind::String(key) => {
+                tokens.bump();
+                key
+            }
+            TokenKind::Ident(_) | TokenKind::Keyword(_) => ident_name(tokens)?,
+            other => {
+                return Err(vec![Diagnostic::error(
+                    tokens.span(),
+                    format!("expected an import attribute key, found {:?}", other),
+                )]);
+            }
+        };
+        expr::expect_punctuator(tokens, Punctuator::Colon)?;
+        let (value, end) = match tokens.peek_kind().clone() {
+            TokenKind::String(value) => {
+                let span = tokens.span();
+                tokens.bump();
+                (value, span.end)
+            }
+            other => {
+                return Err(vec![Diagnostic::error(
+                    tokens.span(),
+                    format!(
+                        "expected a string import attribute value, found {:?}",
+                        other
+                    ),
+                )]);
+            }
+        };
+        attributes.push(ImportAttribute {
+            span: Span::new(start.start, end),
+            key,
+            value,
+        });
+        if !tokens.eat_punctuator(Punctuator::Comma) {
+            break;
+        }
+        if matches!(
+            tokens.peek_kind(),
+            TokenKind::Punctuator(Punctuator::RBrace)
+        ) {
+            break;
+        }
+    }
+    expr::expect_punctuator(tokens, Punctuator::RBrace)?;
+    Ok(attributes)
+}
+
+/// Module export string names must denote well-formed Unicode strings. The
+/// lexer stores cooked values as Rust UTF-8 and therefore substitutes lone
+/// UTF-16 surrogates; inspect the raw literal here so that distinction is not
+/// lost before applying the module-specific Early Error.
+fn string_literal_value_is_well_formed(raw: &str) -> bool {
+    let Some(body) = raw.get(1..raw.len().saturating_sub(1)) else {
+        return false;
+    };
+    let mut chars = body.chars().peekable();
+    let mut units = Vec::new();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            let mut encoded = [0; 2];
+            units.extend(ch.encode_utf16(&mut encoded).iter().copied());
+            continue;
+        }
+
+        let Some(escape) = chars.next() else {
+            return false;
+        };
+        if escape == 'u' {
+            let value = if chars.next_if_eq(&'{').is_some() {
+                let mut hex = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') if !hex.is_empty() => break,
+                        Some(digit) if digit.is_ascii_hexdigit() => hex.push(digit),
+                        _ => return false,
+                    }
+                }
+                u32::from_str_radix(&hex, 16).ok()
+            } else {
+                let hex: String = chars.by_ref().take(4).collect();
+                (hex.len() == 4)
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+            };
+            let Some(value) = value.filter(|value| *value <= 0x10ffff) else {
+                return false;
+            };
+            if value <= 0xffff {
+                units.push(value as u16);
+            } else {
+                let value = value - 0x10000;
+                units.push(0xd800 | ((value >> 10) as u16));
+                units.push(0xdc00 | ((value & 0x3ff) as u16));
+            }
+        } else if matches!(escape, '\n' | '\u{2028}' | '\u{2029}') {
+            // LineContinuation contributes no code units.
+        } else if escape == '\r' {
+            let _ = chars.next_if_eq(&'\n');
+        } else {
+            // Every non-Unicode escape contributes a non-surrogate code unit.
+            units.push(0);
+        }
+    }
+
+    let mut index = 0;
+    while index < units.len() {
+        match units[index] {
+            0xd800..=0xdbff => {
+                if !matches!(units.get(index + 1), Some(0xdc00..=0xdfff)) {
+                    return false;
+                }
+                index += 2;
+            }
+            0xdc00..=0xdfff => return false,
+            _ => index += 1,
+        }
+    }
+    true
 }
 
 /// `{ a, b as c, ... }` import bindings.
@@ -434,8 +632,9 @@ fn parse_import_items(tokens: &mut ParserTokenStream) -> Result<Vec<ImportItem>,
         tokens.peek_kind(),
         TokenKind::Punctuator(Punctuator::RBrace)
     ) {
-        let imported = ident_name(tokens)?;
-        let local = if tokens.eat_keyword(Keyword::As) {
+        let shorthand_local = expr::peek_binding_name(tokens);
+        let imported = module_export_name(tokens)?;
+        let local = if eat_unescaped_keyword(tokens, Keyword::As) {
             expr::binding_identifier(tokens).ok_or_else(|| {
                 vec![Diagnostic::error(
                     tokens.span(),
@@ -443,7 +642,12 @@ fn parse_import_items(tokens: &mut ParserTokenStream) -> Result<Vec<ImportItem>,
                 )]
             })?
         } else {
-            imported.clone()
+            shorthand_local.ok_or_else(|| {
+                vec![Diagnostic::error(
+                    tokens.span(),
+                    "this imported name requires a local binding after `as`",
+                )]
+            })?
         };
         items.push(ImportItem { imported, local });
         if !tokens.eat_punctuator(Punctuator::Comma) {
@@ -460,16 +664,31 @@ fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
                    // Bare side-effect import: `import "mod"`.
     if let TokenKind::String(src) = tokens.peek_kind().clone() {
         tokens.bump();
+        let attributes = parse_with_clause(tokens)?;
         expr::consume_asi(tokens)?;
         return Ok(Decl::Import {
             span,
-            spec: ImportSpec::Bare { source: src },
+            spec: ImportSpec::Bare {
+                request: ModuleRequest {
+                    specifier: src,
+                    phase: ImportPhase::Eval,
+                    attributes,
+                },
+            },
         });
+    }
+
+    // `defer` remains a valid default binding unless the complete deferred
+    // namespace prefix is present. Escapes never match the grammar terminal.
+    let is_deferred_namespace = tokens.is_unescaped_ident_at(0, "defer")
+        && matches!(tokens.peek2().kind, TokenKind::Punctuator(Punctuator::Mul));
+    if is_deferred_namespace {
+        tokens.bump();
     }
 
     let spec = if tokens.eat_punctuator(Punctuator::Mul) {
         // `import * as ns from "mod"`
-        if !tokens.eat_keyword(Keyword::As) {
+        if !eat_unescaped_keyword(tokens, Keyword::As) {
             return Err(vec![Diagnostic::error(
                 tokens.span(),
                 "expected `as` after `*`",
@@ -483,7 +702,11 @@ fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
         })?;
         ImportSpec::Namespace {
             ns,
-            source: parse_module_source(tokens)?,
+            request: if is_deferred_namespace {
+                parse_module_request_at_phase(tokens, ImportPhase::Defer)?
+            } else {
+                parse_module_request(tokens)?
+            },
         }
     } else if matches!(
         tokens.peek_kind(),
@@ -493,7 +716,7 @@ fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
         let items = parse_import_items(tokens)?;
         ImportSpec::Named {
             items,
-            source: parse_module_source(tokens)?,
+            request: parse_module_request(tokens)?,
         }
     } else {
         // `import def from "mod"` / `import def, { a } from "mod"`
@@ -503,28 +726,32 @@ fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
                 "expected a default import name",
             )]
         })?;
+        let mut namespace = None;
         let mut named = Vec::new();
         if tokens.eat_punctuator(Punctuator::Comma) {
             if tokens.eat_punctuator(Punctuator::Mul) {
                 // `import def, * as ns from "mod"` — combined default+namespace.
-                // The AST's `Default` spec only carries named items; fall back to
-                // a Namespace spec (dropping the default binding) to stay valid.
-                let _ = tokens.eat_keyword(Keyword::As);
-                let _ = expr::binding_identifier(tokens);
-                return Ok(Decl::Import {
-                    span,
-                    spec: ImportSpec::Namespace {
-                        ns: String::new(),
-                        source: parse_module_source(tokens)?,
-                    },
-                });
+                if !eat_unescaped_keyword(tokens, Keyword::As) {
+                    return Err(vec![Diagnostic::error(
+                        tokens.span(),
+                        "expected `as` after `*`",
+                    )]);
+                }
+                namespace = Some(expr::binding_identifier(tokens).ok_or_else(|| {
+                    vec![Diagnostic::error(
+                        tokens.span(),
+                        "expected a namespace name",
+                    )]
+                })?);
+            } else {
+                named = parse_import_items(tokens)?;
             }
-            named = parse_import_items(tokens)?;
         }
         ImportSpec::Default {
             local,
+            namespace,
             named,
-            source: parse_module_source(tokens)?,
+            request: parse_module_request(tokens)?,
         }
     };
     expr::consume_asi(tokens)?;
@@ -539,9 +766,9 @@ fn parse_export_items(tokens: &mut ParserTokenStream) -> Result<Vec<ExportItem>,
         tokens.peek_kind(),
         TokenKind::Punctuator(Punctuator::RBrace)
     ) {
-        let local = ident_name(tokens)?;
-        let exported = if tokens.eat_keyword(Keyword::As) {
-            ident_name(tokens)?
+        let local = module_export_name(tokens)?;
+        let exported = if eat_unescaped_keyword(tokens, Keyword::As) {
+            module_export_name(tokens)?
         } else {
             local.clone()
         };
@@ -559,8 +786,38 @@ fn parse_export(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
     tokens.bump(); // `export`
 
     // `export default …`
-    if tokens.eat_keyword(Keyword::Default) {
-        // `export default function/class` (named or anonymous) or an expression.
+    if eat_unescaped_keyword(tokens, Keyword::Default) {
+        // HoistableDeclaration and ClassDeclaration are declaration grammar,
+        // not call/member expressions. Preserve that distinction in the AST.
+        let declaration = match tokens.peek_kind().clone() {
+            TokenKind::Keyword(Keyword::Function) => {
+                let start = tokens.span();
+                tokens.bump();
+                Some(parse_function_decl(tokens, start, false, true)?)
+            }
+            TokenKind::Keyword(Keyword::Async) if async_function_ahead(tokens) => {
+                let start = tokens.span();
+                tokens.bump();
+                tokens.bump();
+                Some(parse_function_decl(tokens, start, true, true)?)
+            }
+            TokenKind::Keyword(Keyword::Class) => {
+                let start = tokens.span();
+                tokens.bump();
+                Some(Decl::Class(Box::new(crate::class::parse_class_decl(
+                    tokens,
+                    start,
+                    Vec::new(),
+                )?)))
+            }
+            _ => None,
+        };
+        if let Some(declaration) = declaration {
+            return Ok(Decl::Export {
+                span,
+                spec: ExportSpec::DefaultDecl(Box::new(declaration)),
+            });
+        }
         let value = expr::parse_assignment(tokens)?;
         expr::consume_asi(tokens)?;
         return Ok(Decl::Export {
@@ -571,16 +828,16 @@ fn parse_export(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
 
     // `export * [as ns] from "mod"`
     if tokens.eat_punctuator(Punctuator::Mul) {
-        if tokens.eat_keyword(Keyword::As) {
-            // `export * as ns from "mod"` — namespace re-export. The AST has no
-            // dedicated variant; record as All (the `as ns` is dropped).
-            let _ = ident_name(tokens)?;
-        }
-        let source = parse_module_source(tokens)?;
+        let exported = if eat_unescaped_keyword(tokens, Keyword::As) {
+            Some(module_export_name(tokens)?)
+        } else {
+            None
+        };
+        let request = parse_module_request(tokens)?;
         expr::consume_asi(tokens)?;
         return Ok(Decl::Export {
             span,
-            spec: ExportSpec::All { source },
+            spec: ExportSpec::All { exported, request },
         });
     }
 
@@ -591,11 +848,11 @@ fn parse_export(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
     ) {
         let items = parse_export_items(tokens)?;
         if matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::From)) {
-            let source = parse_module_source(tokens)?;
+            let request = parse_module_request(tokens)?;
             expr::consume_asi(tokens)?;
             return Ok(Decl::Export {
                 span,
-                spec: ExportSpec::ReExport { items, source },
+                spec: ExportSpec::ReExport { items, request },
             });
         }
         expr::consume_asi(tokens)?;
@@ -620,19 +877,22 @@ fn parse_export(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
             parse_var(tokens, span, VarKind::Const)?
         }
         TokenKind::Keyword(Keyword::Function) => {
+            let start = tokens.span();
             tokens.bump();
-            parse_function_decl(tokens, span, false)?
+            parse_function_decl(tokens, start, false, false)?
         }
         TokenKind::Keyword(Keyword::Async) if async_function_ahead(tokens) => {
+            let start = tokens.span();
             tokens.bump();
             tokens.bump();
-            parse_function_decl(tokens, span, true)?
+            parse_function_decl(tokens, start, true, false)?
         }
         TokenKind::Keyword(Keyword::Class) => {
+            let start = tokens.span();
             tokens.bump();
             Decl::Class(Box::new(crate::class::parse_class_decl(
                 tokens,
-                span,
+                start,
                 Vec::new(),
             )?))
         }
@@ -780,16 +1040,18 @@ fn parse_function_decl(
     tokens: &mut ParserTokenStream,
     start: Span,
     is_async: bool,
+    allow_anonymous: bool,
 ) -> Result<Decl, Vec<Diagnostic>> {
     let is_generator = tokens.eat_punctuator(Punctuator::Mul);
     let name = match expr::binding_identifier(tokens) {
         Some(n) => Some(n),
-        None => {
+        None if !allow_anonymous => {
             return Err(vec![Diagnostic::error(
                 tokens.span(),
                 format!("expected function name, found {:?}", tokens.peek_kind()),
             )]);
         }
+        None => None,
     };
     // Params + body are parsed in this function's async/generator context.
     tokens.enter_fn(is_async, is_generator);

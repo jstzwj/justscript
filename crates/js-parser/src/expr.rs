@@ -573,6 +573,12 @@ fn parse_unary(tokens: &mut ParserTokenStream) -> Result<Expr, Vec<Diagnostic>> 
         && matches!(tokens.peek_kind(), TokenKind::Keyword(Keyword::Await))
     {
         let span = tokens.span();
+        if tokens.current_token_contains_escape() {
+            return Err(vec![Diagnostic::error(
+                span,
+                "the `await` terminal may not contain an escape sequence",
+            )]);
+        }
         tokens.bump();
         let arg = parse_unary(tokens)?;
         let span = Span::new(span.start, arg.span().end);
@@ -1861,12 +1867,10 @@ pub(crate) fn keyword_binding_name(
     let allowed = match kw {
         Keyword::Await => !ctx.is_async,
         Keyword::Yield => !ctx.is_generator,
-        // `let`/`static` are valid identifiers in sloppy mode, but accepting
-        // them as *bindings* is net-negative: directive-prologue strict mode
-        // (`"use strict"; var let;`) isn't known at parse time, so doing so
-        // produces false-accepts that outweigh the false-rejects it fixes.
-        // (Expression-position `let` is handled separately in parse_primary /
-        // for-head disambiguation.)
+        Keyword::Static => !ctx.is_strict,
+        // `let` remains excluded because statement/declaration lookahead needs
+        // dedicated grammar handling. `static` is unambiguous in a binding
+        // position and post-parse Early Errors cover directive strictness.
         Keyword::Let
         | Keyword::Async
         | Keyword::Of

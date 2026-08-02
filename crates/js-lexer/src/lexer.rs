@@ -5,12 +5,12 @@
 //! drives this until EOF.
 
 use crate::cursor::{Cursor, EOF_CHAR};
+use crate::unicode_id;
 use js_syntax::keyword::Keyword;
 use js_syntax::punctuator::Punctuator;
 use js_syntax::source::{BytePos, Span};
 use js_syntax::token::{Token, TokenKind};
 use std::str::FromStr;
-use unicode_xid::UnicodeXID;
 
 pub struct Lexer<'a> {
     src: &'a str,
@@ -793,7 +793,11 @@ impl<'a> Lexer<'a> {
 
     fn eat_string(&mut self, quote: char) -> TokenKind {
         self.cursor.bump(); // opening quote
-        let mut out = String::new();
+
+        // ECMAScript String values are sequences of UTF-16 code units. Build
+        // that sequence first so adjacent surrogate escapes form the intended
+        // scalar instead of becoming two replacement characters.
+        let mut out = Vec::new();
         let mut valid = true;
         let mut terminated = false;
         loop {
@@ -829,9 +833,9 @@ impl<'a> Lexer<'a> {
                 }
                 self.cursor.bump();
                 match esc {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
+                    'n' => out.push('\n' as u16),
+                    't' => out.push('\t' as u16),
+                    'r' => out.push('\r' as u16),
                     '0' => {
                         let mut value = 0;
                         for _ in 0..2 {
@@ -841,15 +845,15 @@ impl<'a> Lexer<'a> {
                             value = value * 8 + digit;
                             self.cursor.bump();
                         }
-                        out.push(char::from_u32(value).unwrap());
+                        out.push(value as u16);
                     }
-                    'b' => out.push('\u{0008}'),
-                    'f' => out.push('\u{000C}'),
-                    'v' => out.push('\u{000B}'),
-                    '\\' | '\'' | '"' => out.push(esc),
-                    '/' => out.push('/'),
+                    'b' => out.push(0x0008),
+                    'f' => out.push(0x000c),
+                    'v' => out.push(0x000b),
+                    '\\' | '\'' | '"' => push_utf16(&mut out, esc),
+                    '/' => out.push('/' as u16),
                     'x' => match self.take_hex(2) {
-                        Some(value) => out.push(char::from_u32(value).unwrap()),
+                        Some(value) => out.push(value as u16),
                         None => valid = false,
                     },
                     'u' => {
@@ -861,10 +865,7 @@ impl<'a> Lexer<'a> {
                         };
                         match hex {
                             Some(value) if value <= 0x10ffff => {
-                                // ECMAScript strings are UTF-16 and can contain
-                                // lone surrogates; Rust strings cannot, so retain
-                                // syntactic validity with a replacement scalar.
-                                out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+                                push_code_point_utf16(&mut out, value);
                             }
                             _ => valid = false,
                         }
@@ -879,18 +880,22 @@ impl<'a> Lexer<'a> {
                             value = value * 8 + digit;
                             self.cursor.bump();
                         }
-                        out.push(char::from_u32(value).unwrap());
+                        out.push(value as u16);
                     }
-                    '8' | '9' => out.push(esc),
-                    other => out.push(other),
+                    '8' | '9' => push_utf16(&mut out, esc),
+                    other => push_utf16(&mut out, other),
                 }
                 continue;
             }
-            out.push(c);
+            push_utf16(&mut out, c);
             self.cursor.bump();
         }
         if valid && terminated {
-            TokenKind::String(out)
+            // The AST currently stores Rust strings. Lone surrogates remain
+            // syntactically valid ordinary JS strings and are represented
+            // lossily; productions that require well-formed Unicode inspect
+            // the raw source before accepting the token.
+            TokenKind::String(String::from_utf16_lossy(&out))
         } else {
             TokenKind::Unknown(quote)
         }
@@ -956,6 +961,19 @@ impl<'a> Lexer<'a> {
     }
 }
 
+fn push_utf16(out: &mut Vec<u16>, ch: char) {
+    let mut units = [0; 2];
+    out.extend(ch.encode_utf16(&mut units).iter().copied());
+}
+
+fn push_code_point_utf16(out: &mut Vec<u16>, value: u32) {
+    if value <= 0xffff {
+        out.push(value as u16);
+    } else if let Some(ch) = char::from_u32(value) {
+        push_utf16(out, ch);
+    }
+}
+
 /// An iterator over all tokens (including trivia) of a source string.
 pub struct Tokens<'a> {
     lexer: Lexer<'a>,
@@ -1000,11 +1018,11 @@ fn is_line_terminator(c: char) -> bool {
 }
 
 fn is_id_start(c: char) -> bool {
-    c == '_' || c == '$' || UnicodeXID::is_xid_start(c)
+    c == '_' || c == '$' || unicode_id::is_id_start(c)
 }
 
 fn is_id_continue(c: char) -> bool {
-    c == '_' || c == '$' || UnicodeXID::is_xid_continue(c)
+    c == '_' || c == '$' || unicode_id::is_id_continue(c)
 }
 
 /// Resolve a candidate punctuator spelling (1–4 chars) to its [`Punctuator`].

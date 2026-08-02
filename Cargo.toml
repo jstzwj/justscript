@@ -37,7 +37,6 @@ js-codegen = { path = "crates/js-codegen" }
 js-engine = { path = "crates/js-engine" }
 
 # External crates
-unicode-xid = "0.2"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

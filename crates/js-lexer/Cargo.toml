@@ -9,4 +9,3 @@ description = "ECMAScript tokenizer for JustScript"
 
 [dependencies]
 js-syntax.workspace = true
-unicode-xid.workspace = true
