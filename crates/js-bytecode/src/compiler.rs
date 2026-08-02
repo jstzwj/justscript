@@ -64,6 +64,9 @@ fn compile_program_inner(
         functions: Vec::new(),
         errors: Vec::new(),
         loops: Vec::new(),
+        labels: Vec::new(),
+        with_depth: 0,
+        function_with_bases: vec![0],
         scopes: Vec::new(),
         private_scopes,
         is_module: program.kind == js_syntax::ast::ProgramKind::Module,
@@ -155,6 +158,16 @@ fn compile_block(
 }
 
 fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx, top_level: bool) {
+    compile_stmt_with_labels(stmt, func, ctx, top_level, &[]);
+}
+
+fn compile_stmt_with_labels(
+    stmt: &Stmt,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+    top_level: bool,
+    target_labels: &[String],
+) {
     let start_pc = func.code.len();
     match stmt {
         Stmt::Empty(_) | Stmt::Debugger(_) => {}
@@ -205,7 +218,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
             let start = func.here();
             compile_expr(test, func, ctx);
             let jmp_end = emit_placeholder(func, Opcode::JumpIfFalse);
-            ctx.push_loop();
+            ctx.push_loop(target_labels, true);
             compile_stmt(body, func, ctx, false);
             // `continue` targets the test.
             let continue_target = start;
@@ -216,7 +229,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
         }
         Stmt::DoWhile { body, test, .. } => {
             let start = func.here();
-            ctx.push_loop();
+            ctx.push_loop(target_labels, true);
             compile_stmt(body, func, ctx, false);
             let test_target = func.here();
             compile_expr(test, func, ctx);
@@ -249,7 +262,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
                 }
                 None => None,
             };
-            ctx.push_loop();
+            ctx.push_loop(target_labels, true);
             compile_stmt(body, func, ctx, false);
             // `continue` jumps to the update section.
             let update_target = func.here();
@@ -287,8 +300,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
             // No match: jump to default (or end).
             let jmp_default = emit_placeholder(func, Opcode::Jump);
             // Switches allow `break` only.
-            ctx.push_loop();
-            let loop_idx = ctx.loops.len() - 1;
+            ctx.push_loop(&[], false);
             let mut body_starts = vec![0u16; cases.len()];
             for (i, c) in cases.iter().enumerate() {
                 body_starts[i] = func.here();
@@ -305,32 +317,18 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
                 jmp_default,
                 default_idx.map(|i| body_starts[i]).unwrap_or(end),
             );
-            // `continue` inside a switch should target the enclosing loop; we
-            // approximate by leaving continues unpatched (rejected) — drain to
-            // avoid leaking. Breaks patch to `end`.
-            if let Some(frame) = ctx.loops.get_mut(loop_idx) {
-                for at in frame.breaks.drain(..) {
-                    patch(func, at, end);
-                }
-                // Any `continue` here is illegal in a bare switch; report below
-                // by leaving its placeholder — but we can't easily, so patch to
-                // end as a safe fallback.
-                for at in frame.continues.drain(..) {
-                    patch(func, at, end);
-                }
-            }
-            ctx.loops.pop();
+            ctx.pop_loop(func, end, end);
         }
-        Stmt::Break { .. } => {
-            if !ctx.emit_break(func) {
+        Stmt::Break { label, .. } => {
+            if !ctx.emit_break(func, label.as_deref()) {
                 ctx.errors.push(Diagnostic::error(
                     stmt.span(),
                     "`break` outside of a loop or switch",
                 ));
             }
         }
-        Stmt::Continue { .. } => {
-            if !ctx.emit_continue(func) {
+        Stmt::Continue { label, .. } => {
+            if !ctx.emit_continue(func, label.as_deref()) {
                 ctx.errors.push(Diagnostic::error(
                     stmt.span(),
                     "`continue` outside of a loop",
@@ -352,21 +350,55 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
         Stmt::ForOf {
             left, right, body, ..
         } => {
-            compile_for_of(left, right, body, func, ctx);
+            compile_for_of(left, right, body, func, ctx, target_labels);
         }
         Stmt::ForIn {
             left, right, body, ..
         } => {
-            compile_for_in(left, right, body, func, ctx);
+            compile_for_in(left, right, body, func, ctx, target_labels);
         }
-        other => {
-            ctx.errors.push(Diagnostic::error(
-                other.span(),
-                "this statement kind is not supported yet",
-            ));
+        Stmt::Labeled { label, body, .. } => {
+            let mut labels = vec![label.clone()];
+            let mut target = body.as_ref();
+            while let Stmt::Labeled {
+                label: nested,
+                body,
+                ..
+            } = target
+            {
+                labels.push(nested.clone());
+                target = body.as_ref();
+            }
+            if is_iteration_statement(target) {
+                compile_stmt_with_labels(target, func, ctx, false, &labels);
+            } else {
+                ctx.push_label(labels);
+                compile_stmt(target, func, ctx, false);
+                let end = func.here();
+                ctx.pop_label(func, end);
+            }
+        }
+        Stmt::With { obj, body, .. } => {
+            compile_expr(obj, func, ctx);
+            func.emit_bare(Opcode::EnterWith);
+            ctx.with_depth += 1;
+            compile_stmt(body, func, ctx, false);
+            ctx.with_depth -= 1;
+            func.emit_bare(Opcode::LeaveWith);
         }
     }
     func.annotate_since(start_pc, stmt.span());
+}
+
+fn is_iteration_statement(statement: &Stmt) -> bool {
+    matches!(
+        statement,
+        Stmt::While { .. }
+            | Stmt::DoWhile { .. }
+            | Stmt::For { .. }
+            | Stmt::ForIn { .. }
+            | Stmt::ForOf { .. }
+    )
 }
 
 fn compile_decl(
@@ -533,6 +565,7 @@ fn compile_function_value(
     let _ = is_arrow;
 
     ctx.scopes.push(Scope::default());
+    ctx.function_with_bases.push(ctx.with_depth);
     // Parameters → slots 0..n, registered in the scope. Non-identifier params
     // get a scratch slot (the arg value) plus their inner bindings declared,
     // and are destructured at function entry below.
@@ -607,6 +640,7 @@ fn compile_function_value(
     nested.annotate_since(0, span);
 
     ctx.scopes.pop();
+    ctx.function_with_bases.pop();
     ctx.functions[id as usize - 1] = nested;
     id
 }
@@ -1128,6 +1162,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 }
             }
         }
+        Expr::TaggedTemplate { tag, template, .. } => {
+            compile_tagged_template(tag, template, func, ctx);
+        }
         Expr::Array { elements, .. } => {
             use js_syntax::ast::expr::ArrayExprElement;
             let has_spread = elements
@@ -1152,7 +1189,6 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             for el in elements.iter().flatten() {
                 match el {
                     ArrayExprElement::Expr(e) => {
-                        func.emit_bare(Opcode::Dup);
                         compile_expr(e, func, ctx);
                         func.emit_bare(Opcode::ArrayPush);
                     }
@@ -1248,6 +1284,12 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         }
         Expr::New(n) => {
             compile_expr(&n.callee, func, ctx);
+            if n.args.iter().any(|arg| matches!(arg, CallArg::Spread(_))) {
+                compile_argument_list(&n.args, func, ctx);
+                func.emit_bare(Opcode::NewWithArgumentList);
+                func.annotate_since(start_pc, expr.span());
+                return;
+            }
             let mut count = 0u16;
             for a in &n.args {
                 match a {
@@ -1289,6 +1331,11 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Assign {
             op, left, right, ..
         } => {
+            if matches!(op, AssignOp::And | AssignOp::Or | AssignOp::Nullish) {
+                compile_logical_assignment(*op, left, right, func, ctx);
+                func.annotate_since(start_pc, expr.span());
+                return;
+            }
             match left {
                 AssignTarget::Ident { name, .. } => {
                     if *op == AssignOp::Assign {
@@ -1323,26 +1370,13 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                             func.emit_bare(Opcode::SetProp); // [v]
                         }
                     } else {
-                        // Compound: load current, apply op, store, keep result.
-                        compile_expr(&m.object, func, ctx); // [obj]
-                        if let MemberProp::Private(name) = &m.property {
-                            let private = ctx.private_name_constant(name, m.span);
-                            func.emit(Instruction::new(Opcode::GetPrivate, private));
-                        } else {
-                            compile_member_key_push(&m.property, func, ctx); // [obj, key]
-                            func.emit_bare(Opcode::GetProp); // [cur]
-                        }
-                        compile_expr(right, func, ctx); // [cur, rhs]
-                        emit_binop(compound_to_binop(*op), func); // [newv]
-                        func.emit_bare(Opcode::Dup); // [newv, newv]
-                        compile_expr(&m.object, func, ctx); // [newv, newv, obj]
-                        if let MemberProp::Private(name) = &m.property {
-                            let private = ctx.private_name_constant(name, m.span);
-                            func.emit(Instruction::new(Opcode::SetPrivate, private));
-                        } else {
-                            compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
-                            func.emit_bare(Opcode::SetProp); // [newv]
-                        }
+                        let target = prepare_assign_target(left, func, ctx)
+                            .expect("member assignment target must prepare");
+                        load_prepared_assignment(&target, func, ctx);
+                        compile_expr(right, func, ctx);
+                        emit_binop(compound_to_binop(*op), func);
+                        func.emit_bare(Opcode::Dup);
+                        put_prepared_assignment(target, func, ctx);
                     }
                 }
                 AssignTarget::Pat(pattern) => {
@@ -1361,6 +1395,16 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             // Method call `obj.m(args)` / `obj[k](args)`: keep `obj` as `this`.
             match call.callee.as_ref() {
                 Expr::Super(_) => {
+                    if call
+                        .args
+                        .iter()
+                        .any(|arg| matches!(arg, CallArg::Spread(_)))
+                    {
+                        compile_argument_list(&call.args, func, ctx);
+                        func.emit_bare(Opcode::CallSuperWithArgumentList);
+                        func.annotate_since(start_pc, expr.span());
+                        return;
+                    }
                     let mut count = 0u16;
                     for argument in &call.args {
                         match argument {
@@ -1396,6 +1440,16 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                             func.emit_bare(Opcode::GetProp); // [obj, method]
                         }
                     }
+                    if call
+                        .args
+                        .iter()
+                        .any(|arg| matches!(arg, CallArg::Spread(_)))
+                    {
+                        compile_argument_list(&call.args, func, ctx);
+                        func.emit_bare(Opcode::CallMethodWithArgumentList);
+                        func.annotate_since(start_pc, expr.span());
+                        return;
+                    }
                     let mut count = 0u16;
                     for a in &call.args {
                         if let CallArg::Expr(e) = a {
@@ -1414,6 +1468,24 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 }
                 _ => {
                     compile_expr(&call.callee, func, ctx);
+                    if call
+                        .args
+                        .iter()
+                        .any(|arg| matches!(arg, CallArg::Spread(_)))
+                    {
+                        compile_argument_list(&call.args, func, ctx);
+                        let opcode = if matches!(
+                            call.callee.as_ref(),
+                            Expr::Ident { name, .. } if name == "eval"
+                        ) {
+                            Opcode::CallDirectEvalWithArgumentList
+                        } else {
+                            Opcode::CallWithArgumentList
+                        };
+                        func.emit_bare(opcode);
+                        func.annotate_since(start_pc, expr.span());
+                        return;
+                    }
                     let mut count = 0u16;
                     for a in &call.args {
                         match a {
@@ -1505,6 +1577,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(source, func, ctx);
             func.emit_bare(Opcode::DynamicImport);
         }
+        Expr::ImportMeta(_) => func.emit_bare(Opcode::GetImportMeta),
         Expr::Regex { pattern, flags, .. } => {
             let combined = format!("{}\0{}", pattern, flags);
             let idx = ctx.constants.intern_str(combined);
@@ -1547,9 +1620,19 @@ fn compile_optional_member_chain(
 ) {
     let mut members = Vec::new();
     let root = collect_member_chain(expression, &mut members);
-    compile_expr(root, func, ctx);
+    let mut member_index = 0;
+    if matches!(root, Expr::Super(_)) {
+        let first = members
+            .first()
+            .expect("a super optional member chain has a property");
+        compile_member_key_push(&first.property, func, ctx);
+        func.emit_bare(Opcode::GetSuperProp);
+        member_index = 1;
+    } else {
+        compile_expr(root, func, ctx);
+    }
     let mut nullish_jumps = Vec::new();
-    for member in members {
+    for member in members.into_iter().skip(member_index) {
         if member.optional {
             func.emit_bare(Opcode::Dup);
             nullish_jumps.push(emit_placeholder(func, Opcode::JumpIfNullish));
@@ -1635,7 +1718,13 @@ fn compile_named_evaluation(
 /// unresolvable reference. Encode that distinction directly in bytecode.
 fn compile_typeof(arg: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     if let Expr::Ident { name, .. } = arg {
-        if name != "undefined" && matches!(ctx.resolve_var(name), VarRef::Global) {
+        let reference = ctx.resolve_var(name);
+        if ctx.uses_dynamic_name(&reference) {
+            let name = ctx.constants.intern_str(name);
+            func.emit(Instruction::new(Opcode::TypeofName, name));
+            return;
+        }
+        if name != "undefined" && matches!(reference, VarRef::Global) {
             let name = ctx.constants.intern_str(name);
             func.emit(Instruction::new(Opcode::TypeofGlobal, name));
             return;
@@ -1675,12 +1764,125 @@ fn compile_lit(lit: &Lit, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
             let idx = ctx.constants.intern_bigint(raw);
             func.emit(Instruction::new(Opcode::LdaConst, idx));
         }
-        Lit::Regex { span, .. } | Lit::TemplateString { span, .. } => {
+        Lit::TemplateString { cooked, raw, .. } => {
+            let value = cooked.as_ref().unwrap_or(raw);
+            let idx = ctx.constants.intern_str(value);
+            func.emit(Instruction::new(Opcode::LdaConst, idx));
+        }
+        Lit::Regex { span, .. } => {
             ctx.errors.push(Diagnostic::error(
                 *span,
                 "this literal kind is not supported yet",
             ));
             func.emit_bare(Opcode::LdaUndefined);
+        }
+    }
+}
+
+fn compile_tagged_template(
+    tag: &Expr,
+    template: &Expr,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    let method_call = match tag {
+        Expr::Member(member) if matches!(member.object.as_ref(), Expr::Super(_)) => {
+            func.emit_bare(Opcode::LdaThis);
+            compile_member_key_push(&member.property, func, ctx);
+            func.emit_bare(Opcode::GetSuperProp);
+            true
+        }
+        Expr::Member(member) => {
+            compile_expr(&member.object, func, ctx);
+            func.emit_bare(Opcode::Dup);
+            if let MemberProp::Private(name) = &member.property {
+                let private = ctx.private_name_constant(name, member.span);
+                func.emit(Instruction::new(Opcode::GetPrivate, private));
+            } else {
+                compile_member_key_push(&member.property, func, ctx);
+                func.emit_bare(Opcode::GetProp);
+            }
+            true
+        }
+        _ => {
+            compile_expr(tag, func, ctx);
+            false
+        }
+    };
+
+    let (cooked, raw, expressions) = match template {
+        Expr::Lit(Lit::TemplateString { cooked, raw, .. }) => {
+            (vec![cooked.clone()], vec![raw.clone()], &[][..])
+        }
+        Expr::TemplateLit {
+            quasis,
+            expressions,
+            ..
+        } => (
+            quasis.iter().map(|(cooked, _)| cooked.clone()).collect(),
+            quasis.iter().map(|(_, raw)| raw.clone()).collect(),
+            expressions.as_slice(),
+        ),
+        _ => {
+            ctx.errors.push(Diagnostic::error(
+                template.span(),
+                "tagged template operand is not a template literal",
+            ));
+            func.emit_bare(Opcode::LdaUndefined);
+            return;
+        }
+    };
+    let site = func.template_sites.len() as u16;
+    func.template_sites
+        .push(crate::module::TemplateSite { cooked, raw });
+    func.emit(Instruction::new(Opcode::GetTemplateObject, site));
+    for expression in expressions {
+        compile_expr(expression, func, ctx);
+    }
+    let argc = expressions.len() as u16 + 1;
+    func.emit(Instruction::new(
+        if method_call {
+            Opcode::CallMethod
+        } else {
+            Opcode::Call
+        },
+        argc,
+    ));
+}
+
+fn compile_argument_list(
+    arguments: &[CallArg],
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    func.emit(Instruction::new(Opcode::NewArray, 0));
+    for argument in arguments {
+        match argument {
+            CallArg::Expr(expression) => {
+                compile_expr(expression, func, ctx);
+                func.emit_bare(Opcode::ArrayPush);
+            }
+            CallArg::Spread(expression) => {
+                compile_expr(expression, func, ctx);
+                func.emit_bare(Opcode::GetIterator);
+                let iterator = fresh_temp(func, "argument-iterator");
+                func.emit(Instruction::new(Opcode::StaLocal, iterator));
+                let next = func.here();
+                func.emit(Instruction::new(Opcode::LdaLocal, iterator));
+                func.emit_bare(Opcode::IterNext);
+                func.emit_bare(Opcode::Dup);
+                let done = ctx.constants.intern_str("done");
+                func.emit(Instruction::new(Opcode::LdaConst, done));
+                func.emit_bare(Opcode::GetProp);
+                let completed = emit_placeholder(func, Opcode::JumpIfTrue);
+                let value = ctx.constants.intern_str("value");
+                func.emit(Instruction::new(Opcode::LdaConst, value));
+                func.emit_bare(Opcode::GetProp);
+                func.emit_bare(Opcode::ArrayPush);
+                emit_jump(func, Opcode::Jump, next);
+                patch(func, completed, func.here());
+                func.emit_bare(Opcode::Pop);
+            }
         }
     }
 }
@@ -1735,11 +1937,20 @@ fn emit_binop(op: BinOp, func: &mut BytecodeFunction) {
 fn compile_delete(arg: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match arg {
         Expr::Member(member) => {
-            compile_expr(&member.object, func, ctx);
-            compile_member_key_push(&member.property, func, ctx);
-            func.emit_bare(Opcode::DeleteProp);
+            if matches!(member.object.as_ref(), Expr::Super(_)) {
+                compile_member_key_push(&member.property, func, ctx);
+                func.emit_bare(Opcode::DeleteSuperProp);
+            } else {
+                compile_expr(&member.object, func, ctx);
+                compile_member_key_push(&member.property, func, ctx);
+                func.emit_bare(Opcode::DeleteProp);
+            }
         }
         Expr::Ident { name, .. } => match ctx.resolve_var(name) {
+            reference if ctx.uses_dynamic_name(&reference) => {
+                let name = ctx.constants.intern_str(name);
+                func.emit(Instruction::new(Opcode::DeleteName, name));
+            }
             VarRef::Local(_) | VarRef::Upvalue(_) => func.emit_bare(Opcode::LdaFalse),
             VarRef::Global => {
                 let name = ctx.constants.intern_str(name);
@@ -1866,6 +2077,7 @@ fn compile_for_of(
     body: &Stmt,
     func: &mut BytecodeFunction,
     ctx: &mut CompilerCtx,
+    target_labels: &[String],
 ) {
     let iter = func.locals.intern("<forof-iter>");
     // ITER = GetIterator(right)
@@ -1889,7 +2101,7 @@ fn compile_for_of(
     func.emit_bare(Opcode::GetProp);
     assign_for_target(left, func, ctx);
     // body
-    ctx.push_loop();
+    ctx.push_loop(target_labels, true);
     compile_stmt(body, func, ctx, false);
     let update_target = func.here();
     emit_jump(func, Opcode::Jump, start);
@@ -1907,6 +2119,7 @@ fn compile_for_in(
     body: &Stmt,
     func: &mut BytecodeFunction,
     ctx: &mut CompilerCtx,
+    target_labels: &[String],
 ) {
     let src = func.locals.intern("<forin-src>");
     let idx = func.locals.intern("<forin-idx>");
@@ -1931,7 +2144,7 @@ fn compile_for_in(
     func.emit(Instruction::new(Opcode::LdaLocal, idx));
     func.emit_bare(Opcode::GetProp);
     assign_for_target(left, func, ctx);
-    ctx.push_loop();
+    ctx.push_loop(target_labels, true);
     compile_stmt(body, func, ctx, false);
     let update_target = func.here();
     let one = ctx.constants.intern_int(1);
@@ -1983,7 +2196,7 @@ fn declare_pattern_names(pat: &Pat, func: &mut BytecodeFunction, ctx: &mut Compi
 /// Rest elements/properties are collected into a fresh array (basic).
 fn bind_pattern(pat: &Pat, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match pat {
-        Pat::Ident { name, .. } => store_ident(name, func, ctx),
+        Pat::Ident { name, .. } => store_binding_ident(name, func, ctx),
         Pat::Assignment { left, right, .. } => {
             // `value === undefined ? default : value`
             func.emit_bare(Opcode::Dup);
@@ -2057,6 +2270,7 @@ enum PreparedAssignmentTarget {
     Ident(String),
     Private { object: u16, private_name: u16 },
     Property { object: u16, key: u16 },
+    Super { key: u16 },
 }
 
 fn fresh_temp(func: &mut BytecodeFunction, purpose: &str) -> u16 {
@@ -2078,6 +2292,12 @@ fn prepare_assignment_target(
             prepare_assignment_target(left, func, ctx)
         }
         Pat::Member(member) => {
+            if matches!(member.object.as_ref(), Expr::Super(_)) {
+                let key = fresh_temp(func, "destr-ref-super-key");
+                compile_member_key_push(&member.property, func, ctx);
+                func.emit(Instruction::new(Opcode::StaLocal, key));
+                return Some(PreparedAssignmentTarget::Super { key });
+            }
             let object = fresh_temp(func, "destr-ref-object");
             compile_expr(&member.object, func, ctx);
             func.emit(Instruction::new(Opcode::StaLocal, object));
@@ -2117,6 +2337,113 @@ fn put_prepared_assignment(
             func.emit(Instruction::new(Opcode::LdaLocal, key));
             func.emit_bare(Opcode::SetProp);
         }
+        PreparedAssignmentTarget::Super { key } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, key));
+            func.emit_bare(Opcode::SetSuperProp);
+        }
+    }
+}
+
+fn prepare_assign_target(
+    target: &AssignTarget,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) -> Option<PreparedAssignmentTarget> {
+    match target {
+        AssignTarget::Ident { name, .. } => Some(PreparedAssignmentTarget::Ident(name.clone())),
+        AssignTarget::Member(member) => {
+            prepare_assignment_target(&Pat::Member(member.clone()), func, ctx)
+        }
+        AssignTarget::Pat(_) => None,
+    }
+}
+
+fn load_prepared_assignment(
+    target: &PreparedAssignmentTarget,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    match target {
+        PreparedAssignmentTarget::Ident(name) => load_ident(name, func, ctx),
+        PreparedAssignmentTarget::Private {
+            object,
+            private_name,
+        } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, *object));
+            func.emit(Instruction::new(Opcode::GetPrivate, *private_name));
+        }
+        PreparedAssignmentTarget::Property { object, key } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, *object));
+            func.emit(Instruction::new(Opcode::LdaLocal, *key));
+            func.emit_bare(Opcode::GetProp);
+        }
+        PreparedAssignmentTarget::Super { key } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, *key));
+            func.emit_bare(Opcode::GetSuperProp);
+        }
+    }
+}
+
+fn assignment_target_name(target: &AssignTarget) -> Option<String> {
+    match target {
+        AssignTarget::Ident { name, .. } => Some(name.clone()),
+        AssignTarget::Member(member) => match &member.property {
+            MemberProp::Ident(name) => Some(name.clone()),
+            MemberProp::Private(name) => Some(format!("#{name}")),
+            MemberProp::Computed(_) => None,
+        },
+        AssignTarget::Pat(_) => None,
+    }
+}
+
+fn compile_logical_assignment(
+    op: AssignOp,
+    left: &AssignTarget,
+    right: &Expr,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    let Some(target) = prepare_assign_target(left, func, ctx) else {
+        ctx.errors.push(Diagnostic::error(
+            right.span(),
+            "logical assignment requires a simple assignment target",
+        ));
+        func.emit_bare(Opcode::LdaUndefined);
+        return;
+    };
+    load_prepared_assignment(&target, func, ctx);
+    func.emit_bare(Opcode::Dup);
+
+    let short_circuit = match op {
+        AssignOp::And => Some(emit_placeholder(func, Opcode::JumpIfFalse)),
+        AssignOp::Or => Some(emit_placeholder(func, Opcode::JumpIfTrue)),
+        AssignOp::Nullish => None,
+        _ => unreachable!("non-logical assignment passed to logical lowering"),
+    };
+    let nullish_rhs = if op == AssignOp::Nullish {
+        Some(emit_placeholder(func, Opcode::JumpIfNullish))
+    } else {
+        None
+    };
+    let non_nullish_end = nullish_rhs.map(|_| emit_placeholder(func, Opcode::Jump));
+    let rhs_start = func.here();
+    if let Some(jump) = nullish_rhs {
+        patch(func, jump, rhs_start);
+    }
+    func.emit_bare(Opcode::Pop);
+    if let Some(name) = assignment_target_name(left) {
+        compile_named_evaluation(right, &name, func, ctx);
+    } else {
+        compile_expr(right, func, ctx);
+    }
+    func.emit_bare(Opcode::Dup);
+    put_prepared_assignment(target, func, ctx);
+    let end = func.here();
+    if let Some(jump) = short_circuit {
+        patch(func, jump, end);
+    }
+    if let Some(jump) = non_nullish_end {
+        patch(func, jump, end);
     }
 }
 
@@ -2298,7 +2625,7 @@ fn collect_stmt_bindings(stmt: &Stmt, out: &mut Vec<String>) {
                 collect_bindings(f, out);
             }
         }
-        Stmt::Labeled { body, .. } => collect_stmt_bindings(body, out),
+        Stmt::Labeled { body, .. } | Stmt::With { body, .. } => collect_stmt_bindings(body, out),
         // Expression statements, return, throw, break, continue, etc. introduce
         // no bindings; nested functions are separate scopes (not collected).
         _ => {}
@@ -2434,7 +2761,13 @@ fn load_ident(name: &str, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
         func.emit_bare(Opcode::LdaUndefined);
         return;
     }
-    match ctx.resolve_var(name) {
+    let reference = ctx.resolve_var(name);
+    if ctx.uses_dynamic_name(&reference) {
+        let idx = ctx.constants.intern_str(name);
+        func.emit(Instruction::new(Opcode::GetName, idx));
+        return;
+    }
+    match reference {
         VarRef::Local(slot) => func.emit(Instruction::new(Opcode::LdaLocal, slot)),
         VarRef::Upvalue(idx) => func.emit(Instruction::new(Opcode::LdaUpvalue, idx)),
         VarRef::Global => {
@@ -2445,6 +2778,25 @@ fn load_ident(name: &str, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
 }
 
 fn store_ident(name: &str, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    let reference = ctx.resolve_var(name);
+    if ctx.uses_dynamic_name(&reference) {
+        let idx = ctx.constants.intern_str(name);
+        func.emit(Instruction::new(Opcode::SetName, idx));
+        return;
+    }
+    match reference {
+        VarRef::Local(slot) => func.emit(Instruction::new(Opcode::StaLocal, slot)),
+        VarRef::Upvalue(idx) => func.emit(Instruction::new(Opcode::StaUpvalue, idx)),
+        VarRef::Global => {
+            let idx = ctx.constants.intern_str(name);
+            func.emit(Instruction::new(Opcode::SetGlobal, idx));
+        }
+    }
+}
+
+/// BindingInitialization targets the binding created by the declaration; it
+/// does not perform object Environment Record name resolution.
+fn store_binding_ident(name: &str, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     match ctx.resolve_var(name) {
         VarRef::Local(slot) => func.emit(Instruction::new(Opcode::StaLocal, slot)),
         VarRef::Upvalue(idx) => func.emit(Instruction::new(Opcode::StaUpvalue, idx)),
@@ -2486,38 +2838,17 @@ fn compile_update(
             }
         }
         Expr::Member(m) => {
-            // Load current value, apply +1/-1, then store with [value, obj, key]
-            // ordering. Prefix yields the new value; postfix yields the old.
-            compile_expr(&m.object, func, ctx); // [obj]
-            if let MemberProp::Private(name) = &m.property {
-                let private = ctx.private_name_constant(name, m.span);
-                func.emit(Instruction::new(Opcode::GetPrivate, private));
-            } else {
-                compile_member_key_push(&m.property, func, ctx); // [obj, key]
-                func.emit_bare(Opcode::GetProp); // [cur]
-            }
+            let target = prepare_assignment_target(&Pat::Member(m.clone()), func, ctx)
+                .expect("member update target must prepare");
+            load_prepared_assignment(&target, func, ctx);
             if prefix {
-                emit_delta(func); // [newv]
-                func.emit_bare(Opcode::Dup); // [newv, newv]
-                compile_expr(&m.object, func, ctx); // [newv, newv, obj]
-                if let MemberProp::Private(name) = &m.property {
-                    let private = ctx.private_name_constant(name, m.span);
-                    func.emit(Instruction::new(Opcode::SetPrivate, private));
-                } else {
-                    compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
-                    func.emit_bare(Opcode::SetProp); // [newv]
-                }
+                emit_delta(func);
+                func.emit_bare(Opcode::Dup);
+                put_prepared_assignment(target, func, ctx);
             } else {
-                func.emit_bare(Opcode::Dup); // [cur, cur]
-                emit_delta(func); // [cur, newv]
-                compile_expr(&m.object, func, ctx); // [cur, newv, obj]
-                if let MemberProp::Private(name) = &m.property {
-                    let private = ctx.private_name_constant(name, m.span);
-                    func.emit(Instruction::new(Opcode::SetPrivate, private));
-                } else {
-                    compile_member_key_push(&m.property, func, ctx); // [cur, newv, obj, key]
-                    func.emit_bare(Opcode::SetProp); // [cur]
-                }
+                func.emit_bare(Opcode::Dup);
+                emit_delta(func);
+                put_prepared_assignment(target, func, ctx);
             }
         }
         _ => {
@@ -2579,6 +2910,16 @@ struct CompilerCtx {
     /// only (`continues` stays empty and a `continue` inside a bare switch is
     /// rejected by the caller).
     loops: Vec<LoopFrame>,
+    /// Non-iteration labelled statements. Their only runtime control target is
+    /// `break label`; iteration labels live directly on `LoopFrame` so both
+    /// labelled break and labelled continue resolve to the same statement.
+    labels: Vec<LabelFrame>,
+    /// Number of syntactically enclosing `with` statements and the depth at
+    /// which each compiled function began. Together these distinguish a
+    /// function's own locals from outer names resolved through captured object
+    /// Environment Records.
+    with_depth: usize,
+    function_with_bases: Vec<usize>,
     /// Lexical scope stack, one entry per *function* being compiled (scopes[0]
     /// is `<main>`). Drives closure upvalue resolution.
     scopes: Vec<Scope>,
@@ -2604,6 +2945,13 @@ struct UpvalueBinding {
 struct LoopFrame {
     breaks: Vec<u16>,
     continues: Vec<u16>,
+    labels: Vec<String>,
+    is_iteration: bool,
+}
+
+struct LabelFrame {
+    labels: Vec<String>,
+    breaks: Vec<u16>,
 }
 
 /// Retain the complete visible lexical chain on function closures. Direct eval
@@ -2683,6 +3031,14 @@ impl CompilerCtx {
         VarRef::Global
     }
 
+    fn uses_dynamic_name(&self, reference: &VarRef) -> bool {
+        if self.with_depth == 0 {
+            return false;
+        }
+        let function_base = self.function_with_bases.last().copied().unwrap_or(0);
+        self.with_depth > function_base || !matches!(reference, VarRef::Local(_))
+    }
+
     /// Recursive Lua-style upvalue resolution against ancestor scopes.
     /// `scope_idx` is the ancestor index to inspect (the parent of the function
     /// currently being resolved). Returns the upvalue index registered in the
@@ -2735,8 +3091,12 @@ impl CompilerCtx {
         (scope.upvalues.len() - 1) as u16
     }
 
-    fn push_loop(&mut self) {
-        self.loops.push(LoopFrame::default());
+    fn push_loop(&mut self, labels: &[String], is_iteration: bool) {
+        self.loops.push(LoopFrame {
+            labels: labels.to_vec(),
+            is_iteration,
+            ..LoopFrame::default()
+        });
     }
     /// Pop the current frame, patching `break` jumps to `break_target` and
     /// `continue` jumps to `continue_target`.
@@ -2750,26 +3110,62 @@ impl CompilerCtx {
             }
         }
     }
-    fn emit_break(&mut self, func: &mut BytecodeFunction) -> bool {
-        if let Some(frame) = self.loops.last_mut() {
-            frame.breaks.push(emit_placeholder(func, Opcode::Jump));
-            true
-        } else {
-            false
+    fn push_label(&mut self, labels: Vec<String>) {
+        self.labels.push(LabelFrame {
+            labels,
+            breaks: Vec::new(),
+        });
+    }
+
+    fn pop_label(&mut self, func: &mut BytecodeFunction, break_target: u16) {
+        if let Some(frame) = self.labels.pop() {
+            for at in frame.breaks {
+                patch(func, at, break_target);
+            }
         }
     }
-    fn emit_continue(&mut self, func: &mut BytecodeFunction) -> bool {
-        if let Some(frame) = self.loops.last_mut() {
-            // Only loops (not switches) accept continue; switches leave
-            // `continues` to be patched to the enclosing loop's update, but to
-            // keep semantics simple we only allow continue in loops — switches
-            // don't push a continue-able frame distinction here. We record the
-            // patch and let the enclosing loop patch it.
-            frame.continues.push(emit_placeholder(func, Opcode::Jump));
-            true
-        } else {
-            false
+
+    fn emit_break(&mut self, func: &mut BytecodeFunction, label: Option<&str>) -> bool {
+        if let Some(label) = label {
+            if let Some(frame) = self
+                .loops
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.labels.iter().any(|candidate| candidate == label))
+            {
+                frame.breaks.push(emit_placeholder(func, Opcode::Jump));
+                return true;
+            }
+            if let Some(frame) = self
+                .labels
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.labels.iter().any(|candidate| candidate == label))
+            {
+                frame.breaks.push(emit_placeholder(func, Opcode::Jump));
+                return true;
+            }
+            return false;
         }
+
+        let Some(frame) = self.loops.last_mut() else {
+            return false;
+        };
+        frame.breaks.push(emit_placeholder(func, Opcode::Jump));
+        true
+    }
+    fn emit_continue(&mut self, func: &mut BytecodeFunction, label: Option<&str>) -> bool {
+        let frame = match label {
+            Some(label) => self.loops.iter_mut().rev().find(|frame| {
+                frame.is_iteration && frame.labels.iter().any(|candidate| candidate == label)
+            }),
+            None => self.loops.iter_mut().rev().find(|frame| frame.is_iteration),
+        };
+        let Some(frame) = frame else {
+            return false;
+        };
+        frame.continues.push(emit_placeholder(func, Opcode::Jump));
+        true
     }
 }
 

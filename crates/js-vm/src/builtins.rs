@@ -196,6 +196,7 @@ pub fn native_static_value(obj: &Value, name: &str) -> Option<Value> {
             "iterator" => Some(Value::symbol(js_runtime::value::JsSymbol::iterator())),
             "asyncIterator" => Some(Value::symbol(js_runtime::value::JsSymbol::async_iterator())),
             "toPrimitive" => Some(Value::symbol(js_runtime::value::JsSymbol::to_primitive())),
+            "unscopables" => Some(Value::symbol(js_runtime::value::JsSymbol::unscopables())),
             _ => None,
         };
     }
@@ -642,6 +643,7 @@ pub(crate) fn resolve_promise(
             on_fulfilled: None,
             on_rejected: None,
             result: promise,
+            await_id: None,
         };
         let state = {
             let mut source = source.borrow_mut();
@@ -697,6 +699,45 @@ pub(crate) fn promise_resolved(
     let promise = new_promise();
     resolve_promise(interp, modules, promise.clone(), value)?;
     Ok(Value::object(promise))
+}
+
+pub(crate) fn register_await_reaction(
+    interp: &mut Interpreter,
+    promise: &Value,
+    await_id: u64,
+) -> Result<(), InterpError> {
+    let promise = promise_object(promise)
+        .ok_or_else(|| InterpError::Internal("await reaction target is not a Promise".into()))?;
+    let reaction = PromiseReaction {
+        on_fulfilled: None,
+        on_rejected: None,
+        result: new_promise(),
+        await_id: Some(await_id),
+    };
+    let state = {
+        let mut object = promise.borrow_mut();
+        let data = object.promise.as_mut().unwrap();
+        match &data.state {
+            PromiseState::Pending => {
+                data.reactions.push(reaction.clone());
+                None
+            }
+            state => Some(state.clone()),
+        }
+    };
+    if let Some(state) = state {
+        let (argument, rejected) = match state {
+            PromiseState::Fulfilled(value) => (value, false),
+            PromiseState::Rejected(value) => (value, true),
+            PromiseState::Pending => unreachable!(),
+        };
+        interp.enqueue_promise_job(crate::interp::PromiseJob::Reaction {
+            reaction,
+            argument,
+            rejected,
+        });
+    }
+    Ok(())
 }
 
 fn promise_resolve(
@@ -809,6 +850,7 @@ fn promise_then(
         on_fulfilled: callable(args.first()),
         on_rejected: callable(args.get(1)),
         result: new_promise(),
+        await_id: None,
     };
     let state = {
         let mut object = promise.borrow_mut();
@@ -2129,15 +2171,7 @@ fn arr_some_every(
 }
 
 fn is_truthy(v: &Value) -> bool {
-    !matches!(
-        v.data(),
-        ValueData::Undefined | ValueData::Null | ValueData::Boolean(false)
-    ) && match v.data() {
-        ValueData::Integer(i) => *i != 0,
-        ValueData::Number(n) => *n != 0.0 && !n.is_nan(),
-        ValueData::String(s) => !s.is_empty(),
-        _ => true,
-    }
+    v.to_boolean()
 }
 
 // ---- global builtins ------------------------------------------------------

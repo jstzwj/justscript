@@ -53,6 +53,15 @@ pub struct BytecodeFunction {
     pub is_async: bool,
     /// Exception-handler specs, indexed by `TryBegin`'s operand.
     pub handlers: Vec<HandlerSpec>,
+    /// Parsed template sites used by tagged-template evaluation. Each source
+    /// site has a stable index within its function.
+    pub template_sites: Vec<TemplateSite>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TemplateSite {
+    pub cooked: Vec<Option<String>>,
+    pub raw: Vec<String>,
 }
 
 /// A compiled `try` handler: where to jump on a caught exception, and where to
@@ -80,6 +89,7 @@ impl BytecodeFunction {
             is_generator: false,
             is_async: false,
             handlers: Vec::new(),
+            template_sites: Vec::new(),
         }
     }
 

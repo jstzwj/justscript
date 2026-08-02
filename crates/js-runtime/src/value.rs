@@ -10,6 +10,7 @@
 use crate::object::{Attribute, JsObject, ObjectData, PropertyDescriptor};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 
@@ -185,6 +186,21 @@ impl Value {
             ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_)
         )
     }
+    /// ECMAScript `ToBoolean`. This conversion never invokes user code.
+    pub fn to_boolean(&self) -> bool {
+        match &self.data {
+            ValueData::Undefined | ValueData::Null => false,
+            ValueData::Boolean(value) => *value,
+            ValueData::Integer(value) => *value != 0,
+            ValueData::Number(value) => *value != 0.0 && !value.is_nan(),
+            ValueData::String(value) => !value.is_empty(),
+            ValueData::BigInt(value) => value.0 != "0",
+            ValueData::Symbol(_)
+            | ValueData::Object(_)
+            | ValueData::Function(_)
+            | ValueData::Generator(_) => true,
+        }
+    }
     pub fn is_function(&self) -> bool {
         matches!(self.data, ValueData::Function(_))
     }
@@ -303,6 +319,8 @@ pub struct GeneratorState {
     pub locals: Vec<Cell>,
     pub stack: Vec<Value>,
     pub upvalues: Vec<Cell>,
+    /// Object Environment Records captured at generator creation.
+    pub with_environments: Vec<Value>,
     pub private_brands: HashMap<u32, u64>,
     pub private_environment_stack: Vec<HashMap<u32, u64>>,
     pub this: Value,
@@ -318,10 +336,19 @@ pub struct GeneratorState {
     /// Active handlers must survive suspension just like locals and the stack.
     pub try_stack: Vec<GeneratorTryState>,
     pub pending_throw: Option<Value>,
+    pub async_executing: bool,
+    pub async_queue: VecDeque<AsyncGeneratorRequest>,
     /// `true` once the body has completed; further `.next()` returns done.
     pub done: bool,
     /// `false` until the first `.next()` (pc starts at 0).
     pub started: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AsyncGeneratorRequest {
+    pub kind: GeneratorResumeKind,
+    pub value: Value,
+    pub promise: JsObject,
 }
 
 /// The completion used to resume a suspended generator.
@@ -370,6 +397,8 @@ pub struct JsFunction {
     pub id: u32,
     pub param_count: u16,
     pub upvalues: Vec<Cell>,
+    /// Object Environment Records captured at function creation.
+    pub with_environments: Vec<Value>,
     /// For arrow functions: the lexically captured `this`. `None` for ordinary
     /// functions (which get `this` from their call site).
     pub this_cell: Option<Cell>,
@@ -452,6 +481,7 @@ impl JsFunction {
             id,
             param_count,
             upvalues: Vec::new(),
+            with_environments: Vec::new(),
             this_cell: None,
             native: None,
             bound_generator: None,
@@ -522,7 +552,7 @@ pub struct JsSymbol {
 impl JsSymbol {
     pub fn new(description: Option<String>) -> JsSymbol {
         use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(5);
+        static NEXT_ID: AtomicU64 = AtomicU64::new(6);
         JsSymbol {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             description,
@@ -554,6 +584,13 @@ impl JsSymbol {
         JsSymbol {
             id: 4,
             description: Some("Symbol.toPrimitive".into()),
+        }
+    }
+
+    pub fn unscopables() -> JsSymbol {
+        JsSymbol {
+            id: 5,
+            description: Some("Symbol.unscopables".into()),
         }
     }
 }
@@ -633,5 +670,22 @@ mod tests {
             ValueData::String(s) => assert_eq!(s.as_str(), "hi"),
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_boolean_covers_all_primitive_categories() {
+        assert!(!Value::undefined().to_boolean());
+        assert!(!Value::null().to_boolean());
+        assert!(!Value::boolean(false).to_boolean());
+        assert!(!Value::integer(0).to_boolean());
+        assert!(!Value::number(f64::NAN).to_boolean());
+        assert!(!Value::string("").to_boolean());
+        assert!(!Value::bigint(JsBigInt::from_i64(0)).to_boolean());
+
+        assert!(Value::boolean(true).to_boolean());
+        assert!(Value::integer(1).to_boolean());
+        assert!(Value::number(-1.0).to_boolean());
+        assert!(Value::string("0").to_boolean());
+        assert!(Value::bigint(JsBigInt::from_i64(-1)).to_boolean());
     }
 }

@@ -1211,3 +1211,88 @@ fn calling_and_constructing_non_callable_values_throw_type_error() {
         assert_eq!(exception.value.error_name().as_deref(), Some("TypeError"));
     }
 }
+
+#[test]
+fn logical_assignment_resolves_its_reference_once() {
+    assert!(matches!(
+        run(r#"
+let reads = 0;
+let writes = 0;
+let object = {
+    get value() { reads += 1; return 0; },
+    set value(next) { writes += next; }
+};
+object.value ||= 2;
+reads === 1 && writes === 2;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn with_uses_object_environment_and_unscopables() {
+    assert!(matches!(
+        run(r#"
+let outer = 1;
+let object = { outer: 2, visible: 3 };
+object[Symbol.unscopables] = { outer: true };
+let observed;
+with (object) { observed = outer + visible; }
+observed;
+"#),
+        ValueData::Integer(4)
+    ));
+}
+
+#[test]
+fn tagged_template_object_is_cached_per_source_site() {
+    assert!(matches!(
+        run(r#"
+let first;
+function tag(strings) {
+    if (first === undefined) { first = strings; return true; }
+    return first === strings && Object.isFrozen(strings) && Object.isFrozen(strings.raw);
+}
+function callSite() { return tag`value`; }
+callSite();
+callSite();
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn spread_calls_methods_and_constructors_from_iterator_values() {
+    assert!(matches!(
+        run(r#"
+function C(a, b) { this.total = a + b; }
+let receiver = { base: 4, add(a, b) { return this.base + a + b; } };
+let instance = new C(...[2, 3]);
+receiver.add(1, ...[2]) === 7 && instance.total === 5;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn async_await_continuation_updates_shared_state() {
+    let value = run(r#"
+let state = { value: 0 };
+async function update() {
+    state.value = await Promise.resolve(42);
+}
+update();
+state;
+"#);
+    let ValueData::Object(object) = value else {
+        panic!("expected state object");
+    };
+    let value = object.borrow().properties.get("value").cloned();
+    assert!(matches!(
+        value,
+        Some(js_runtime::object::PropertyDescriptor::Data {
+            value,
+            ..
+        }) if matches!(value.data(), ValueData::Integer(42))
+    ));
+}

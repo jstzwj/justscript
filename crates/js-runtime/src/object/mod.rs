@@ -52,6 +52,9 @@ pub struct PromiseReaction {
     pub on_fulfilled: Option<Value>,
     pub on_rejected: Option<Value>,
     pub result: JsObject,
+    /// VM continuation resumed by this reaction instead of invoking a JS
+    /// handler. `None` for ordinary `.then` reactions.
+    pub await_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

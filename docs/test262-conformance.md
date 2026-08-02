@@ -45,13 +45,27 @@ The report is kept at `target/test262-results/language-runtime/runtime.json`.
 
 | Profile | Files / variants | Executed | Pass | Fail | Incomplete | Skip |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `language-runtime` | 23,711 / 44,475 | 31,926 | 19,990 | 10,766 | 1,170 | 12,549 |
+| `language-runtime` | 23,711 / 44,475 | 31,926 | 20,556 | 11,329 | 41 | 12,549 |
 
-The pass rate over executed variants is 62.6%. This is not combined with the
-front-end, built-ins, Annex B, or ECMA-402 profiles. The largest incomplete
-clusters are unsupported statement lowering (454), pending async continuations
-(246), spread calls (170), unsupported expression lowering (102), spread in
-`new` (44), and the three legacy logical opcodes (113 total).
+The pass rate over executed variants is 64.4%. This is not combined with the
+front-end, built-ins, Annex B, or ECMA-402 profiles. The former incomplete
+clusters for statement lowering (454), async continuation (246), spread
+call/new (214), expression lowering (102), and legacy logical opcodes (113)
+have all been eliminated. The remaining 41 incomplete variants are 16 class
+computed-key setup failures, 8 invalid update-target compiler failures, 5
+source-phase/import-attribute parser failures, 4 duplicate-parameter bytecode
+verification failures, and 8 JSON/text module host-linking failures.
+
+Logical assignment now lowers to short-circuit control flow while retaining a
+single prepared Reference, and all truthiness consumers share one `ToBoolean`
+implementation. Labelled statements carry explicit break/continue targets;
+sloppy `with` uses object Environment Records with Proxy `has`,
+`@@unscopables`, closure capture, and global object-record fallback.
+Tagged-template sites have a per-Realm TemplateMap and frozen cooked/raw
+arrays, while `import.meta` is cached per Module Record. Dynamic argument-list
+bytecode drives IteratorRecord for ordinary, method, super, and constructor
+calls. Async functions now suspend full frames into Promise reactions, and
+async generators serialize concurrent requests through their request queue.
 
 ### Language Runtime Module Subset
 

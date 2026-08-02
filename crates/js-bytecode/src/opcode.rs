@@ -69,6 +69,10 @@ pub enum Opcode {
     LdaUpvalue,
     /// Pop and store into captured upvalue slot `operand`.
     StaUpvalue,
+    /// Pop an object and push an object Environment Record for `with`.
+    EnterWith,
+    /// Pop the innermost object Environment Record.
+    LeaveWith,
 
     // --- arithmetic / binary (operands popped, result pushed) -----------
     Add,
@@ -144,6 +148,10 @@ pub enum Opcode {
     /// on the stack. For generators this drives a `.next()` (the result lands
     /// when the generator yields/returns).
     IterNext,
+    /// Push the cached frozen template object for function-local site operand.
+    GetTemplateObject,
+    /// Push the active Module Record's cached import.meta object.
+    GetImportMeta,
 
     // --- objects / calls ------------------------------------------------
     /// Create a fresh object and push it.
@@ -158,11 +166,18 @@ pub enum Opcode {
     CallDirectEval,
     /// Method call: stack `[obj, fn, args...]`, `this` = obj.
     CallMethod,
+    /// Dynamic argument-list variants consume a freshly built Array rather
+    /// than a fixed number of stack operands.
+    CallWithArgumentList,
+    CallDirectEvalWithArgumentList,
+    CallMethodWithArgumentList,
     /// `new` call with `operand` args.
     New,
+    NewWithArgumentList,
     /// Call the current derived constructor's superclass. `u16::MAX` forwards
     /// all arguments from a synthesized default constructor.
     CallSuper,
+    CallSuperWithArgumentList,
     /// Set a property through the current method's super base.
     SetSuperProp,
     /// Read a property through the current method's super base.
@@ -194,6 +209,8 @@ pub enum Opcode {
     CopyDataProperties,
     /// Delete an own property. Stack input is `[object, key]`; pushes a bool.
     DeleteProp,
+    /// Evaluate and reject deletion of a super property Reference.
+    DeleteSuperProp,
     /// Delete an unqualified global reference named by a string constant.
     DeleteGlobal,
     /// `a instanceof B`: pop B, pop a, push boolean.
@@ -207,6 +224,12 @@ pub enum Opcode {
     TypeofGlobal,
     /// Set the named global `operand`.
     SetGlobal,
+    /// Resolve a name through active object Environment Records, then through
+    /// the statically known local/upvalue/global fallback.
+    GetName,
+    SetName,
+    TypeofName,
+    DeleteName,
     /// Pop a module specifier and push the host's dynamic-import Promise.
     DynamicImport,
 
@@ -237,6 +260,7 @@ pub enum OperandKind {
     ArgumentCount,
     Handler,
     ClassField,
+    TemplateSite,
 }
 
 impl Opcode {
@@ -250,6 +274,10 @@ impl Opcode {
             | Opcode::TypeofGlobal
             | Opcode::SetGlobal
             | Opcode::DeleteGlobal
+            | Opcode::GetName
+            | Opcode::SetName
+            | Opcode::TypeofName
+            | Opcode::DeleteName
             | Opcode::GetPrivate
             | Opcode::SetPrivate
             | Opcode::DefinePrivate
@@ -274,6 +302,7 @@ impl Opcode {
             | Opcode::NewArray => ArgumentCount,
             Opcode::TryBegin => Handler,
             Opcode::LoadClassFieldKey => ClassField,
+            Opcode::GetTemplateObject => TemplateSite,
             _ => None,
         }
     }

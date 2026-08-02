@@ -25,6 +25,8 @@ pub struct CallFrame {
     pub arguments: Vec<Value>,
     /// Cells captured from the enclosing environment (closures).
     pub upvalues: Vec<Cell>,
+    /// Active object Environment Records, outermost first.
+    pub with_environments: Vec<Value>,
     /// The `this` binding for this frame (ordinary functions / `new`).
     pub this: Value,
     /// Environment-record this binding. It is uninitialized in a derived
@@ -47,6 +49,8 @@ pub struct CallFrame {
     /// Promise for the active AsyncGenerator request, if this is an async
     /// generator frame checked out by `.next()`.
     pub async_generator_promise: Option<js_runtime::object::JsObject>,
+    /// Promise capability returned by an ordinary async function invocation.
+    pub async_promise: Option<js_runtime::object::JsObject>,
     /// Completion delivered by the active generator request. `YieldStar`
     /// consumes all three variants; ordinary `yield` consumes `Next`.
     pub generator_resume: Option<(GeneratorResumeKind, Value)>,
@@ -98,6 +102,7 @@ impl CallFrame {
                 .collect(),
             arguments: Vec::new(),
             upvalues: Vec::new(),
+            with_environments: Vec::new(),
             this: Value::undefined(),
             this_binding: Cell::mutable(Value::undefined()),
             captured_this: None,
@@ -107,6 +112,7 @@ impl CallFrame {
             constructor: None,
             generator: None,
             async_generator_promise: None,
+            async_promise: None,
             generator_resume: None,
             try_stack: Vec::new(),
             pending_throw: None,
