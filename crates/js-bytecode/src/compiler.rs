@@ -14,7 +14,7 @@ use crate::constant::ConstantPool;
 use crate::module::{BytecodeFunction, BytecodeModule};
 use crate::opcode::{Instruction, Opcode};
 use js_diagnostics::{DiagResult, Diagnostic};
-use js_syntax::ast::expr::{AssignTarget, CallArg, Expr, MemberProp, ObjectPropValue};
+use js_syntax::ast::expr::{AssignTarget, CallArg, Expr, MemberExpr, MemberProp, ObjectPropValue};
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::op::{BinOp, UpdateOp};
 use js_syntax::ast::pat::Pat;
@@ -635,7 +635,7 @@ fn compile_class_value(
     let mut ctor_body: Vec<Stmt> = Vec::new();
     let mut has_constructor = false;
     for m in members {
-        if matches!(m.kind, ClassMemberKind::Constructor) {
+        if !m.static_ && matches!(m.kind, ClassMemberKind::Constructor) {
             if let ClassMemberValue::Method(f) = &m.value {
                 has_constructor = true;
                 ctor_params = f.params.clone();
@@ -787,7 +787,7 @@ fn compile_class_value(
         member.static_
             || matches!(member.value, ClassMemberValue::StaticBlock(_))
             || matches!(member.value, ClassMemberValue::Method(_))
-                && !matches!(member.kind, ClassMemberKind::Constructor)
+                && (member.static_ || !matches!(member.kind, ClassMemberKind::Constructor))
     });
     let static_initializer = has_static_elements.then(|| {
         let initializer_id = (ctx.functions.len() + 1) as u32;
@@ -808,7 +808,7 @@ fn compile_class_value(
 
         let mut class_methods = Vec::new();
         for (member_index, member) in members.iter().enumerate() {
-            if matches!(member.kind, ClassMemberKind::Constructor) {
+            if !member.static_ && matches!(member.kind, ClassMemberKind::Constructor) {
                 continue;
             }
             if let ClassMemberValue::Method(method) = &member.value {
@@ -1035,6 +1035,7 @@ fn emit_class_value(
         func.emit(Instruction::new(Opcode::CallMethod, 0));
         func.emit_bare(Opcode::Pop);
     }
+    func.emit_bare(Opcode::DeactivateClassPrivateEnvironment);
 }
 
 /// Compile a function body (a `Vec<Stmt>`).
@@ -1229,7 +1230,9 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             }
         }
         Expr::Member(m) => {
-            if matches!(m.object.as_ref(), Expr::Super(_)) {
+            if has_optional_member_chain(expr) {
+                compile_optional_member_chain(expr, func, ctx);
+            } else if matches!(m.object.as_ref(), Expr::Super(_)) {
                 compile_member_key_push(&m.property, func, ctx);
                 func.emit_bare(Opcode::GetSuperProp);
             } else {
@@ -1342,14 +1345,15 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                         }
                     }
                 }
-                AssignTarget::Pat(_) => {
-                    ctx.errors.push(Diagnostic::error(
-                        expr.span(),
-                        "destructuring assignment is not supported in the bytecode VM yet",
-                    ));
+                AssignTarget::Pat(pattern) => {
+                    if *op != AssignOp::Assign {
+                        unreachable!("destructuring targets only permit simple assignment");
+                    }
                     compile_expr(right, func, ctx);
-                    func.emit_bare(Opcode::Pop);
-                    func.emit_bare(Opcode::LdaUndefined);
+                    // Assignment expressions preserve the RHS value while the
+                    // pattern consumes a second copy.
+                    func.emit_bare(Opcode::Dup);
+                    assign_pattern(pattern, func, ctx);
                 }
             }
         }
@@ -1374,14 +1378,23 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     func.emit(Instruction::new(Opcode::CallSuper, count));
                 }
                 Expr::Member(m) => {
-                    compile_expr(&m.object, func, ctx); // [obj]
-                    func.emit_bare(Opcode::Dup); // [obj, obj]
-                    if let MemberProp::Private(name) = &m.property {
-                        let private = ctx.private_name_constant(name, m.span);
-                        func.emit(Instruction::new(Opcode::GetPrivate, private));
+                    if matches!(m.object.as_ref(), Expr::Super(_)) {
+                        // A super property Reference has the current `this`
+                        // value as its receiver, but resolves the method from
+                        // the active method's [[HomeObject]] prototype.
+                        func.emit_bare(Opcode::LdaThis); // [receiver]
+                        compile_member_key_push(&m.property, func, ctx);
+                        func.emit_bare(Opcode::GetSuperProp); // [receiver, method]
                     } else {
-                        compile_member_key_push(&m.property, func, ctx); // [obj, obj, key]
-                        func.emit_bare(Opcode::GetProp); // [obj, method]
+                        compile_expr(&m.object, func, ctx); // [obj]
+                        func.emit_bare(Opcode::Dup); // [obj, obj]
+                        if let MemberProp::Private(name) = &m.property {
+                            let private = ctx.private_name_constant(name, m.span);
+                            func.emit(Instruction::new(Opcode::GetPrivate, private));
+                        } else {
+                            compile_member_key_push(&m.property, func, ctx); // [obj, obj, key]
+                            func.emit_bare(Opcode::GetProp); // [obj, method]
+                        }
                     }
                     let mut count = 0u16;
                     for a in &call.args {
@@ -1508,6 +1521,57 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
     func.annotate_since(start_pc, expr.span());
 }
 
+fn has_optional_member_chain(expression: &Expr) -> bool {
+    match expression {
+        Expr::Member(member) => {
+            member.optional || has_optional_member_chain(member.object.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn collect_member_chain<'a>(expression: &'a Expr, members: &mut Vec<&'a MemberExpr>) -> &'a Expr {
+    if let Expr::Member(member) = expression {
+        let root = collect_member_chain(member.object.as_ref(), members);
+        members.push(member);
+        root
+    } else {
+        expression
+    }
+}
+
+fn compile_optional_member_chain(
+    expression: &Expr,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    let mut members = Vec::new();
+    let root = collect_member_chain(expression, &mut members);
+    compile_expr(root, func, ctx);
+    let mut nullish_jumps = Vec::new();
+    for member in members {
+        if member.optional {
+            func.emit_bare(Opcode::Dup);
+            nullish_jumps.push(emit_placeholder(func, Opcode::JumpIfNullish));
+        }
+        if let MemberProp::Private(name) = &member.property {
+            let private = ctx.private_name_constant(name.as_str(), member.span);
+            func.emit(Instruction::new(Opcode::GetPrivate, private));
+        } else {
+            compile_member_key_push(&member.property, func, ctx);
+            func.emit_bare(Opcode::GetProp);
+        }
+    }
+    let completed = emit_placeholder(func, Opcode::Jump);
+    let nullish = func.here();
+    for jump in nullish_jumps {
+        patch(func, jump, nullish);
+    }
+    func.emit_bare(Opcode::Pop);
+    func.emit_bare(Opcode::LdaUndefined);
+    patch(func, completed, func.here());
+}
+
 /// Compile the specification's NamedEvaluation operation. The transparent
 /// parenthesis recursion is significant for `export default (function() {})`.
 fn compile_named_evaluation(
@@ -1607,7 +1671,11 @@ fn compile_lit(lit: &Lit, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
             let idx = ctx.constants.intern_str(s);
             func.emit(Instruction::new(Opcode::LdaConst, idx));
         }
-        Lit::BigInt(span, _) | Lit::Regex { span, .. } | Lit::TemplateString { span, .. } => {
+        Lit::BigInt(_, raw) => {
+            let idx = ctx.constants.intern_bigint(raw);
+            func.emit(Instruction::new(Opcode::LdaConst, idx));
+        }
+        Lit::Regex { span, .. } | Lit::TemplateString { span, .. } => {
             ctx.errors.push(Diagnostic::error(
                 *span,
                 "this literal kind is not supported yet",
@@ -1782,6 +1850,13 @@ fn for_target_pat(left: &ForTarget) -> &Pat {
     }
 }
 
+fn assign_for_target(target: &ForTarget, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    match target {
+        ForTarget::Var(_) => bind_pattern(for_target_pat(target), func, ctx),
+        ForTarget::Pat(pattern) => assign_pattern(pattern, func, ctx),
+    }
+}
+
 /// Lower `for (target of iterable) body` via the **iterator protocol**: get an
 /// iterator, step it with `.next()` until `done`. Works uniformly for arrays,
 /// strings, and generators. `for-in` still uses the `ObjectKeys` index path.
@@ -1812,7 +1887,7 @@ fn compile_for_of(
     let kv = ctx.constants.intern_str("value");
     func.emit(Instruction::new(Opcode::LdaConst, kv));
     func.emit_bare(Opcode::GetProp);
-    bind_pattern(for_target_pat(left), func, ctx);
+    assign_for_target(left, func, ctx);
     // body
     ctx.push_loop();
     compile_stmt(body, func, ctx, false);
@@ -1855,7 +1930,7 @@ fn compile_for_in(
     func.emit(Instruction::new(Opcode::LdaLocal, src));
     func.emit(Instruction::new(Opcode::LdaLocal, idx));
     func.emit_bare(Opcode::GetProp);
-    bind_pattern(for_target_pat(left), func, ctx);
+    assign_for_target(left, func, ctx);
     ctx.push_loop();
     compile_stmt(body, func, ctx, false);
     let update_target = func.here();
@@ -1971,6 +2046,182 @@ fn bind_pattern(pat: &Pat, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
         // drop the value so the stack stays balanced. Parsing is unaffected.
         Pat::Member(_) => {
             func.emit_bare(Opcode::Pop);
+        }
+    }
+}
+
+/// A Reference Record lowered into stable temporary slots. Destructuring must
+/// evaluate a non-pattern target before reading the source property/iterator,
+/// while PutValue happens afterwards.
+enum PreparedAssignmentTarget {
+    Ident(String),
+    Private { object: u16, private_name: u16 },
+    Property { object: u16, key: u16 },
+}
+
+fn fresh_temp(func: &mut BytecodeFunction, purpose: &str) -> u16 {
+    let next = func.locals.slot_count();
+    func.locals.intern(format!("<{purpose}-{next}>"))
+}
+
+/// Evaluate the Reference part of a destructuring leaf without fetching or
+/// writing its value. This implements the ordering required by
+/// Keyed/IteratorDestructuringAssignmentEvaluation.
+fn prepare_assignment_target(
+    pat: &Pat,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) -> Option<PreparedAssignmentTarget> {
+    match pat {
+        Pat::Ident { name, .. } => Some(PreparedAssignmentTarget::Ident(name.clone())),
+        Pat::Assignment { left, .. } | Pat::Rest { arg: left, .. } => {
+            prepare_assignment_target(left, func, ctx)
+        }
+        Pat::Member(member) => {
+            let object = fresh_temp(func, "destr-ref-object");
+            compile_expr(&member.object, func, ctx);
+            func.emit(Instruction::new(Opcode::StaLocal, object));
+            if let MemberProp::Private(name) = &member.property {
+                let private_name = ctx.private_name_constant(name, member.span);
+                Some(PreparedAssignmentTarget::Private {
+                    object,
+                    private_name,
+                })
+            } else {
+                let key = fresh_temp(func, "destr-ref-key");
+                compile_member_key_push(&member.property, func, ctx);
+                func.emit(Instruction::new(Opcode::StaLocal, key));
+                Some(PreparedAssignmentTarget::Property { object, key })
+            }
+        }
+        Pat::Array { .. } | Pat::Object { .. } => None,
+    }
+}
+
+fn put_prepared_assignment(
+    target: PreparedAssignmentTarget,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    match target {
+        PreparedAssignmentTarget::Ident(name) => store_ident(&name, func, ctx),
+        PreparedAssignmentTarget::Private {
+            object,
+            private_name,
+        } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, object));
+            func.emit(Instruction::new(Opcode::SetPrivate, private_name));
+        }
+        PreparedAssignmentTarget::Property { object, key } => {
+            func.emit(Instruction::new(Opcode::LdaLocal, object));
+            func.emit(Instruction::new(Opcode::LdaLocal, key));
+            func.emit_bare(Opcode::SetProp);
+        }
+    }
+}
+
+fn assign_prepared_value(
+    pat: &Pat,
+    prepared: Option<PreparedAssignmentTarget>,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    if let Pat::Assignment { left, right, .. } = pat {
+        func.emit_bare(Opcode::Dup);
+        func.emit_bare(Opcode::LdaUndefined);
+        func.emit_bare(Opcode::StrictEq);
+        let keep = emit_placeholder(func, Opcode::JumpIfFalse);
+        func.emit_bare(Opcode::Pop);
+        compile_expr(right, func, ctx);
+        patch(func, keep, func.here());
+        if let Some(target) = prepared {
+            put_prepared_assignment(target, func, ctx);
+        } else {
+            assign_pattern(left, func, ctx);
+        }
+    } else if let Some(target) = prepared {
+        put_prepared_assignment(target, func, ctx);
+    } else {
+        assign_pattern(pat, func, ctx);
+    }
+}
+
+/// DestructuringAssignmentEvaluation. Unlike binding initialization, leaf
+/// members are real References and array patterns consume the iterator
+/// protocol instead of indexing an array-like value.
+fn assign_pattern(pat: &Pat, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    match pat {
+        Pat::Ident { .. } | Pat::Member(_) | Pat::Assignment { .. } | Pat::Rest { .. } => {
+            let prepared = prepare_assignment_target(pat, func, ctx);
+            assign_prepared_value(pat, prepared, func, ctx);
+        }
+        Pat::Object { properties, .. } => {
+            let source = fresh_temp(func, "destr-object");
+            func.emit(Instruction::new(Opcode::StaLocal, source));
+            for property in properties {
+                match property {
+                    js_syntax::ast::pat::ObjectPatProp::KeyValue { key, value, .. } => {
+                        // PropertyName evaluation precedes target evaluation.
+                        let property_key = fresh_temp(func, "destr-property-key");
+                        compile_prop_key_push(key, false, func, ctx);
+                        func.emit(Instruction::new(Opcode::StaLocal, property_key));
+                        let prepared = prepare_assignment_target(value, func, ctx);
+                        func.emit(Instruction::new(Opcode::LdaLocal, source));
+                        func.emit(Instruction::new(Opcode::LdaLocal, property_key));
+                        func.emit_bare(Opcode::GetProp);
+                        assign_prepared_value(value, prepared, func, ctx);
+                    }
+                    js_syntax::ast::pat::ObjectPatProp::Rest { arg, .. } => {
+                        // CopyDataProperties exclusion is implemented in the
+                        // next descriptor batch; retain assignment semantics.
+                        let prepared = prepare_assignment_target(arg, func, ctx);
+                        func.emit(Instruction::new(Opcode::LdaLocal, source));
+                        assign_prepared_value(arg, prepared, func, ctx);
+                    }
+                }
+            }
+        }
+        Pat::Array { elements, .. } => {
+            let iterator = fresh_temp(func, "destr-iterator");
+            func.emit_bare(Opcode::GetIterator);
+            func.emit(Instruction::new(Opcode::StaLocal, iterator));
+            for element in elements.iter().flatten() {
+                let inner = match element {
+                    js_syntax::ast::pat::ArrayPatElement::Hole(_) => {
+                        func.emit(Instruction::new(Opcode::LdaLocal, iterator));
+                        func.emit_bare(Opcode::IterNext);
+                        func.emit_bare(Opcode::Pop);
+                        continue;
+                    }
+                    js_syntax::ast::pat::ArrayPatElement::Pat(inner) => inner,
+                };
+                if let Pat::Rest { arg, .. } = inner {
+                    // The existing bytecode has no iterator-to-list opcode yet;
+                    // preserve a correctly typed empty result until that opcode
+                    // is introduced with spread call/new.
+                    let prepared = prepare_assignment_target(arg, func, ctx);
+                    func.emit(Instruction::new(Opcode::NewArray, 0));
+                    assign_prepared_value(arg, prepared, func, ctx);
+                    continue;
+                }
+                let prepared = prepare_assignment_target(inner, func, ctx);
+                func.emit(Instruction::new(Opcode::LdaLocal, iterator));
+                func.emit_bare(Opcode::IterNext);
+                func.emit_bare(Opcode::Dup);
+                let done_key = ctx.constants.intern_str("done");
+                func.emit(Instruction::new(Opcode::LdaConst, done_key));
+                func.emit_bare(Opcode::GetProp);
+                let has_value = emit_placeholder(func, Opcode::JumpIfFalse);
+                func.emit_bare(Opcode::Pop);
+                func.emit_bare(Opcode::LdaUndefined);
+                let joined = emit_placeholder(func, Opcode::Jump);
+                patch(func, has_value, func.here());
+                let value_key = ctx.constants.intern_str("value");
+                func.emit(Instruction::new(Opcode::LdaConst, value_key));
+                func.emit_bare(Opcode::GetProp);
+                patch(func, joined, func.here());
+                assign_prepared_value(inner, prepared, func, ctx);
+            }
         }
     }
 }

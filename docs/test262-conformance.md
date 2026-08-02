@@ -38,10 +38,20 @@ Pinned Test262 revision:
 | `language-front-end` | 23,711 / 44,475 | 44,475 | 0 | 0 | 0 |
 | `annexB` front-end | 1,086 / 1,377 | 1,162 | 215 | 0 | 0 |
 
-Runtime baselines must be regenerated from the complete checkout. Historical
-runtime numbers from the sparse checkout are deliberately not recorded here.
-Until a complete run exists, a profile is **unmeasured**, never implicitly
-passing.
+## Current Language Runtime Snapshot
+
+The complete pinned `test/language` runtime profile now has its first baseline.
+The report is kept at `target/test262-results/language-runtime/runtime.json`.
+
+| Profile | Files / variants | Executed | Pass | Fail | Incomplete | Skip |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `language-runtime` | 23,711 / 44,475 | 31,926 | 19,990 | 10,766 | 1,170 | 12,549 |
+
+The pass rate over executed variants is 62.6%. This is not combined with the
+front-end, built-ins, Annex B, or ECMA-402 profiles. The largest incomplete
+clusters are unsupported statement lowering (454), pending async continuations
+(246), spread calls (170), unsupported expression lowering (102), spread in
+`new` (44), and the three legacy logical opcodes (113 total).
 
 ### Language Runtime Module Subset
 
@@ -76,18 +86,21 @@ property writes invoke accessor descriptors, and anonymous field definitions
 receive their field names.
 
 The focused `test/language/statements/class/elements` runtime subset currently
-reports 1,534 files / 3,054 variants, with 1,068 executed: 974 pass, 70 fail,
-24 incomplete and 1,986 skipped. Computed element keys are evaluated and
-converted once during class definition; both accessor-name computed-key
-directories pass 42 / 42. Direct and indirect eval now use runtime parsing and
-bytecode compilation, retain eval-created modules for escaping closures, and
-bridge lexical/private/class execution contexts. A shared sync/async `yield*`
-state machine now retains its iterator record across suspension, forwards
-`next`, `throw`, and `return` completions, performs Async-from-Sync Promise
-unwrapping, and preserves active exception handlers. This removed all 248
-`yield*` compile-incomplete variants from the class-element snapshot. Each of
-the four private async-generator method/static-method directories now executes
-128 variants with 128 pass, 0 fail, and 0 incomplete.
+reports 1,534 files / 3,054 variants, with all 1,068 executed variants passing,
+0 fail, 0 incomplete, and 1,986 skipped. Class methods and accessors carry an
+explicit `[[HomeObject]]`; field arrows share the lexical `this` binding and
+super environment. Computed keys run `ToPropertyKey`, including
+`@@toPrimitive`, exactly once during definition. Public and private element
+installation respects extensibility and descriptor invariants, while Proxy
+ordinary operations remain distinct from private brand checks.
+
+Direct eval retains its lexical/private/class execution context without leaking
+a completed class's private environment. Generator suspension now preserves
+that private-environment stack together with locals, handlers, and the shared
+Iterator Record. Destructuring assignment and `for-in`/`for-of` assignment
+targets use a common Reference preparation and PutValue path. BigInt literals
+enter the constant pool as exact arbitrary-precision values rather than through
+`f64`.
 
 The standards-based front-end repairs have removed all false accepts from the
 current `test/language` corpus. Block and Module Early Errors now compare the

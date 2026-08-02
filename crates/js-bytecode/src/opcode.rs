@@ -61,6 +61,8 @@ pub enum Opcode {
     LoadClassFieldKey,
     /// Make the class value on top's private environment active in this frame.
     ActivateClassPrivateEnvironment,
+    /// Restore the private environment active before class evaluation.
+    DeactivateClassPrivateEnvironment,
     /// Push the current `this` binding.
     LdaThis,
     /// Load captured upvalue slot `operand` and push it.
@@ -113,6 +115,8 @@ pub enum Opcode {
     JumpIfFalse,
     /// Pop; jump if truthy.
     JumpIfTrue,
+    /// Pop; jump if null or undefined.
+    JumpIfNullish,
     /// `return` (pops the return value if any; pushes undefined otherwise).
     Return,
     /// `yield` (generator): pop the yielded value, suspend the frame, push the
@@ -259,7 +263,9 @@ impl Opcode {
             Opcode::LdaLocal | Opcode::StaLocal => Local,
             Opcode::LdaUpvalue | Opcode::StaUpvalue => Upvalue,
             Opcode::LdaFunction => Function,
-            Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => JumpTarget,
+            Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue | Opcode::JumpIfNullish => {
+                JumpTarget
+            }
             Opcode::Call
             | Opcode::CallDirectEval
             | Opcode::CallMethod

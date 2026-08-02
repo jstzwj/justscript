@@ -156,6 +156,9 @@ impl Value {
     pub fn symbol(symbol: JsSymbol) -> Value {
         Value::new(ValueData::Symbol(symbol))
     }
+    pub fn bigint(value: JsBigInt) -> Value {
+        Value::new(ValueData::BigInt(value))
+    }
     pub fn object(o: JsObject) -> Value {
         Value::new(ValueData::Object(o))
     }
@@ -230,7 +233,31 @@ impl Value {
 
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.data, f)
+        match &self.data {
+            ValueData::Undefined => f.write_str("Undefined"),
+            ValueData::Null => f.write_str("Null"),
+            ValueData::Boolean(value) => f.debug_tuple("Boolean").field(value).finish(),
+            ValueData::Integer(value) => f.debug_tuple("Integer").field(value).finish(),
+            ValueData::Number(value) => f.debug_tuple("Number").field(value).finish(),
+            ValueData::String(value) => f.debug_tuple("String").field(value).finish(),
+            ValueData::Symbol(value) => f.debug_tuple("Symbol").field(value).finish(),
+            ValueData::BigInt(value) => f.debug_tuple("BigInt").field(value).finish(),
+            ValueData::Object(object) => f
+                .debug_struct("Object")
+                .field("class", &object.borrow().class)
+                .finish_non_exhaustive(),
+            ValueData::Function(function) => f
+                .debug_struct("Function")
+                .field("name", &function.name)
+                .finish_non_exhaustive(),
+            ValueData::Generator(generator) => {
+                let generator = generator.borrow();
+                f.debug_struct("Generator")
+                    .field("done", &generator.done)
+                    .field("async", &generator.is_async)
+                    .finish_non_exhaustive()
+            }
+        }
     }
 }
 
@@ -277,11 +304,17 @@ pub struct GeneratorState {
     pub stack: Vec<Value>,
     pub upvalues: Vec<Cell>,
     pub private_brands: HashMap<u32, u64>,
+    pub private_environment_stack: Vec<HashMap<u32, u64>>,
     pub this: Value,
     pub captured_this: Option<Cell>,
+    /// Method [[HomeObject]], retained across generator suspension.
+    pub home_object: Option<Value>,
+    /// Direct eval in this lexical arrow chain applies the class-field
+    /// initializer ContainsArguments restriction.
+    pub reject_eval_arguments: bool,
     pub is_async: bool,
     /// Iterator record retained while a `yield*` expression is suspended.
-    pub delegate: Option<GeneratorDelegate>,
+    pub delegate: Option<IteratorRecord>,
     /// Active handlers must survive suspension just like locals and the stack.
     pub try_stack: Vec<GeneratorTryState>,
     pub pending_throw: Option<Value>,
@@ -301,9 +334,10 @@ pub enum GeneratorResumeKind {
 
 /// Persistent iterator record for the shared sync/async `yield*` state machine.
 #[derive(Clone, Debug)]
-pub struct GeneratorDelegate {
+pub struct IteratorRecord {
     pub iterator: Value,
     pub next_method: Value,
+    pub done: bool,
     pub async_from_sync: bool,
     pub intrinsic_next: bool,
 }
@@ -353,6 +387,10 @@ pub struct JsFunction {
     pub bound_args: Vec<Value>,
     /// Constructor referenced by `extends`, evaluated when the class is defined.
     pub superclass: Option<Box<Value>>,
+    /// ECMAScript method [[HomeObject]]. `super` resolves through this object's
+    /// prototype while retaining the call-time `this` as the receiver.
+    pub home_object: Option<Box<Value>>,
+    pub reject_eval_arguments: bool,
     /// Hidden closure that evaluates this class's instance field definitions.
     pub instance_initializer: Option<Box<Value>>,
     /// Computed class element keys evaluated once per class definition. The
@@ -421,6 +459,8 @@ impl JsFunction {
             bound_this: None,
             bound_args: Vec::new(),
             superclass: None,
+            home_object: None,
+            reject_eval_arguments: false,
             instance_initializer: None,
             class_field_keys: Rc::new(RefCell::new(Vec::new())),
             private_brands: HashMap::new(),
@@ -482,7 +522,7 @@ pub struct JsSymbol {
 impl JsSymbol {
     pub fn new(description: Option<String>) -> JsSymbol {
         use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(4);
+        static NEXT_ID: AtomicU64 = AtomicU64::new(5);
         JsSymbol {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             description,
@@ -509,15 +549,73 @@ impl JsSymbol {
             description: Some("Symbol.asyncIterator".into()),
         }
     }
+
+    pub fn to_primitive() -> JsSymbol {
+        JsSymbol {
+            id: 4,
+            description: Some("Symbol.toPrimitive".into()),
+        }
+    }
 }
 
 /// An arbitrary-precision integer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct JsBigInt(pub String);
 
 impl JsBigInt {
     pub fn from_i64(n: i64) -> JsBigInt {
         JsBigInt(n.to_string())
+    }
+
+    /// Parse an already-validated ECMAScript BigInt literal into an exact,
+    /// radix-independent decimal representation.
+    pub fn from_literal(raw: &str) -> JsBigInt {
+        let cleaned = raw.strip_suffix('n').unwrap_or(raw).replace('_', "");
+        let (radix, digits) = if let Some(digits) = cleaned
+            .strip_prefix("0x")
+            .or_else(|| cleaned.strip_prefix("0X"))
+        {
+            (16, digits)
+        } else if let Some(digits) = cleaned
+            .strip_prefix("0o")
+            .or_else(|| cleaned.strip_prefix("0O"))
+        {
+            (8, digits)
+        } else if let Some(digits) = cleaned
+            .strip_prefix("0b")
+            .or_else(|| cleaned.strip_prefix("0B"))
+        {
+            (2, digits)
+        } else {
+            (10, cleaned.as_str())
+        };
+
+        let mut decimal = vec![0u8];
+        for digit in digits.chars() {
+            let value = digit
+                .to_digit(radix)
+                .expect("BigInt literal must be validated before compilation");
+            let mut carry = value;
+            for place in &mut decimal {
+                let next = u32::from(*place) * radix + carry;
+                *place = (next % 10) as u8;
+                carry = next / 10;
+            }
+            while carry != 0 {
+                decimal.push((carry % 10) as u8);
+                carry /= 10;
+            }
+        }
+        while decimal.len() > 1 && decimal.last() == Some(&0) {
+            decimal.pop();
+        }
+        JsBigInt(
+            decimal
+                .into_iter()
+                .rev()
+                .map(|digit| char::from(b'0' + digit))
+                .collect(),
+        )
     }
 }
 

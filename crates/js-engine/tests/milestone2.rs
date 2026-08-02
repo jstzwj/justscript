@@ -222,6 +222,41 @@ fn object_destructuring() {
 }
 
 #[test]
+fn destructuring_assignment_uses_iterator_and_preserves_reference_order() {
+    match run("var step = 0; \
+         var iterable = { \
+           [Symbol.iterator]: function(){ return this }, \
+           next: function(){ step++; return { value: step * 10, done: step > 2 } } \
+         }; \
+         var a, b; [a, b] = iterable; \
+         var target = { value: 0 }; ({ value: target.value } = { value: a + b }); \
+         target.value")
+    {
+        ValueData::Integer(30) => {}
+        v => panic!("expected Integer(30), got {:?}", v),
+    }
+}
+
+#[test]
+fn derived_this_binding_is_tdz_and_shared_with_arrows() {
+    match run("var before = false; \
+         class Base {} \
+         class Derived extends Base { \
+           constructor(){ \
+             var read = () => this; \
+             try { read(); } catch (error) { before = error instanceof ReferenceError; } \
+             super(); \
+             this.read = read; \
+           } \
+         } \
+         var instance = new Derived(); before && instance.read() === instance")
+    {
+        ValueData::Boolean(true) => {}
+        v => panic!("expected Boolean(true), got {:?}", v),
+    }
+}
+
+#[test]
 fn for_of_sum() {
     match run("var s = 0; for (var x of [1,2,3,4]) s = s + x; s") {
         ValueData::Integer(10) => {}

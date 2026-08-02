@@ -145,8 +145,13 @@ pub mod id {
     pub const FUNCTION_BIND: u16 = 126;
     pub const EVAL: u16 = 127;
     pub const OBJECT_CREATE: u16 = 128;
+    pub const OBJECT_LOOKUP_GETTER: u16 = 129;
+    pub const OBJECT_LOOKUP_SETTER: u16 = 130;
+    pub const OBJECT_CTOR: u16 = 131;
+    pub const PROMISE_ALL: u16 = 132;
+    pub const PROXY_CTOR: u16 = 133;
     /// One-past-the-last id (for registering the dispatch table).
-    pub const COUNT: u16 = 129;
+    pub const COUNT: u16 = 134;
 }
 
 /// Resolve a static method on a global constructor function (Number/String).
@@ -169,6 +174,7 @@ pub fn native_static_id(obj: &Value, name: &str) -> Option<u16> {
         PROMISE_CTOR => Some(match name {
             "resolve" => PROMISE_RESOLVE,
             "reject" => PROMISE_REJECT,
+            "all" => PROMISE_ALL,
             _ => return None,
         }),
         ARRAY_CTOR => Some(match name {
@@ -189,6 +195,7 @@ pub fn native_static_value(obj: &Value, name: &str) -> Option<Value> {
             "toStringTag" => Some(Value::symbol(js_runtime::value::JsSymbol::to_string_tag())),
             "iterator" => Some(Value::symbol(js_runtime::value::JsSymbol::iterator())),
             "asyncIterator" => Some(Value::symbol(js_runtime::value::JsSymbol::async_iterator())),
+            "toPrimitive" => Some(Value::symbol(js_runtime::value::JsSymbol::to_primitive())),
             _ => None,
         };
     }
@@ -416,6 +423,9 @@ impl NativeFn for Builtin {
             OBJECT_HAS_OWN | OBJECT_PROP_ENUM => {
                 return object_prototype_query(&this, &args, self.id == OBJECT_PROP_ENUM)
             }
+            OBJECT_LOOKUP_GETTER => object_lookup_getter(&this, &args),
+            OBJECT_LOOKUP_SETTER => object_lookup_accessor(&this, &args, false),
+            OBJECT_CTOR => Value::object(js_runtime::object::ObjectData::new_handle()),
             OBJECT_GET_PROTO => object_get_prototype(&args),
             OBJECT_SET_PROTO => return object_set_prototype(&args),
             OBJECT_IS_EXTENSIBLE => Value::boolean(object_is_extensible(&args)),
@@ -500,6 +510,8 @@ impl NativeFn for Builtin {
                     args.into_iter().next().unwrap_or_else(Value::undefined),
                 )))
             }
+            PROMISE_ALL => return promise_all(&args),
+            PROXY_CTOR => return proxy_constructor(&args),
             PROMISE_THEN => return promise_then(interp, &this, args),
             PROMISE_CATCH => {
                 let on_rejected = args.into_iter().next().unwrap_or_else(Value::undefined);
@@ -700,6 +712,48 @@ fn promise_resolve(
     }
 }
 
+fn promise_all(args: &[Value]) -> Result<NativeResult, InterpError> {
+    let iterable = args.first().cloned().unwrap_or_else(Value::undefined);
+    let length = crate::interp::array_len(&iterable);
+    let mut values = Vec::with_capacity(length);
+    for index in 0..length {
+        let value = crate::interp::array_get(&iterable, index);
+        match promise_result(&value) {
+            Some(AwaitedPromise::Fulfilled(value)) => values.push(value),
+            Some(AwaitedPromise::Rejected(reason)) => {
+                return Ok(NativeResult::Value(promise_rejected(reason)))
+            }
+            Some(AwaitedPromise::Pending) => {
+                return Ok(NativeResult::Value(Value::object(promise_pending())))
+            }
+            None => values.push(value),
+        }
+    }
+    let promise = new_promise();
+    promise.borrow_mut().promise.as_mut().unwrap().state =
+        PromiseState::Fulfilled(crate::interp::make_array(values));
+    Ok(NativeResult::Value(Value::object(promise)))
+}
+
+fn proxy_constructor(args: &[Value]) -> Result<NativeResult, InterpError> {
+    let target = args.first().cloned().unwrap_or_else(Value::undefined);
+    let handler = args.get(1).cloned().unwrap_or_else(Value::undefined);
+    if crate::interp::obj_as_object(&target).is_none()
+        || crate::interp::obj_as_object(&handler).is_none()
+    {
+        return Err(InterpError::Throw(type_error_value(
+            "Proxy target and handler must be objects",
+        )));
+    }
+    let object = js_runtime::object::ObjectData::new_handle();
+    {
+        let mut data = object.borrow_mut();
+        data.class = "Proxy";
+        data.proxy = Some(js_runtime::object::ProxyData { target, handler });
+    }
+    Ok(NativeResult::Value(Value::object(object)))
+}
+
 fn promise_constructor(
     interp: &mut Interpreter,
     modules: &BytecodeGraph<'_>,
@@ -866,7 +920,7 @@ enum OwnKeyKind {
 }
 
 fn own_descriptor(target: &Value, key: &Value) -> Result<Option<PropertyDescriptor>, InterpError> {
-    let ValueData::Object(object) = target.data() else {
+    let Some(object) = crate::interp::obj_as_object(target) else {
         return Ok(None);
     };
     let data = object.borrow();
@@ -966,13 +1020,40 @@ fn object_prototype_query(
     Ok(NativeResult::Value(Value::boolean(result)))
 }
 
-fn object_get_prototype(args: &[Value]) -> Value {
-    match args.first().map(Value::data) {
-        Some(ValueData::Object(object)) => {
-            object.borrow().proto.clone().unwrap_or_else(Value::null)
+fn object_lookup_getter(this: &Value, args: &[Value]) -> Value {
+    object_lookup_accessor(this, args, true)
+}
+
+fn object_lookup_accessor(this: &Value, args: &[Value], getter: bool) -> Value {
+    let key = args.first().cloned().unwrap_or_else(Value::undefined);
+    let name = crate::interp::prop_name(&key);
+    let mut current = crate::interp::obj_as_object(this).cloned();
+    while let Some(object) = current {
+        let data = object.borrow();
+        if let Some(descriptor) = data.properties.get(&name) {
+            return match descriptor {
+                PropertyDescriptor::Accessor { get, set, .. } => get
+                    .clone()
+                    .filter(|_| getter)
+                    .or_else(|| (!getter).then(|| set.clone()).flatten())
+                    .unwrap_or_else(Value::undefined),
+                PropertyDescriptor::Data { .. } => Value::undefined(),
+            };
         }
-        _ => Value::null(),
+        current = data
+            .proto
+            .as_ref()
+            .and_then(crate::interp::obj_as_object)
+            .cloned();
     }
+    Value::undefined()
+}
+
+fn object_get_prototype(args: &[Value]) -> Value {
+    args.first()
+        .and_then(crate::interp::obj_as_object)
+        .and_then(|object| object.borrow().proto.clone())
+        .unwrap_or_else(Value::null)
 }
 
 fn object_create(args: &[Value]) -> Result<NativeResult, InterpError> {
@@ -997,7 +1078,7 @@ fn object_create(args: &[Value]) -> Result<NativeResult, InterpError> {
 fn object_set_prototype(args: &[Value]) -> Result<NativeResult, InterpError> {
     let target = args.first().cloned().unwrap_or_else(Value::undefined);
     let prototype = args.get(1).cloned().unwrap_or_else(Value::undefined);
-    let ValueData::Object(object) = target.data() else {
+    let Some(object) = crate::interp::obj_as_object(&target) else {
         return Err(InterpError::Throw(type_error_value(
             "target is not an object",
         )));
@@ -1025,12 +1106,14 @@ fn object_set_prototype(args: &[Value]) -> Result<NativeResult, InterpError> {
 }
 
 fn object_is_extensible(args: &[Value]) -> bool {
-    matches!(args.first().map(Value::data), Some(ValueData::Object(object)) if !object.borrow().non_extensible)
+    args.first()
+        .and_then(crate::interp::obj_as_object)
+        .is_some_and(|object| !object.borrow().non_extensible)
 }
 
 fn object_prevent_extensions(args: &[Value], reflect: bool) -> Result<NativeResult, InterpError> {
     let target = args.first().cloned().unwrap_or_else(Value::undefined);
-    let ValueData::Object(object) = target.data() else {
+    let Some(object) = crate::interp::obj_as_object(&target) else {
         return if reflect {
             Ok(NativeResult::Value(Value::boolean(false)))
         } else {
@@ -1108,7 +1191,7 @@ fn object_define_property(args: &[Value], reflect: bool) -> Result<NativeResult,
 }
 
 fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
-    let Some(ValueData::Object(object)) = args.first().map(Value::data) else {
+    let Some(object) = args.first().and_then(crate::interp::obj_as_object) else {
         return crate::interp::make_array(Vec::new());
     };
     let object = object.borrow();
@@ -1132,6 +1215,8 @@ fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
                 js_runtime::value::JsSymbol::iterator()
             } else if id == js_runtime::value::JsSymbol::async_iterator().id {
                 js_runtime::value::JsSymbol::async_iterator()
+            } else if id == js_runtime::value::JsSymbol::to_primitive().id {
+                js_runtime::value::JsSymbol::to_primitive()
             } else {
                 js_runtime::value::JsSymbol {
                     id,
@@ -1146,20 +1231,53 @@ fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
 
 fn object_freeze(args: &[Value]) -> Result<NativeResult, InterpError> {
     let target = args.first().cloned().unwrap_or_else(Value::undefined);
-    if matches!(target.data(), ValueData::Object(object) if object.borrow().module_namespace.as_ref().is_some_and(|namespace| !namespace.is_empty()))
-    {
+    if crate::interp::obj_as_object(&target).is_some_and(|object| {
+        object
+            .borrow()
+            .module_namespace
+            .as_ref()
+            .is_some_and(|namespace| !namespace.is_empty())
+    }) {
         return Err(InterpError::Throw(type_error_value(
             "module namespace exports cannot be made non-writable",
         )));
     }
-    if let ValueData::Object(object) = target.data() {
-        object.borrow_mut().non_extensible = true;
+    if let Some(object) = crate::interp::obj_as_object(&target) {
+        let mut object = object.borrow_mut();
+        object.non_extensible = true;
+        for descriptor in object.properties.values_mut() {
+            match descriptor {
+                PropertyDescriptor::Data { attr, .. } => {
+                    attr.writable = false;
+                    attr.configurable = false;
+                }
+                PropertyDescriptor::Accessor { attr, .. } => attr.configurable = false,
+            }
+        }
+        for descriptor in object.symbol_properties.values_mut() {
+            match descriptor {
+                PropertyDescriptor::Data { attr, .. } => {
+                    attr.writable = false;
+                    attr.configurable = false;
+                }
+                PropertyDescriptor::Accessor { attr, .. } => attr.configurable = false,
+            }
+        }
     }
     Ok(NativeResult::Value(target))
 }
 
 fn object_is_frozen(args: &[Value]) -> bool {
-    matches!(args.first().map(Value::data), Some(ValueData::Object(object)) if object.borrow().non_extensible && object.borrow().module_namespace.as_ref().is_none_or(|namespace| namespace.is_empty()))
+    args.first()
+        .and_then(crate::interp::obj_as_object)
+        .is_some_and(|object| {
+            object.borrow().non_extensible
+                && object
+                    .borrow()
+                    .module_namespace
+                    .as_ref()
+                    .is_none_or(|namespace| namespace.is_empty())
+        })
 }
 
 fn reflect_delete_property(args: &[Value]) -> bool {
@@ -2073,6 +2191,21 @@ fn namespace(props: Vec<(&str, Value)>) -> Value {
     Value::object(o)
 }
 
+fn native_function_namespace(name: &str, native: u16, props: Vec<(&str, Value)>) -> Value {
+    let mut value = native_fn(name, native);
+    let object = &value
+        .as_function_mut()
+        .expect("native function namespace must be callable")
+        .object;
+    for (key, property) in props {
+        object.borrow_mut().properties.insert(
+            key.to_string(),
+            js_runtime::object::PropertyDescriptor::data(property),
+        );
+    }
+    value
+}
+
 /// Install the global builtins (`console`, `Math`, `Object`, `JSON`, `Array`,
 /// `parseInt`, `Number`, …) into the realm's global map.
 pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
@@ -2120,10 +2253,19 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
             "propertyIsEnumerable",
             native_fn("propertyIsEnumerable", OBJECT_PROP_ENUM),
         ),
+        (
+            "__lookupGetter__",
+            native_fn("__lookupGetter__", OBJECT_LOOKUP_GETTER),
+        ),
+        (
+            "__lookupSetter__",
+            native_fn("__lookupSetter__", OBJECT_LOOKUP_SETTER),
+        ),
     ]);
-    globals.insert(
-        "Object".to_string(),
-        namespace(vec![
+    let object_constructor = native_function_namespace(
+        "Object",
+        OBJECT_CTOR,
+        vec![
             ("keys", native_fn("keys", OBJECT_KEYS)),
             ("values", native_fn("values", OBJECT_VALUES)),
             ("entries", native_fn("entries", OBJECT_ENTRIES)),
@@ -2164,8 +2306,9 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
             ),
             ("freeze", native_fn("freeze", OBJECT_FREEZE)),
             ("isFrozen", native_fn("isFrozen", OBJECT_IS_FROZEN)),
-        ]),
+        ],
     );
+    globals.insert("Object".to_string(), object_constructor);
     globals.insert(
         "Reflect".to_string(),
         namespace(vec![
@@ -2212,6 +2355,7 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
     globals.insert("String".to_string(), native_fn("String", STRING_FN));
     globals.insert("Boolean".to_string(), native_fn("Boolean", BOOLEAN_FN));
     globals.insert("Promise".to_string(), native_fn("Promise", PROMISE_CTOR));
+    globals.insert("Proxy".to_string(), native_fn("Proxy", PROXY_CTOR));
     // Error constructors.
     globals.insert("Error".to_string(), native_fn("Error", ERROR_CTOR));
     globals.insert(

@@ -60,6 +60,12 @@ pub struct PromiseData {
     pub reactions: Vec<PromiseReaction>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProxyData {
+    pub target: Value,
+    pub handler: Value,
+}
+
 /// The concrete object payload.
 #[derive(Debug, Default)]
 pub struct ObjectData {
@@ -100,6 +106,11 @@ pub struct ObjectData {
     pub deferred_module: Option<usize>,
     /// `Some` only for Promise instances.
     pub promise: Option<PromiseData>,
+    /// Proxy exotic-object internal slots.
+    pub proxy: Option<ProxyData>,
+    /// VM-internal Iterator Record. The wrapper object is never exposed by a
+    /// language operation; it lets bytecode locals retain the record fields.
+    pub iterator_record: Option<crate::value::IteratorRecord>,
     /// Constructor and inherited constructors used by `instanceof`.
     pub constructor_chain: Vec<ConstructorIdentity>,
 }

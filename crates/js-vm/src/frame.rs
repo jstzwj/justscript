@@ -27,6 +27,9 @@ pub struct CallFrame {
     pub upvalues: Vec<Cell>,
     /// The `this` binding for this frame (ordinary functions / `new`).
     pub this: Value,
+    /// Environment-record this binding. It is uninitialized in a derived
+    /// constructor until the first successful `super()` call.
+    pub this_binding: Cell,
     /// For arrow functions: the lexically captured `this` cell. `None` for
     /// ordinary functions, which use [`CallFrame::this`].
     pub captured_this: Option<Cell>,
@@ -53,8 +56,14 @@ pub struct CallFrame {
     pub pending_throw: Option<Value>,
     /// Runtime class heritage for derived constructors/methods.
     pub superclass: Option<Value>,
+    /// Active method [[HomeObject]]. Arrow functions inherit this slot.
+    pub home_object: Option<Value>,
     /// Private environments captured by the executing function.
     pub private_brands: HashMap<u32, u64>,
+    /// Saved private environments for nested class definition evaluation.
+    pub private_environment_stack: Vec<HashMap<u32, u64>>,
+    /// Whether direct eval inherits a class-field ContainsArguments ban.
+    pub reject_eval_arguments: bool,
     /// Definition-time computed keys shared with the active class initializer.
     pub class_field_keys: Rc<RefCell<Vec<Value>>>,
     /// Base object initialized by the most recent `super()` call.
@@ -90,6 +99,7 @@ impl CallFrame {
             arguments: Vec::new(),
             upvalues: Vec::new(),
             this: Value::undefined(),
+            this_binding: Cell::mutable(Value::undefined()),
             captured_this: None,
             stack: OperandStack::with_capacity(16),
             span,
@@ -101,7 +111,10 @@ impl CallFrame {
             try_stack: Vec::new(),
             pending_throw: None,
             superclass: None,
+            home_object: None,
             private_brands: HashMap::new(),
+            private_environment_stack: Vec::new(),
+            reject_eval_arguments: false,
             class_field_keys: Rc::new(RefCell::new(Vec::new())),
             super_base: None,
         }

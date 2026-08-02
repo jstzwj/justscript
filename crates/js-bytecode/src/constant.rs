@@ -1,7 +1,7 @@
 //! The constant pool of a [`crate::BytecodeModule`]: deduplicated literals
 //! (numbers, strings) referenced by `LdaConst`/`GetGlobal`/etc.
 
-use js_runtime::value::{JsString, Value};
+use js_runtime::value::{JsBigInt, JsString, Value};
 use std::collections::HashMap;
 
 /// A deduplicated table of compile-time constants, addressed by 16-bit index.
@@ -12,6 +12,8 @@ pub struct ConstantPool {
     by_str: HashMap<String, u16>,
     /// Number bits → index.
     by_num: HashMap<u64, u16>,
+    /// Canonical decimal BigInt value -> index.
+    by_bigint: HashMap<String, u16>,
 }
 
 impl ConstantPool {
@@ -64,6 +66,17 @@ impl ConstantPool {
         idx
     }
 
+    pub fn intern_bigint(&mut self, raw: &str) -> u16 {
+        let bigint = JsBigInt::from_literal(raw);
+        if let Some(&index) = self.by_bigint.get(&bigint.0) {
+            return index;
+        }
+        let key = bigint.0.clone();
+        let index = self.push(Value::bigint(bigint));
+        self.by_bigint.insert(key, index);
+        index
+    }
+
     fn push(&mut self, v: Value) -> u16 {
         let idx = self.items.len() as u16;
         self.items.push(v);
@@ -93,5 +106,18 @@ mod tests {
         let c = pool.intern_num(3.0);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn bigint_literals_are_exact_and_deduped_across_radices() {
+        let mut pool = ConstantPool::new();
+        let decimal = pool.intern_bigint("18446744073709551616n");
+        let hexadecimal = pool.intern_bigint("0x1_0000_0000_0000_0000n");
+        assert_eq!(decimal, hexadecimal);
+        assert!(matches!(
+            pool.get(decimal).data(),
+            js_runtime::value::ValueData::BigInt(value)
+                if value.0 == "18446744073709551616"
+        ));
     }
 }

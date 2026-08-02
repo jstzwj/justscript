@@ -13,7 +13,7 @@ use js_diagnostics::DiagResult;
 use js_runtime::context::RealmContext;
 use js_runtime::object::PropertyDescriptor;
 use js_runtime::value::{
-    GeneratorDelegate, GeneratorResumeKind, GeneratorState, GeneratorTryState, JsFunction, Value,
+    GeneratorResumeKind, GeneratorState, GeneratorTryState, IteratorRecord, JsFunction, Value,
     ValueData,
 };
 use std::cell::RefCell;
@@ -927,21 +927,45 @@ impl Interpreter {
             }
             Opcode::GetIterator => {
                 let v = self.top().stack.pop();
-                self.top().stack.push(make_iterator(&v));
+                let record = self.get_iterator_record(modules, v, false)?;
+                self.top().stack.push(iterator_record_value(record));
             }
             Opcode::IterNext => {
-                let it = self.top().stack.pop();
-                if it.is_generator() {
-                    // Drive one `.next()` via the call machinery; the
-                    // iterator-result lands on this frame's stack when the
-                    // generator yields/returns (or synchronously if done).
-                    let next_fn = get_property(&it, &Value::string("next"));
-                    self.invoke(modules, next_fn, Vec::new(), it, false);
+                let record_value = self.top().stack.pop();
+                let record_object = obj_as_object(&record_value).cloned().ok_or_else(|| {
+                    InterpError::Internal("iterator local is not an object".into())
+                })?;
+                let record = record_object
+                    .borrow()
+                    .iterator_record
+                    .clone()
+                    .ok_or_else(|| {
+                        InterpError::Internal("iterator local has no Iterator Record".into())
+                    })?;
+                let result = if record.done {
+                    iter_result(Value::undefined(), true)
+                } else if record.intrinsic_next {
+                    step_array_iterator(&record.iterator)
                 } else {
-                    // Array-iterator object: step by index synchronously.
-                    let result = step_array_iterator(&it);
-                    self.top().stack.push(result);
+                    self.call_value(
+                        modules,
+                        record.next_method.clone(),
+                        Vec::new(),
+                        record.iterator.clone(),
+                    )?
+                };
+                if !result.is_object() {
+                    record_object
+                        .borrow_mut()
+                        .iterator_record
+                        .as_mut()
+                        .unwrap()
+                        .done = true;
+                    return Err(InterpError::Throw(type_error(
+                        "iterator result is not an object",
+                    )));
                 }
+                self.top().stack.push(result);
             }
             Opcode::ObjectKeys => {
                 let v = self.top().stack.pop();
@@ -1030,7 +1054,7 @@ impl Interpreter {
                 self.top().stack.push(value);
             }
             Opcode::LdaThis => {
-                let v = self.current_this();
+                let v = self.current_this()?;
                 self.top().stack.push(v);
             }
             Opcode::LdaUpvalue => {
@@ -1134,6 +1158,8 @@ impl Interpreter {
                 initializer_function.private_brands.extend(class_brands);
                 initializer_function.class_field_keys =
                     class.as_function().unwrap().class_field_keys.clone();
+                initializer_function.home_object =
+                    Some(Box::new(get_property(&class, &Value::string("prototype"))));
                 class.as_function_mut().unwrap().instance_initializer = Some(Box::new(initializer));
                 self.top().stack.push(class);
             }
@@ -1177,7 +1203,17 @@ impl Interpreter {
                     })?
                     .private_brands
                     .clone();
-                self.top().private_brands.extend(brands);
+                let frame = self.top();
+                frame
+                    .private_environment_stack
+                    .push(frame.private_brands.clone());
+                frame.private_brands.extend(brands);
+            }
+            Opcode::DeactivateClassPrivateEnvironment => {
+                let previous = self.top().private_environment_stack.pop().ok_or_else(|| {
+                    InterpError::Internal("class private environment stack is unbalanced".into())
+                })?;
+                self.top().private_brands = previous;
             }
 
             // ---- arithmetic / binary ----
@@ -1299,6 +1335,12 @@ impl Interpreter {
             Opcode::JumpIfFalse => {
                 let v = self.top().stack.pop();
                 if is_falsy(&v) {
+                    self.top().pc = ins.operand as usize;
+                }
+            }
+            Opcode::JumpIfNullish => {
+                let value = self.top().stack.pop();
+                if value.is_nullish() {
                     self.top().pc = ins.operand as usize;
                 }
             }
@@ -1448,6 +1490,9 @@ impl Interpreter {
                         }
                         target.class_field_keys = receiver.class_field_keys.clone();
                         target.superclass = receiver.superclass.clone();
+                        if target.name == "<class-static-initializer>" {
+                            target.home_object = Some(Box::new(this.clone()));
+                        }
                     }
                     (a, this, callee)
                 };
@@ -1474,7 +1519,7 @@ impl Interpreter {
                     .last()
                     .and_then(|frame| frame.constructor.clone());
                 let super_base = get_property(&superclass, &Value::string("prototype"));
-                let base = self.current_this();
+                let base = self.frames.last().unwrap().this.clone();
                 if superclass
                     .as_function()
                     .is_some_and(|function| function.superclass.is_none())
@@ -1492,6 +1537,10 @@ impl Interpreter {
                 } else {
                     base
                 };
+                frame
+                    .this_binding
+                    .set(frame.this.clone())
+                    .map_err(binding_error_value)?;
                 frame.stack.push(result);
             }
             Opcode::SetSuperProp => {
@@ -1595,26 +1644,65 @@ impl Interpreter {
             Opcode::DefineDataProperty | Opcode::DefineMethod => {
                 let key = self.top().stack.pop();
                 let object = self.top().stack.pop();
-                let value = self.top().stack.pop();
+                let mut value = self.top().stack.pop();
                 let handle = obj_as_object(&object).cloned().ok_or_else(|| {
                     InterpError::Throw(type_error("class element base is not an object"))
                 })?;
-                handle.borrow_mut().properties.insert(
-                    prop_name(&key),
-                    PropertyDescriptor::Data {
-                        value,
-                        attr: js_runtime::object::Attribute {
-                            writable: true,
-                            enumerable: ins.op == Opcode::DefineDataProperty,
-                            configurable: true,
-                        },
+                if ins.op == Opcode::DefineMethod {
+                    if let Some(function) = value.as_function_mut() {
+                        function.home_object = Some(Box::new(object.clone()));
+                    }
+                }
+                let descriptor = PropertyDescriptor::Data {
+                    value,
+                    attr: js_runtime::object::Attribute {
+                        writable: true,
+                        enumerable: ins.op == Opcode::DefineDataProperty,
+                        configurable: true,
                     },
-                );
+                };
+                let proxy = { handle.borrow().proxy.clone() };
+                let defined = if let Some(proxy) = proxy {
+                    let trap = self.get_property_value(
+                        modules,
+                        &proxy.handler,
+                        &Value::string("defineProperty"),
+                        &proxy.handler,
+                    )?;
+                    if trap.is_undefined() {
+                        let target = obj_as_object(&proxy.target).cloned().ok_or_else(|| {
+                            InterpError::Internal("Proxy target is not an object".into())
+                        })?;
+                        define_own_property(&target, &key, descriptor)
+                    } else if trap.is_function() {
+                        let descriptor_value = property_descriptor_value(&descriptor);
+                        is_truthy(&self.call_value(
+                            modules,
+                            trap,
+                            vec![proxy.target, key.clone(), descriptor_value],
+                            proxy.handler,
+                        )?)
+                    } else {
+                        return Err(InterpError::Throw(type_error(
+                            "Proxy defineProperty trap is not callable",
+                        )));
+                    }
+                } else {
+                    define_own_property(&handle, &key, descriptor)
+                };
+                if !defined {
+                    return Err(InterpError::Throw(type_error(
+                        "class element property cannot be defined",
+                    )));
+                }
             }
             Opcode::DefineGetter | Opcode::DefineSetter => {
                 let key = self.top().stack.pop();
                 let object = self.top().stack.pop();
-                let function = self.top().stack.pop();
+                let mut function = self.top().stack.pop();
+                if let Some(callable) = function.as_function_mut() {
+                    callable.home_object = Some(Box::new(object.clone()));
+                }
                 define_accessor(&object, &key, function, ins.op == Opcode::DefineGetter);
             }
             Opcode::GetPrivate => {
@@ -1686,8 +1774,23 @@ impl Interpreter {
             | Opcode::DefinePrivateGetterTemplate
             | Opcode::DefinePrivateSetterTemplate => {
                 let object = self.top().stack.pop();
-                let value = self.top().stack.pop();
+                let mut value = self.top().stack.pop();
                 let private_name = self.private_name(module, ins.operand)?;
+                if ins.op != Opcode::DefinePrivate {
+                    let home_object = if matches!(
+                        ins.op,
+                        Opcode::DefinePrivateMethodTemplate
+                            | Opcode::DefinePrivateGetterTemplate
+                            | Opcode::DefinePrivateSetterTemplate
+                    ) {
+                        get_property(&object, &Value::string("prototype"))
+                    } else {
+                        object.clone()
+                    };
+                    if let Some(function) = value.as_function_mut() {
+                        function.home_object = Some(Box::new(home_object));
+                    }
+                }
                 define_private_element(&object, private_name, value, ins.op)?;
             }
             Opcode::PrivateIn => {
@@ -1833,6 +1936,7 @@ impl Interpreter {
             stack,
             upvalues,
             private_brands,
+            private_environment_stack,
             this,
             captured_this,
             try_stack,
@@ -1854,6 +1958,7 @@ impl Interpreter {
                 stack,
                 std::mem::take(&mut frame.upvalues),
                 std::mem::take(&mut frame.private_brands),
+                std::mem::take(&mut frame.private_environment_stack),
                 frame.this.clone(),
                 frame.captured_this.take(),
                 std::mem::take(&mut frame.try_stack),
@@ -1867,6 +1972,7 @@ impl Interpreter {
             state.stack = stack;
             state.upvalues = upvalues;
             state.private_brands = private_brands;
+            state.private_environment_stack = private_environment_stack;
             state.this = this;
             state.captured_this = captured_this;
             state.try_stack = try_stack
@@ -1935,7 +2041,7 @@ impl Interpreter {
 
         if generator.borrow().delegate.is_none() {
             let iterable = self.top().stack.pop();
-            let delegate = self.get_yield_star_iterator(modules, iterable, is_async)?;
+            let delegate = self.get_iterator_record(modules, iterable, is_async)?;
             generator.borrow_mut().delegate = Some(delegate);
         }
 
@@ -2037,20 +2143,21 @@ impl Interpreter {
         }
     }
 
-    fn get_yield_star_iterator(
+    fn get_iterator_record(
         &mut self,
         modules: &BytecodeGraph<'_>,
         iterable: Value,
         is_async: bool,
-    ) -> Result<GeneratorDelegate, InterpError> {
+    ) -> Result<IteratorRecord, InterpError> {
         let indexable = matches!(
             iterable.data(),
             ValueData::Object(object) if object.borrow().is_exotic_array
         ) || matches!(iterable.data(), ValueData::String(_));
         if indexable {
-            return Ok(GeneratorDelegate {
+            return Ok(IteratorRecord {
                 iterator: make_iterator(&iterable),
                 next_method: Value::undefined(),
+                done: false,
                 async_from_sync: is_async,
                 intrinsic_next: true,
             });
@@ -2066,9 +2173,10 @@ impl Interpreter {
             let iterator = iterable.clone();
             let next_method =
                 self.get_property_value(modules, &iterator, &Value::string("next"), &iterator)?;
-            return Ok(GeneratorDelegate {
+            return Ok(IteratorRecord {
                 iterator,
                 next_method,
+                done: false,
                 async_from_sync: is_async && !inner_is_async,
                 intrinsic_next: false,
             });
@@ -2108,9 +2216,10 @@ impl Interpreter {
         }
         let next_method =
             self.get_property_value(modules, &iterator, &Value::string("next"), &iterator)?;
-        Ok(GeneratorDelegate {
+        Ok(IteratorRecord {
             iterator,
             next_method,
+            done: false,
             async_from_sync,
             intrinsic_next: false,
         })
@@ -2166,6 +2275,29 @@ impl Interpreter {
         key: &Value,
         receiver: &Value,
     ) -> Result<Value, InterpError> {
+        if let Some(proxy) = obj_as_object(object).and_then(|object| object.borrow().proxy.clone())
+        {
+            let trap = self.get_property_value(
+                modules,
+                &proxy.handler,
+                &Value::string("get"),
+                &proxy.handler,
+            )?;
+            if trap.is_undefined() {
+                return self.get_property_value(modules, &proxy.target, key, receiver);
+            }
+            if !trap.is_function() {
+                return Err(InterpError::Throw(type_error(
+                    "Proxy get trap is not callable",
+                )));
+            }
+            return self.call_value(
+                modules,
+                trap,
+                vec![proxy.target, key.clone(), receiver.clone()],
+                proxy.handler,
+            );
+        }
         if let ValueData::String(name) = key.data() {
             if let Some(value) = crate::builtins::native_static_value(object, &name.0) {
                 return Ok(value);
@@ -2234,6 +2366,31 @@ impl Interpreter {
         value: Value,
         receiver: &Value,
     ) -> Result<bool, InterpError> {
+        if let Some(proxy) = obj_as_object(object).and_then(|object| object.borrow().proxy.clone())
+        {
+            let trap = self.get_property_value(
+                modules,
+                &proxy.handler,
+                &Value::string("set"),
+                &proxy.handler,
+            )?;
+            if trap.is_undefined() {
+                return self.set_property_value(modules, &proxy.target, key, value, receiver);
+            }
+            if !trap.is_function() {
+                return Err(InterpError::Throw(type_error(
+                    "Proxy set trap is not callable",
+                )));
+            }
+            return self
+                .call_value(
+                    modules,
+                    trap,
+                    vec![proxy.target, key.clone(), value, receiver.clone()],
+                    proxy.handler,
+                )
+                .map(|result| is_truthy(&result));
+        }
         let Some(handle) = obj_as_object(object).cloned() else {
             return Ok(set_property_checked(receiver, key, value));
         };
@@ -2399,8 +2556,12 @@ impl Interpreter {
 
     fn super_property_base(&self) -> Result<(Value, Value), InterpError> {
         let frame = self.frames.last().unwrap();
-        let receiver = self.current_this();
-        let base = if let Some(base) = &frame.super_base {
+        let receiver = self.current_this()?;
+        let base = if let Some(home_object) = &frame.home_object {
+            obj_as_object(home_object)
+                .and_then(|object| object.borrow().proto.clone())
+                .unwrap_or_else(Value::null)
+        } else if let Some(base) = &frame.super_base {
             base.clone()
         } else if let Some(superclass) = &frame.superclass {
             get_property(superclass, &Value::string("prototype"))
@@ -2598,7 +2759,13 @@ impl Interpreter {
         }
         // Arrows capture `this` lexically from the enclosing frame.
         let this_cell = if is_arrow {
-            Some(new_cell(self.current_this()))
+            let frame = self.frames.last().unwrap();
+            Some(
+                frame
+                    .captured_this
+                    .clone()
+                    .unwrap_or_else(|| frame.this_binding.clone()),
+            )
         } else {
             None
         };
@@ -2611,6 +2778,7 @@ impl Interpreter {
             .get("Object")
             .map(|object| get_property(object, &Value::string("prototype")));
         if let Some(object_prototype) = object_prototype {
+            f.object.borrow_mut().proto = Some(object_prototype.clone());
             let function_prototype = f.object.borrow().properties.get("prototype").and_then(
                 |descriptor| match descriptor {
                     PropertyDescriptor::Data { value, .. } => obj_as_object(value).cloned(),
@@ -2620,6 +2788,29 @@ impl Interpreter {
             if let Some(function_prototype) = function_prototype {
                 function_prototype.borrow_mut().proto = Some(object_prototype);
             }
+        }
+        let function_value = Value::function(f.clone());
+        if let Some(function_prototype) =
+            f.object
+                .borrow()
+                .properties
+                .get("prototype")
+                .and_then(|descriptor| match descriptor {
+                    PropertyDescriptor::Data { value, .. } => obj_as_object(value).cloned(),
+                    PropertyDescriptor::Accessor { .. } => None,
+                })
+        {
+            function_prototype.borrow_mut().properties.insert(
+                "constructor".into(),
+                PropertyDescriptor::Data {
+                    value: function_value,
+                    attr: js_runtime::object::Attribute {
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                },
+            );
         }
         f.module_index = module_index as u32;
         f.upvalues = upvalues;
@@ -2631,6 +2822,15 @@ impl Interpreter {
                 .last()
                 .and_then(|frame| frame.superclass.clone())
                 .map(Box::new);
+            f.home_object = self
+                .frames
+                .last()
+                .and_then(|frame| frame.home_object.clone())
+                .map(Box::new);
+            f.reject_eval_arguments = self
+                .frames
+                .last()
+                .is_some_and(|frame| frame.reject_eval_arguments);
         }
         f.private_brands = self
             .frames
@@ -2647,12 +2847,12 @@ impl Interpreter {
 
     /// The `this` value for the current frame (ordinary frame `this`, or the
     /// arrow's lexically captured `this`).
-    fn current_this(&self) -> Value {
+    fn current_this(&self) -> Result<Value, InterpError> {
         let frame = self.frames.last().unwrap();
         if let Some(c) = &frame.captured_this {
-            return c.get().unwrap_or_else(|_| Value::undefined());
+            return c.get().map_err(binding_error_value);
         }
-        frame.this.clone()
+        frame.this_binding.get().map_err(binding_error_value)
     }
 
     /// ECMAScript ToPropertyKey with the String hint. Class computed names use
@@ -2670,6 +2870,28 @@ impl Interpreter {
         }
 
         let object = obj_as_object(&value).cloned();
+        let exotic_key = Value::symbol(js_runtime::value::JsSymbol::to_primitive());
+        let exotic = self.get_property_value(modules, &value, &exotic_key, &value)?;
+        if !exotic.is_nullish() {
+            if !exotic.is_function() {
+                return Err(InterpError::Throw(type_error(
+                    "@@toPrimitive is not callable",
+                )));
+            }
+            let primitive = self.call_value(
+                modules,
+                exotic,
+                vec![Value::string("string")],
+                value.clone(),
+            )?;
+            return match primitive.data() {
+                ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_) => Err(
+                    InterpError::Throw(type_error("@@toPrimitive returned an object")),
+                ),
+                ValueData::Symbol(_) => Ok(primitive),
+                _ => Ok(Value::string(to_string(&primitive))),
+            };
+        }
         let explicit_null_prototype = object
             .as_ref()
             .is_some_and(|object| object.borrow().explicit_null_prototype);
@@ -2729,7 +2951,7 @@ impl Interpreter {
                 InterpError::Internal("direct eval has no active execution context".into())
             })?;
             inherited_brands = frame.private_brands.clone();
-            this_value = self.current_this();
+            this_value = self.current_this()?;
             superclass = frame.superclass.clone();
             if let Some(module_ptr) = self.module_ptr(modules, frame.module_index) {
                 let module = unsafe { &*module_ptr };
@@ -2796,7 +3018,12 @@ impl Interpreter {
             allow_super_property: direct && superclass.is_some(),
             allow_super_call: false,
             allow_new_target: direct,
-            reject_arguments: direct && inside_initializer,
+            reject_arguments: direct
+                && (inside_initializer
+                    || self
+                        .frames
+                        .last()
+                        .is_some_and(|frame| frame.reject_eval_arguments)),
         };
         let source = std::sync::Arc::new(js_syntax::SourceFile::new(
             "<eval>",
@@ -2884,7 +3111,8 @@ impl Interpreter {
             module.main.locals.slot_count(),
             module.main.span,
         );
-        frame.this = this_value;
+        frame.this = this_value.clone();
+        frame.this_binding = js_runtime::value::Cell::mutable(this_value);
         frame.private_brands = private_brands;
         frame.superclass = superclass;
         frame.upvalues = module
@@ -3060,11 +3288,22 @@ impl Interpreter {
         if f.this_cell.is_some() {
             nf.captured_this = f.this_cell.clone();
         } else {
-            nf.this = this;
+            nf.this = this.clone();
+            nf.this_binding = if is_construct && f.superclass.is_some() {
+                js_runtime::value::Cell::uninitialized(true)
+            } else {
+                js_runtime::value::Cell::mutable(this)
+            };
         }
         nf.is_construct = is_construct;
         nf.constructor = is_construct.then(|| callee.clone());
         nf.superclass = f.superclass.as_deref().cloned();
+        nf.home_object = f.home_object.as_deref().cloned();
+        nf.reject_eval_arguments = f.reject_eval_arguments
+            || matches!(
+                func.name.as_str(),
+                "<class-instance-initializer>" | "<class-static-initializer>"
+            );
         nf.private_brands = f.private_brands;
         nf.class_field_keys = f.class_field_keys;
         self.frames.push(nf);
@@ -3096,12 +3335,15 @@ impl Interpreter {
             stack: Vec::new(),
             upvalues: f.upvalues.clone(),
             private_brands: f.private_brands.clone(),
+            private_environment_stack: Vec::new(),
             this: if f.this_cell.is_some() {
                 Value::undefined()
             } else {
                 this
             },
             captured_this: f.this_cell.clone(),
+            home_object: f.home_object.as_deref().cloned(),
+            reject_eval_arguments: f.reject_eval_arguments,
             is_async: func.is_async,
             delegate: None,
             try_stack: Vec::new(),
@@ -3130,8 +3372,11 @@ impl Interpreter {
             stack,
             upvalues,
             private_brands,
+            private_environment_stack,
             this,
             captured_this,
+            home_object,
+            reject_eval_arguments,
             try_stack,
             pending_throw,
         ) = {
@@ -3154,8 +3399,11 @@ impl Interpreter {
                 std::mem::take(&mut s.stack),
                 std::mem::take(&mut s.upvalues),
                 std::mem::take(&mut s.private_brands),
+                std::mem::take(&mut s.private_environment_stack),
                 std::mem::replace(&mut s.this, Value::undefined()),
                 s.captured_this.take(),
+                s.home_object.take(),
+                s.reject_eval_arguments,
                 std::mem::take(&mut s.try_stack),
                 s.pending_throw.take(),
             )
@@ -3171,8 +3419,12 @@ impl Interpreter {
         frame.locals = locals;
         frame.upvalues = upvalues;
         frame.private_brands = private_brands;
-        frame.this = this;
+        frame.private_environment_stack = private_environment_stack;
+        frame.this = this.clone();
+        frame.this_binding = js_runtime::value::Cell::mutable(this);
         frame.captured_this = captured_this;
+        frame.home_object = home_object;
+        frame.reject_eval_arguments = reject_eval_arguments;
         frame.generator = Some(gen);
         frame.try_stack = try_stack
             .into_iter()
@@ -3414,6 +3666,7 @@ pub(crate) fn eq_strict(a: Value, b: Value) -> bool {
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
         (Function(x), Function(y)) => Rc::ptr_eq(&x.object, &y.object),
         (Symbol(x), Symbol(y)) => x.id == y.id,
+        (BigInt(x), BigInt(y)) => x == y,
         (Symbol(_), _) | (_, Symbol(_)) => false,
         _ => false,
     }
@@ -3830,6 +4083,17 @@ fn define_private_element(
         .cloned()
         .ok_or_else(|| InterpError::Throw(type_error("private element base is not an object")))?;
     let mut data = handle.borrow_mut();
+    let templates = matches!(
+        opcode,
+        Opcode::DefinePrivateMethodTemplate
+            | Opcode::DefinePrivateGetterTemplate
+            | Opcode::DefinePrivateSetterTemplate
+    );
+    if !templates && data.non_extensible && !data.private_elements.contains_key(&name) {
+        return Err(InterpError::Throw(type_error(
+            "private element cannot be added to a non-extensible object",
+        )));
+    }
     let descriptor = match opcode {
         Opcode::DefinePrivate => PropertyDescriptor::Data {
             value,
@@ -3849,10 +4113,6 @@ fn define_private_element(
         | Opcode::DefinePrivateSetter
         | Opcode::DefinePrivateGetterTemplate
         | Opcode::DefinePrivateSetterTemplate => {
-            let templates = matches!(
-                opcode,
-                Opcode::DefinePrivateGetterTemplate | Opcode::DefinePrivateSetterTemplate
-            );
             let existing = if templates {
                 data.private_instance_elements.remove(&name)
             } else {
@@ -3911,6 +4171,11 @@ fn install_private_elements(
     elements: &HashMap<js_runtime::object::PrivateName, PropertyDescriptor>,
 ) -> Result<(), InterpError> {
     let mut data = object.borrow_mut();
+    if data.non_extensible && !elements.is_empty() {
+        return Err(InterpError::Throw(type_error(
+            "private elements cannot be added to a non-extensible object",
+        )));
+    }
     if elements
         .keys()
         .any(|name| data.private_elements.contains_key(name))
@@ -3984,7 +4249,17 @@ pub(crate) fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bo
         {
             return false;
         }
-        handle.borrow_mut().symbol_properties.insert(
+        let mut data = handle.borrow_mut();
+        if let Some(PropertyDescriptor::Data { value: slot, attr }) =
+            data.symbol_properties.get_mut(&symbol.id)
+        {
+            if !attr.writable {
+                return false;
+            }
+            *slot = value;
+            return true;
+        }
+        data.symbol_properties.insert(
             symbol.id,
             js_runtime::object::PropertyDescriptor::data(value),
         );
@@ -3997,8 +4272,20 @@ pub(crate) fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bo
         None
     };
     let mut b = handle.borrow_mut();
-    b.properties
-        .insert(name, js_runtime::object::PropertyDescriptor::data(value));
+    if b.non_extensible && !b.properties.contains_key(&name) {
+        return false;
+    }
+    if let Some(descriptor) = b.properties.get_mut(&name) {
+        match descriptor {
+            PropertyDescriptor::Data { value: slot, attr } if attr.writable => *slot = value,
+            PropertyDescriptor::Data { .. } | PropertyDescriptor::Accessor { .. } => return false,
+        }
+    } else {
+        b.properties.insert(
+            name.clone(),
+            js_runtime::object::PropertyDescriptor::data(value),
+        );
+    }
     if let Some(idx) = new_len {
         let cur = b
             .properties
@@ -4021,6 +4308,119 @@ pub(crate) fn set_property_checked(obj: &Value, key: &Value, value: Value) -> bo
         }
     }
     true
+}
+
+fn define_own_property(
+    object: &js_runtime::object::JsObject,
+    key: &Value,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let mut data = object.borrow_mut();
+    let current = match key.data() {
+        ValueData::Symbol(symbol) => data.symbol_properties.get(&symbol.id),
+        _ => data.properties.get(&prop_name(key)),
+    };
+    if current.is_none() && data.non_extensible {
+        return false;
+    }
+    if let Some(current) = current {
+        let current_attr = match current {
+            PropertyDescriptor::Data { attr, .. } | PropertyDescriptor::Accessor { attr, .. } => {
+                *attr
+            }
+        };
+        let new_attr = match &descriptor {
+            PropertyDescriptor::Data { attr, .. } | PropertyDescriptor::Accessor { attr, .. } => {
+                *attr
+            }
+        };
+        if !current_attr.configurable
+            && (new_attr.configurable || new_attr.enumerable != current_attr.enumerable)
+        {
+            return false;
+        }
+        if let PropertyDescriptor::Data {
+            value: current_value,
+            attr: current_attr,
+        } = current
+        {
+            if !current_attr.configurable && !current_attr.writable {
+                let PropertyDescriptor::Data {
+                    value: new_value,
+                    attr: new_attr,
+                } = &descriptor
+                else {
+                    return false;
+                };
+                if new_attr.writable || !same_value_runtime(current_value, new_value) {
+                    return false;
+                }
+            }
+        } else if !current_attr.configurable
+            && matches!(descriptor, PropertyDescriptor::Data { .. })
+        {
+            return false;
+        }
+    }
+    match key.data() {
+        ValueData::Symbol(symbol) => {
+            data.symbol_properties.insert(symbol.id, descriptor);
+        }
+        _ => {
+            data.properties.insert(prop_name(key), descriptor);
+        }
+    }
+    true
+}
+
+fn property_descriptor_value(descriptor: &PropertyDescriptor) -> Value {
+    let value = Value::object(js_runtime::object::ObjectData::new_handle());
+    match descriptor {
+        PropertyDescriptor::Data {
+            value: property_value,
+            attr,
+        } => {
+            set_property(&value, &Value::string("value"), property_value.clone());
+            set_property(
+                &value,
+                &Value::string("writable"),
+                Value::boolean(attr.writable),
+            );
+            set_property(
+                &value,
+                &Value::string("enumerable"),
+                Value::boolean(attr.enumerable),
+            );
+            set_property(
+                &value,
+                &Value::string("configurable"),
+                Value::boolean(attr.configurable),
+            );
+        }
+        PropertyDescriptor::Accessor { get, set, attr } => {
+            set_property(
+                &value,
+                &Value::string("get"),
+                get.clone().unwrap_or_else(Value::undefined),
+            );
+            set_property(
+                &value,
+                &Value::string("set"),
+                set.clone().unwrap_or_else(Value::undefined),
+            );
+            set_property(
+                &value,
+                &Value::string("enumerable"),
+                Value::boolean(attr.enumerable),
+            );
+            set_property(
+                &value,
+                &Value::string("configurable"),
+                Value::boolean(attr.configurable),
+            );
+        }
+    }
+    value
 }
 
 fn binding_error_value(error: js_runtime::value::BindingError) -> InterpError {
@@ -4063,6 +4463,16 @@ fn make_iterator(iterable: &Value) -> Value {
         );
     }
     Value::object(o)
+}
+
+fn iterator_record_value(record: IteratorRecord) -> Value {
+    let object = js_runtime::object::ObjectData::new_handle();
+    {
+        let mut data = object.borrow_mut();
+        data.class = "IteratorRecord";
+        data.iterator_record = Some(record);
+    }
+    Value::object(object)
 }
 
 /// Step an array-iterator object once: read `__it_src`/`__it_idx`, produce the
@@ -4171,11 +4581,20 @@ pub(crate) fn array_append(arr: &Value, v: Value) {
 }
 
 /// Borrow the `JsObject` handle from an object Value, if it is one.
-fn obj_as_object(v: &Value) -> Option<&js_runtime::object::JsObject> {
+pub(crate) fn obj_as_object(v: &Value) -> Option<&js_runtime::object::JsObject> {
     match v.data() {
         ValueData::Object(o) => Some(o),
         ValueData::Function(function) => Some(&function.object),
         _ => None,
+    }
+}
+
+fn same_value_runtime(left: &Value, right: &Value) -> bool {
+    match (left.data(), right.data()) {
+        (ValueData::Number(left), ValueData::Number(right)) => {
+            (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
+        }
+        _ => eq_strict(left.clone(), right.clone()),
     }
 }
 
