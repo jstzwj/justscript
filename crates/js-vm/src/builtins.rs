@@ -140,8 +140,13 @@ pub mod id {
     pub const REFLECT_PREVENT_EXTENSIONS: u16 = 121;
     pub const REFLECT_SET: u16 = 122;
     pub const REFLECT_OWN_KEYS: u16 = 123;
+    pub const REFLECT_GET: u16 = 124;
+    pub const ASSERT: u16 = 125;
+    pub const FUNCTION_BIND: u16 = 126;
+    pub const EVAL: u16 = 127;
+    pub const OBJECT_CREATE: u16 = 128;
     /// One-past-the-last id (for registering the dispatch table).
-    pub const COUNT: u16 = 124;
+    pub const COUNT: u16 = 129;
 }
 
 /// Resolve a static method on a global constructor function (Number/String).
@@ -195,6 +200,7 @@ pub fn builtin_method_id(this: &Value, name: &str) -> Option<u16> {
     match this.data() {
         ValueData::Function(_) => Some(match name {
             "call" => FUNCTION_CALL,
+            "bind" => FUNCTION_BIND,
             _ => return None,
         }),
         ValueData::Symbol(_) => Some(match name {
@@ -241,6 +247,7 @@ pub fn builtin_method_id(this: &Value, name: &str) -> Option<u16> {
             })
         }
         ValueData::String(_) => Some(match name {
+            "toString" => SYMBOL_TO_STRING,
             "charAt" => STR_CHAR_AT,
             "charCodeAt" => STR_CHAR_CODE_AT,
             "codePointAt" => STR_CODE_POINT_AT,
@@ -373,6 +380,7 @@ impl NativeFn for Builtin {
                     _ => unreachable!(),
                 }
             }
+            OBJECT_CREATE => return object_create(&args),
             JSON_STRINGIFY => json_stringify(&args),
             PARSE_INT => parse_int(&args),
             PARSE_FLOAT => parse_float(&args),
@@ -397,6 +405,13 @@ impl NativeFn for Builtin {
                     .call_value(module, this, args.into_iter().skip(1).collect(), receiver)
                     .map(NativeResult::Value);
             }
+            FUNCTION_BIND => return bind_function(&this, args),
+            EVAL => {
+                let value = args.into_iter().next().unwrap_or_else(Value::undefined);
+                return interp
+                    .eval_value(module, value, false)
+                    .map(NativeResult::Value);
+            }
             OBJECT_HAS_OWN | OBJECT_PROP_ENUM => {
                 return object_prototype_query(&this, &args, self.id == OBJECT_PROP_ENUM)
             }
@@ -412,6 +427,14 @@ impl NativeFn for Builtin {
             OBJECT_IS_FROZEN => Value::boolean(object_is_frozen(&args)),
             REFLECT_DEFINE_PROP => return object_define_property(&args, true),
             REFLECT_DELETE_PROP => Value::boolean(reflect_delete_property(&args)),
+            REFLECT_GET => {
+                let target = args.first().cloned().unwrap_or_else(Value::undefined);
+                let key = args.get(1).cloned().unwrap_or_else(Value::undefined);
+                let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
+                return interp
+                    .get_property_value(module, &target, &key, &receiver)
+                    .map(NativeResult::Value);
+            }
             REFLECT_HAS => Value::boolean(reflect_has(&args)),
             REFLECT_PREVENT_EXTENSIONS => return object_prevent_extensions(&args, true),
             REFLECT_SET => Value::boolean(reflect_set(&args)),
@@ -465,6 +488,7 @@ impl NativeFn for Builtin {
             ASSERT_SAME_VALUE => return assert_same_value(&args, false),
             ASSERT_NOT_SAME_VALUE => return assert_same_value(&args, true),
             ASSERT_THROWS => return assert_throws(interp, module, &args),
+            ASSERT => return assert_truthy(&args),
             DONE => return done(interp, &args),
             PROMISE_CTOR => return promise_constructor(interp, module, &this, args),
             PROMISE_RESOLVE => {
@@ -513,7 +537,17 @@ fn promise_object(value: &Value) -> Option<JsObject> {
 
 fn new_promise() -> JsObject {
     let promise = js_runtime::object::ObjectData::promise();
-    promise.borrow_mut().proto = Some(promise_prototype());
+    {
+        let mut object = promise.borrow_mut();
+        object.proto = Some(promise_prototype());
+        object
+            .constructor_chain
+            .push(js_runtime::object::ConstructorIdentity {
+                module_index: 0,
+                function_id: 0,
+                native_id: Some(id::PROMISE_CTOR),
+            });
+    }
     promise
 }
 
@@ -565,6 +599,10 @@ fn settle_promise(interp: &mut Interpreter, promise: JsObject, rejected: bool, v
             rejected,
         });
     }
+}
+
+pub(crate) fn fulfill_promise(interp: &mut Interpreter, promise: JsObject, value: Value) {
+    settle_promise(interp, promise, false, value);
 }
 
 pub(crate) fn reject_promise(interp: &mut Interpreter, promise: JsObject, reason: Value) {
@@ -936,6 +974,25 @@ fn object_get_prototype(args: &[Value]) -> Value {
     }
 }
 
+fn object_create(args: &[Value]) -> Result<NativeResult, InterpError> {
+    let prototype = args.first().cloned().unwrap_or_else(Value::undefined);
+    if !matches!(prototype.data(), ValueData::Null) && !prototype.is_object() {
+        return Err(InterpError::Throw(type_error_value(
+            "Object prototype may only be an object or null",
+        )));
+    }
+    let object = js_runtime::object::ObjectData::new_handle();
+    {
+        let mut data = object.borrow_mut();
+        if matches!(prototype.data(), ValueData::Null) {
+            data.explicit_null_prototype = true;
+        } else {
+            data.proto = Some(prototype);
+        }
+    }
+    Ok(NativeResult::Value(Value::object(object)))
+}
+
 fn object_set_prototype(args: &[Value]) -> Result<NativeResult, InterpError> {
     let target = args.first().cloned().unwrap_or_else(Value::undefined);
     let prototype = args.get(1).cloned().unwrap_or_else(Value::undefined);
@@ -1159,6 +1216,11 @@ fn value_eq_strict(a: &Value, b: &Value) -> bool {
         (ValueData::Number(x), ValueData::Integer(y)) => *x == (*y as f64),
         (ValueData::String(x), ValueData::String(y)) => x == y,
         (ValueData::Boolean(x), ValueData::Boolean(y)) => x == y,
+        (ValueData::Symbol(x), ValueData::Symbol(y)) => x.id == y.id,
+        (ValueData::Object(x), ValueData::Object(y)) => std::rc::Rc::ptr_eq(x, y),
+        (ValueData::Function(x), ValueData::Function(y)) => {
+            std::rc::Rc::ptr_eq(&x.object, &y.object)
+        }
         (ValueData::Undefined, ValueData::Undefined) | (ValueData::Null, ValueData::Null) => true,
         _ => false,
     }
@@ -1964,6 +2026,33 @@ fn native_fn(name: &str, id: u16) -> Value {
     Value::function(f)
 }
 
+fn bind_function(this: &Value, mut args: Vec<Value>) -> Result<NativeResult, InterpError> {
+    let target = this.as_function().ok_or_else(|| {
+        InterpError::Throw(type_error_value(
+            "Function.prototype.bind receiver is not callable",
+        ))
+    })?;
+    let bound_this = if args.is_empty() {
+        Value::undefined()
+    } else {
+        args.remove(0)
+    };
+    let mut bound = target.clone();
+    let fresh = JsFunction::new(format!("bound {}", target.name), target.id, 0);
+    bound.object = fresh.object;
+    bound.name = format!("bound {}", target.name);
+    // Binding an already-bound function cannot replace its original receiver.
+    // Bound arguments, however, are concatenated in binding order.
+    bound.bound_this = target
+        .bound_this
+        .clone()
+        .or_else(|| Some(Box::new(bound_this)));
+    let mut bound_args = target.bound_args.clone();
+    bound_args.extend(args);
+    bound.bound_args = bound_args;
+    Ok(NativeResult::Value(Value::function(bound)))
+}
+
 /// Construct a namespace object (Math/console/Object/...) with given properties.
 fn namespace(props: Vec<(&str, Value)>) -> Value {
     let o = js_runtime::object::ObjectData::new_handle();
@@ -1986,6 +2075,7 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
     globals.insert("undefined".to_string(), Value::undefined());
     globals.insert("NaN".to_string(), Value::number(f64::NAN));
     globals.insert("Infinity".to_string(), Value::number(f64::INFINITY));
+    globals.insert("eval".to_string(), native_fn("eval", EVAL));
 
     globals.insert(
         "console".to_string(),
@@ -2033,6 +2123,7 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
             ("values", native_fn("values", OBJECT_VALUES)),
             ("entries", native_fn("entries", OBJECT_ENTRIES)),
             ("assign", native_fn("assign", OBJECT_ASSIGN)),
+            ("create", native_fn("create", OBJECT_CREATE)),
             ("prototype", object_prototype),
             (
                 "getPrototypeOf",
@@ -2081,6 +2172,7 @@ pub fn install_globals(globals: &mut std::collections::HashMap<String, Value>) {
                 "deleteProperty",
                 native_fn("deleteProperty", REFLECT_DELETE_PROP),
             ),
+            ("get", native_fn("get", REFLECT_GET)),
             ("has", native_fn("has", REFLECT_HAS)),
             (
                 "preventExtensions",
@@ -2583,6 +2675,17 @@ fn assert_same_value(args: &[Value], negate: bool) -> Result<NativeResult, Inter
     Err(InterpError::Throw(test262_error(&msg)))
 }
 
+fn assert_truthy(args: &[Value]) -> Result<NativeResult, InterpError> {
+    if args.first().is_some_and(is_truthy) {
+        return Ok(NativeResult::Value(Value::undefined()));
+    }
+    let message = args
+        .get(1)
+        .map(to_string)
+        .unwrap_or_else(|| "Expected value to be truthy".into());
+    Err(InterpError::Throw(test262_error(&message)))
+}
+
 /// `assert.throws(constructor, callable[, message])` — call `callable`, expect it
 /// to throw a value whose error name matches `constructor`'s. Also accepts the
 /// `(ctor, callable, predicateFn)` shape: the predicate must return truthy for
@@ -2679,17 +2782,22 @@ fn done(interp: &mut Interpreter, args: &[Value]) -> Result<NativeResult, Interp
 /// runner opts in.
 pub fn install_test262_harness(globals: &mut std::collections::HashMap<String, Value>) {
     use id::*;
-    globals.insert(
-        "assert".to_string(),
-        namespace(vec![
-            ("sameValue", native_fn("sameValue", ASSERT_SAME_VALUE)),
-            (
-                "notSameValue",
-                native_fn("notSameValue", ASSERT_NOT_SAME_VALUE),
-            ),
-            ("throws", native_fn("throws", ASSERT_THROWS)),
-        ]),
-    );
+    let mut assert = JsFunction::new("assert", 0, 1);
+    assert.native = Some(ASSERT);
+    for (name, value) in [
+        ("sameValue", native_fn("sameValue", ASSERT_SAME_VALUE)),
+        (
+            "notSameValue",
+            native_fn("notSameValue", ASSERT_NOT_SAME_VALUE),
+        ),
+        ("throws", native_fn("throws", ASSERT_THROWS)),
+    ] {
+        assert.object.borrow_mut().properties.insert(
+            name.into(),
+            js_runtime::object::PropertyDescriptor::data(value),
+        );
+    }
+    globals.insert("assert".to_string(), Value::function(assert));
     globals.insert(
         "Test262Error".to_string(),
         native_fn("Test262Error", TEST262_ERROR_CTOR),

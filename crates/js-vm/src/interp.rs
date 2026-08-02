@@ -36,6 +36,11 @@ const IT_IDX: &str = "__it_idx";
 pub enum NativeResult {
     Value(Value),
     ResumeGenerator(Rc<RefCell<GeneratorState>>, Value),
+    ResumeAsyncGenerator(
+        Rc<RefCell<GeneratorState>>,
+        Value,
+        js_runtime::object::JsObject,
+    ),
 }
 
 /// Outcome of one [`Interpreter::step`]: keep going, or the running frame
@@ -119,8 +124,8 @@ impl NativeFn for GenThrow {
 impl NativeFn for GenNext {
     fn call(
         &self,
-        _interp: &mut Interpreter,
-        _modules: &BytecodeGraph<'_>,
+        interp: &mut Interpreter,
+        modules: &BytecodeGraph<'_>,
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
@@ -129,7 +134,20 @@ impl NativeFn for GenNext {
             InterpError::Internal("generator method has no bound generator".into())
         })?;
         let arg = args.into_iter().next().unwrap_or_else(Value::undefined);
-        Ok(NativeResult::ResumeGenerator(gen, arg))
+        if gen.borrow().is_async {
+            if gen.borrow().done {
+                let promise = crate::builtins::promise_resolved(
+                    interp,
+                    modules,
+                    iter_result(Value::undefined(), true),
+                )?;
+                return Ok(NativeResult::Value(promise));
+            }
+            let promise = crate::builtins::promise_pending();
+            Ok(NativeResult::ResumeAsyncGenerator(gen, arg, promise))
+        } else {
+            Ok(NativeResult::ResumeGenerator(gen, arg))
+        }
     }
 }
 
@@ -194,6 +212,10 @@ pub struct Interpreter {
     dynamic_imports: Option<Vec<HashMap<String, Result<usize, String>>>>,
     dynamic_import_requests: VecDeque<DynamicImportRequest>,
     deferred_modules: Option<DeferredModuleGraph>,
+    /// Runtime-compiled eval modules. Box allocation keeps bytecode addresses
+    /// stable while the table grows and closures outlive the eval call.
+    eval_modules: Vec<(usize, Box<BytecodeModule>)>,
+    next_private_brand: u64,
 }
 
 /// Hard cap on instructions per program. Generous enough for legitimate
@@ -219,6 +241,8 @@ impl Interpreter {
             dynamic_imports: None,
             dynamic_import_requests: VecDeque::new(),
             deferred_modules: None,
+            eval_modules: Vec::new(),
+            next_private_brand: 1,
         };
         // Install the global builtins (console, Math, Object, JSON, parseInt, …).
         {
@@ -233,6 +257,33 @@ impl Interpreter {
     /// Construct an interpreter with a fresh realm.
     pub fn fresh() -> Interpreter {
         Interpreter::new(RealmContext::fresh())
+    }
+
+    fn module_ptr(
+        &self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Option<*const BytecodeModule> {
+        modules
+            .get(module_index)
+            .map(|module| *module as *const BytecodeModule)
+            .or_else(|| {
+                self.eval_modules
+                    .iter()
+                    .find(|(index, _)| *index == module_index)
+                    .map(|(_, module)| module.as_ref() as *const BytecodeModule)
+            })
+    }
+
+    fn module_ref<'a>(
+        &'a self,
+        modules: &BytecodeGraph<'_>,
+        module_index: usize,
+    ) -> Option<&'a BytecodeModule> {
+        let pointer = self.module_ptr(modules, module_index)?;
+        // Bytecode modules in the external graph live for the dispatch call;
+        // eval modules are boxed and never removed from this interpreter.
+        Some(unsafe { &*pointer })
     }
 
     /// Register the instantiated module graph used by deferred namespace
@@ -622,7 +673,10 @@ impl Interpreter {
                         .frames
                         .iter()
                         .rev()
-                        .map(|frame| runtime_frame(modules, frame))
+                        .filter_map(|frame| {
+                            self.module_ref(modules, frame.module_index)
+                                .map(|module| runtime_frame(module, frame))
+                        })
                         .collect();
                 }
                 return Err(other);
@@ -649,7 +703,15 @@ impl Interpreter {
                 }
                 None => {
                     let frame = self.frames.last().unwrap();
-                    if func_ref(modules[frame.module_index], frame.func_index).is_async {
+                    let module = self
+                        .module_ref(modules, frame.module_index)
+                        .ok_or_else(|| {
+                            InterpError::Internal(format!(
+                                "frame refers to missing bytecode module {}",
+                                frame.module_index
+                            ))
+                        })?;
+                    if func_ref(module, frame.func_index).is_async {
                         let promise = crate::builtins::promise_rejected(thrown);
                         self.frames.pop();
                         if let Some(caller) = self.frames.last_mut() {
@@ -660,7 +722,7 @@ impl Interpreter {
                             "async function escaped without a caller frame".into(),
                         ));
                     }
-                    self.error_trace.push(runtime_frame(modules, frame));
+                    self.error_trace.push(runtime_frame(module, frame));
                     self.frames.pop(); // no handler here → unwind to caller
                 }
             }
@@ -684,11 +746,12 @@ impl Interpreter {
             return Err(err);
         }
         let module_index = self.frames.last().unwrap().module_index;
-        let module = modules.get(module_index).copied().ok_or_else(|| {
+        let module_ptr = self.module_ptr(modules, module_index).ok_or_else(|| {
             InterpError::Internal(format!(
                 "frame refers to missing bytecode module {module_index}"
             ))
         })?;
+        let module = unsafe { &*module_ptr };
         // Fetch + advance the PC without holding a long-lived borrow.
         let ins = {
             let frame = self.frames.last_mut().unwrap();
@@ -836,6 +899,32 @@ impl Interpreter {
                 let f = self.function_value(module, module_index, ins.operand as u32);
                 self.top().stack.push(Value::function(f));
             }
+            Opcode::SetFunctionName => {
+                let name = match module.constants.get(ins.operand).data() {
+                    ValueData::String(name) => name.as_str().to_string(),
+                    _ => {
+                        return Err(InterpError::Internal(
+                            "SetFunctionName operand is not a string".into(),
+                        ))
+                    }
+                };
+                let mut value = self.top().stack.pop();
+                if let Some(function) = value.as_function_mut() {
+                    function.name = name.clone();
+                    function.object.borrow_mut().properties.insert(
+                        "name".into(),
+                        PropertyDescriptor::Data {
+                            value: Value::string(name),
+                            attr: js_runtime::object::Attribute {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                            },
+                        },
+                    );
+                }
+                self.top().stack.push(value);
+            }
             Opcode::LdaThis => {
                 let v = self.current_this();
                 self.top().stack.push(v);
@@ -885,8 +974,106 @@ impl Interpreter {
                         "class extends value is not a constructor or null",
                     )));
                 }
-                class.as_function_mut().unwrap().superclass = Some(Box::new(superclass));
+                if let (Some(class_object), Some(super_object)) =
+                    (obj_as_object(&class), obj_as_object(&superclass))
+                {
+                    class_object.borrow_mut().proto = Some(superclass.clone());
+                    let class_prototype = class_object
+                        .borrow()
+                        .properties
+                        .get("prototype")
+                        .and_then(|descriptor| match descriptor {
+                            PropertyDescriptor::Data { value, .. } => Some(value),
+                            PropertyDescriptor::Accessor { .. } => None,
+                        })
+                        .cloned();
+                    let super_prototype = super_object
+                        .borrow()
+                        .properties
+                        .get("prototype")
+                        .and_then(|descriptor| match descriptor {
+                            PropertyDescriptor::Data { value, .. } => Some(value),
+                            PropertyDescriptor::Accessor { .. } => None,
+                        })
+                        .cloned();
+                    if let (Some(class_prototype), Some(super_prototype)) =
+                        (class_prototype, super_prototype)
+                    {
+                        if let Some(class_prototype) = obj_as_object(&class_prototype) {
+                            class_prototype.borrow_mut().proto = Some(super_prototype);
+                        }
+                    }
+                }
+                let function = class.as_function_mut().unwrap();
+                function.superclass = Some(Box::new(superclass.clone()));
+                if let Some(initializer) = function.instance_initializer.as_deref_mut() {
+                    if let Some(initializer) = initializer.as_function_mut() {
+                        initializer.superclass = Some(Box::new(superclass));
+                    }
+                }
                 self.top().stack.push(class);
+            }
+            Opcode::SetClassInstanceInitializer => {
+                let mut initializer = self.top().stack.pop();
+                let mut class = self.top().stack.pop();
+                let class_brands = class
+                    .as_function()
+                    .map(|function| function.private_brands.clone())
+                    .ok_or_else(|| {
+                        InterpError::Internal(
+                            "class instance initializer target is not a function".into(),
+                        )
+                    })?;
+                let initializer_function = initializer.as_function_mut().ok_or_else(|| {
+                    InterpError::Internal("class instance initializer is not a function".into())
+                })?;
+                initializer_function.private_brands.extend(class_brands);
+                initializer_function.class_field_keys =
+                    class.as_function().unwrap().class_field_keys.clone();
+                class.as_function_mut().unwrap().instance_initializer = Some(Box::new(initializer));
+                self.top().stack.push(class);
+            }
+            Opcode::DefineClassFieldKey => {
+                let key = self.top().stack.pop();
+                let class = self.top().stack.pop();
+                let key = self.to_property_key_value(modules, key)?;
+                let function = class.as_function().ok_or_else(|| {
+                    InterpError::Internal("computed class key target is not a function".into())
+                })?;
+                function.class_field_keys.borrow_mut().push(key);
+                self.top().stack.push(class);
+            }
+            Opcode::LoadClassFieldKey => {
+                let key = self
+                    .frames
+                    .last()
+                    .unwrap()
+                    .class_field_keys
+                    .borrow()
+                    .get(ins.operand as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        InterpError::Internal(format!(
+                            "computed class key {} was not initialized",
+                            ins.operand
+                        ))
+                    })?;
+                self.top().stack.push(key);
+            }
+            Opcode::ActivateClassPrivateEnvironment => {
+                let brands = self
+                    .top()
+                    .stack
+                    .peek()
+                    .as_function()
+                    .ok_or_else(|| {
+                        InterpError::Internal(
+                            "class private environment target is not a function".into(),
+                        )
+                    })?
+                    .private_brands
+                    .clone();
+                self.top().private_brands.extend(brands);
             }
 
             // ---- arithmetic / binary ----
@@ -958,8 +1145,25 @@ impl Interpreter {
                     .globals
                     .get(&name)
                     .cloned()
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        InterpError::Throw(crate::builtins::error_ctor(
+                            &Value::undefined(),
+                            &[Value::string(format!("{name} is not defined"))],
+                            "ReferenceError",
+                        ))
+                    })?;
                 self.top().stack.push(v);
+            }
+            Opcode::TypeofGlobal => {
+                let name = match module.constants.get(ins.operand).data() {
+                    ValueData::String(s) => s.as_str(),
+                    _ => "",
+                };
+                let value = self.ctx.realm.borrow().globals.get(name).cloned();
+                self.top().stack.push(match value {
+                    Some(value) => typeof_(value),
+                    None => Value::string("undefined"),
+                });
             }
             Opcode::SetGlobal => {
                 let v = self.top().stack.pop();
@@ -995,19 +1199,32 @@ impl Interpreter {
                 }
             }
             Opcode::Return => {
-                let (ret, was_construct, this_obj, gen) = {
+                let (ret, was_construct, this_obj, gen, async_generator_promise) = {
                     let f = self.frames.last_mut().unwrap();
                     (
                         f.stack.pop(),
                         f.is_construct,
                         f.this.clone(),
                         f.generator.clone(),
+                        f.async_generator_promise.clone(),
                     )
                 };
                 // A generator body completing: mark done, return {value, done:true}.
                 if let Some(g) = gen {
                     g.borrow_mut().done = true;
                     self.frames.pop();
+                    if let Some(promise) = async_generator_promise {
+                        crate::builtins::fulfill_promise(
+                            self,
+                            promise.clone(),
+                            iter_result(ret, true),
+                        );
+                        if self.frames.is_empty() {
+                            return Ok(Step::Done(Value::object(promise)));
+                        }
+                        self.top().stack.push(Value::object(promise));
+                        return Ok(Step::More);
+                    }
                     if self.frames.is_empty() {
                         return Ok(Step::Done(Value::undefined()));
                     }
@@ -1016,7 +1233,15 @@ impl Interpreter {
                 }
                 let is_async = {
                     let frame = self.frames.last().unwrap();
-                    func_ref(modules[frame.module_index], frame.func_index).is_async
+                    let module = self
+                        .module_ref(modules, frame.module_index)
+                        .ok_or_else(|| {
+                            InterpError::Internal(format!(
+                                "frame refers to missing bytecode module {}",
+                                frame.module_index
+                            ))
+                        })?;
+                    func_ref(module, frame.func_index).is_async
                 };
                 if self.frames.len() == 1 {
                     self.drain_jobs(modules)?;
@@ -1062,6 +1287,8 @@ impl Interpreter {
                 // the frame and hand {value, done:false} to the caller.
                 let gen = self.frames.last().unwrap().generator.clone();
                 let gen = gen.expect("`yield` outside a generator frame");
+                let async_generator_promise =
+                    self.frames.last().unwrap().async_generator_promise.clone();
                 let yielded = self.frames.last_mut().unwrap().stack.pop();
                 {
                     let mut s = gen.borrow_mut();
@@ -1075,6 +1302,8 @@ impl Interpreter {
                     v.reverse();
                     s.stack = v;
                     s.upvalues = self.frames.last_mut().unwrap().upvalues.split_off(0);
+                    s.private_brands =
+                        std::mem::take(&mut self.frames.last_mut().unwrap().private_brands);
                     s.this = self.frames.last_mut().unwrap().this.clone();
                     s.captured_this = self.frames.last_mut().unwrap().captured_this.take();
                     s.done = false;
@@ -1084,7 +1313,32 @@ impl Interpreter {
                     // `yield` at the top of the script (no caller) — drop it.
                     return Ok(Step::Done(Value::undefined()));
                 }
-                self.top().stack.push(iter_result(yielded, false));
+                if let Some(promise) = async_generator_promise {
+                    let yielded = crate::builtins::promise_resolved(self, modules, yielded)?;
+                    self.drain_jobs(modules)?;
+                    match crate::builtins::promise_result(&yielded) {
+                        Some(crate::builtins::AwaitedPromise::Fulfilled(value)) => {
+                            crate::builtins::fulfill_promise(
+                                self,
+                                promise.clone(),
+                                iter_result(value, false),
+                            );
+                        }
+                        Some(crate::builtins::AwaitedPromise::Rejected(value)) => {
+                            gen.borrow_mut().done = true;
+                            crate::builtins::reject_promise(self, promise.clone(), value);
+                        }
+                        Some(crate::builtins::AwaitedPromise::Pending) => {
+                            return Err(InterpError::Internal(
+                                "async generator yielded a pending Promise".into(),
+                            ));
+                        }
+                        None => unreachable!("PromiseResolve always returns a Promise"),
+                    }
+                    self.top().stack.push(Value::object(promise));
+                } else {
+                    self.top().stack.push(iter_result(yielded, false));
+                }
             }
             Opcode::Await => {
                 let awaited = self.top().stack.pop();
@@ -1114,6 +1368,19 @@ impl Interpreter {
                 let (callee, args) = pop_args(self, ins.operand);
                 self.invoke(modules, callee, args, Value::undefined(), false);
             }
+            Opcode::CallDirectEval => {
+                let (callee, args) = pop_args(self, ins.operand);
+                let intrinsic_eval = callee
+                    .as_function()
+                    .is_some_and(|function| function.native == Some(crate::builtins::id::EVAL));
+                if intrinsic_eval {
+                    let input = args.into_iter().next().unwrap_or_else(Value::undefined);
+                    let value = self.eval_value(modules, input, true)?;
+                    self.top().stack.push(value);
+                } else {
+                    self.invoke(modules, callee, args, Value::undefined(), false);
+                }
+            }
             Opcode::CallMethod => {
                 // Stack: [obj, fn, args...]
                 let (args, this, callee) = {
@@ -1121,14 +1388,25 @@ impl Interpreter {
                     let frame = self.frames.last_mut().unwrap();
                     let mut a: Vec<Value> = (0..n).map(|_| frame.stack.pop()).collect();
                     a.reverse();
-                    let callee = frame.stack.pop();
+                    let mut callee = frame.stack.pop();
                     let this = frame.stack.pop();
+                    if let (Some(receiver), Some(target)) =
+                        (this.as_function(), callee.as_function_mut())
+                    {
+                        for (&class_id, &brand) in &receiver.private_brands {
+                            target.private_brands.insert(class_id, brand);
+                        }
+                        target.class_field_keys = receiver.class_field_keys.clone();
+                        target.superclass = receiver.superclass.clone();
+                    }
                     (a, this, callee)
                 };
                 self.invoke(modules, callee, args, this, false);
             }
             Opcode::CallSuper => {
-                let args = {
+                let args = if ins.operand == u16::MAX {
+                    self.frames.last().unwrap().arguments.clone()
+                } else {
                     let count = ins.operand as usize;
                     let mut args: Vec<_> = (0..count).map(|_| self.top().stack.pop()).collect();
                     args.reverse();
@@ -1141,10 +1419,24 @@ impl Interpreter {
                     .ok_or_else(|| {
                         InterpError::Internal("super() has no runtime superclass".into())
                     })?;
+                let derived_constructor = self
+                    .frames
+                    .last()
+                    .and_then(|frame| frame.constructor.clone());
+                let super_base = get_property(&superclass, &Value::string("prototype"));
                 let base = self.current_this();
+                if superclass
+                    .as_function()
+                    .is_some_and(|function| function.superclass.is_none())
+                {
+                    self.initialize_instance_elements(modules, &superclass, &base)?;
+                }
                 let result = self.call_value_mode(modules, superclass, args, base.clone(), true)?;
+                if let Some(constructor) = derived_constructor {
+                    self.initialize_instance_elements(modules, &constructor, &result)?;
+                }
                 let frame = self.frames.last_mut().unwrap();
-                frame.super_base = Some(base.clone());
+                frame.super_base = Some(super_base);
                 frame.this = if result.is_object() {
                     result.clone()
                 } else {
@@ -1156,6 +1448,12 @@ impl Interpreter {
                 let key = self.top().stack.pop();
                 let value = self.top().stack.pop();
                 self.set_super_property(modules, &key, value)?;
+            }
+            Opcode::GetSuperProp => {
+                let key = self.top().stack.pop();
+                let (base, receiver) = self.super_property_base()?;
+                let value = self.get_property_value(modules, &base, &key, &receiver)?;
+                self.top().stack.push(value);
             }
             Opcode::NewObject => {
                 let o = js_runtime::object::ObjectData::new_handle();
@@ -1229,7 +1527,7 @@ impl Interpreter {
                 let key = self.top().stack.pop();
                 let obj = self.top().stack.pop();
                 self.ensure_deferred_namespace(modules, &obj)?;
-                let value = self.get_property_value(modules, &obj, &key)?;
+                let value = self.get_property_value(modules, &obj, &key, &obj)?;
                 self.top().stack.push(value);
             }
             Opcode::SetProp => {
@@ -1240,17 +1538,118 @@ impl Interpreter {
                 let obj = self.top().stack.pop();
                 let value = self.top().stack.pop();
                 self.ensure_deferred_namespace(modules, &obj)?;
-                if !set_property_checked(&obj, &key, value) {
-                    return Err(InterpError::Throw(type_error(
-                        "cannot assign to a module namespace property",
-                    )));
+                if !self.set_property_value(modules, &obj, &key, value, &obj)? {
+                    return Err(InterpError::Throw(type_error("property assignment failed")));
                 }
+            }
+            Opcode::DefineDataProperty | Opcode::DefineMethod => {
+                let key = self.top().stack.pop();
+                let object = self.top().stack.pop();
+                let value = self.top().stack.pop();
+                let handle = obj_as_object(&object).cloned().ok_or_else(|| {
+                    InterpError::Throw(type_error("class element base is not an object"))
+                })?;
+                handle.borrow_mut().properties.insert(
+                    prop_name(&key),
+                    PropertyDescriptor::Data {
+                        value,
+                        attr: js_runtime::object::Attribute {
+                            writable: true,
+                            enumerable: ins.op == Opcode::DefineDataProperty,
+                            configurable: true,
+                        },
+                    },
+                );
             }
             Opcode::DefineGetter | Opcode::DefineSetter => {
                 let key = self.top().stack.pop();
                 let object = self.top().stack.pop();
                 let function = self.top().stack.pop();
                 define_accessor(&object, &key, function, ins.op == Opcode::DefineGetter);
+            }
+            Opcode::GetPrivate => {
+                let object = self.top().stack.pop();
+                let private_name = self.private_name(module, ins.operand)?;
+                let descriptor = obj_as_object(&object)
+                    .and_then(|object| object.borrow().private_elements.get(&private_name).cloned())
+                    .ok_or_else(|| {
+                        InterpError::Throw(type_error(
+                            "private member is not declared on this object",
+                        ))
+                    })?;
+                let value = match descriptor {
+                    PropertyDescriptor::Data { value, .. } => value,
+                    PropertyDescriptor::Accessor { get, .. } => match get {
+                        Some(getter) => {
+                            self.call_value(modules, getter, Vec::new(), object.clone())?
+                        }
+                        None => {
+                            return Err(InterpError::Throw(type_error(
+                                "private accessor has no getter",
+                            )))
+                        }
+                    },
+                };
+                self.top().stack.push(value);
+            }
+            Opcode::SetPrivate => {
+                let object = self.top().stack.pop();
+                let value = self.top().stack.pop();
+                let private_name = self.private_name(module, ins.operand)?;
+                let handle = obj_as_object(&object).cloned().ok_or_else(|| {
+                    InterpError::Throw(type_error("private member base is not an object"))
+                })?;
+                let descriptor = handle
+                    .borrow()
+                    .private_elements
+                    .get(&private_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        InterpError::Throw(type_error(
+                            "private member is not declared on this object",
+                        ))
+                    })?;
+                match descriptor {
+                    PropertyDescriptor::Data { attr, .. } if attr.writable => {
+                        handle
+                            .borrow_mut()
+                            .private_elements
+                            .insert(private_name, PropertyDescriptor::Data { value, attr });
+                    }
+                    PropertyDescriptor::Accessor {
+                        set: Some(setter), ..
+                    } => {
+                        self.call_value(modules, setter, vec![value], object)?;
+                    }
+                    _ => {
+                        return Err(InterpError::Throw(type_error(
+                            "private member is not writable",
+                        )))
+                    }
+                }
+            }
+            Opcode::DefinePrivate
+            | Opcode::DefinePrivateMethod
+            | Opcode::DefinePrivateGetter
+            | Opcode::DefinePrivateSetter
+            | Opcode::DefinePrivateMethodTemplate
+            | Opcode::DefinePrivateGetterTemplate
+            | Opcode::DefinePrivateSetterTemplate => {
+                let object = self.top().stack.pop();
+                let value = self.top().stack.pop();
+                let private_name = self.private_name(module, ins.operand)?;
+                define_private_element(&object, private_name, value, ins.op)?;
+            }
+            Opcode::PrivateIn => {
+                let object = self.top().stack.pop();
+                let private_name = self.private_name(module, ins.operand)?;
+                let handle = obj_as_object(&object).ok_or_else(|| {
+                    InterpError::Throw(type_error(
+                        "right-hand side of private `in` is not an object",
+                    ))
+                })?;
+                let present = handle.borrow().private_elements.contains_key(&private_name);
+                self.top().stack.push(Value::boolean(present));
             }
             Opcode::CopyDataProperties => {
                 let source = self.top().stack.pop();
@@ -1277,8 +1676,27 @@ impl Interpreter {
                     self.top().stack.push(value);
                     return Ok(Step::More);
                 }
-                // Construct a fresh object bound as `this`.
-                let this = Value::object(js_runtime::object::ObjectData::new_handle());
+                // Construct a fresh object with the constructor's prototype.
+                let instance = js_runtime::object::ObjectData::new_handle();
+                if let Some(function) = callee.as_function() {
+                    let function_object = function.object.borrow();
+                    instance.borrow_mut().proto = function_object
+                        .properties
+                        .get("prototype")
+                        .and_then(|descriptor| match descriptor {
+                            PropertyDescriptor::Data { value, .. } if value.is_object() => {
+                                Some(value.clone())
+                            }
+                            _ => None,
+                        });
+                }
+                let this = Value::object(instance);
+                if callee
+                    .as_function()
+                    .is_some_and(|function| function.superclass.is_none())
+                {
+                    self.initialize_instance_elements(modules, &callee, &this)?;
+                }
                 set_constructor_chain(&this, &callee);
                 self.invoke(modules, callee, args, this, true);
             }
@@ -1320,12 +1738,18 @@ impl Interpreter {
         self.frames.last_mut().unwrap()
     }
 
-    fn get_property_value(
+    pub(crate) fn get_property_value(
         &mut self,
         modules: &BytecodeGraph<'_>,
         object: &Value,
         key: &Value,
+        receiver: &Value,
     ) -> Result<Value, InterpError> {
+        if let ValueData::String(name) = key.data() {
+            if let Some(value) = crate::builtins::native_static_value(object, &name.0) {
+                return Ok(value);
+            }
+        }
         let Some(handle) = obj_as_object(object) else {
             return get_property_checked(object, key).map_err(binding_error_value);
         };
@@ -1342,9 +1766,12 @@ impl Interpreter {
                             js_runtime::object::PropertyDescriptor::Data { value, .. } => Ok(value),
                             js_runtime::object::PropertyDescriptor::Accessor { get, .. } => {
                                 match get {
-                                    Some(getter) if getter.is_function() => {
-                                        self.call_value(modules, getter, Vec::new(), object.clone())
-                                    }
+                                    Some(getter) if getter.is_function() => self.call_value(
+                                        modules,
+                                        getter,
+                                        Vec::new(),
+                                        receiver.clone(),
+                                    ),
                                     _ => Ok(Value::undefined()),
                                 }
                             }
@@ -1367,7 +1794,7 @@ impl Interpreter {
                     js_runtime::object::PropertyDescriptor::Data { value, .. } => Ok(value),
                     js_runtime::object::PropertyDescriptor::Accessor { get, .. } => match get {
                         Some(getter) if getter.is_function() => {
-                            self.call_value(modules, getter, Vec::new(), object.clone())
+                            self.call_value(modules, getter, Vec::new(), receiver.clone())
                         }
                         _ => Ok(Value::undefined()),
                     },
@@ -1376,6 +1803,71 @@ impl Interpreter {
             current = prototype.as_ref().and_then(obj_as_object).cloned();
         }
         get_property_checked(object, key).map_err(binding_error_value)
+    }
+
+    fn set_property_value(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        object: &Value,
+        key: &Value,
+        value: Value,
+        receiver: &Value,
+    ) -> Result<bool, InterpError> {
+        let Some(handle) = obj_as_object(object).cloned() else {
+            return Ok(set_property_checked(receiver, key, value));
+        };
+        let name = prop_name(key);
+        let mut current = Some(handle);
+        while let Some(candidate) = current {
+            let (descriptor, prototype, namespace) = {
+                let data = candidate.borrow();
+                (
+                    data.properties.get(&name).cloned(),
+                    data.proto.clone(),
+                    data.module_namespace.is_some(),
+                )
+            };
+            if namespace {
+                return Ok(false);
+            }
+            if let Some(descriptor) = descriptor {
+                return match descriptor {
+                    PropertyDescriptor::Accessor {
+                        set: Some(setter), ..
+                    } => {
+                        self.call_value(modules, setter, vec![value], receiver.clone())?;
+                        Ok(true)
+                    }
+                    PropertyDescriptor::Accessor { set: None, .. } => Ok(false),
+                    PropertyDescriptor::Data { attr, .. } if !attr.writable => Ok(false),
+                    PropertyDescriptor::Data { .. } => {
+                        Ok(set_property_checked(receiver, key, value))
+                    }
+                };
+            }
+            current = prototype.as_ref().and_then(obj_as_object).cloned();
+        }
+        Ok(set_property_checked(receiver, key, value))
+    }
+
+    fn initialize_instance_elements(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        constructor: &Value,
+        instance: &Value,
+    ) -> Result<(), InterpError> {
+        let function = constructor.as_function().ok_or_else(|| {
+            InterpError::Internal("instance element owner is not a constructor".into())
+        })?;
+        let templates = function.object.borrow().private_instance_elements.clone();
+        let initializer = function.instance_initializer.as_deref().cloned();
+        let instance_object = obj_as_object(instance)
+            .ok_or_else(|| InterpError::Throw(type_error("constructed value is not an object")))?;
+        install_private_elements(instance_object, &templates)?;
+        if let Some(initializer) = initializer {
+            self.call_value(modules, initializer, Vec::new(), instance.clone())?;
+        }
+        Ok(())
     }
 
     /// Call a JS `callee` with `args`/`this` and run it to completion
@@ -1406,11 +1898,12 @@ impl Interpreter {
                 .as_function()
                 .map(|function| function.module_index as usize)
                 .unwrap_or(0);
-            let module = modules.get(module_index).copied().ok_or_else(|| {
+            let module_ptr = self.module_ptr(modules, module_index).ok_or_else(|| {
                 InterpError::Internal(format!(
                     "PromiseJob callback refers to missing module {module_index}"
                 ))
             })?;
+            let module = unsafe { &*module_ptr };
             self.frames
                 .push(CallFrame::for_module(module_index, 0, 0, module.main.span));
         }
@@ -1448,16 +1941,7 @@ impl Interpreter {
         key: &Value,
         value: Value,
     ) -> Result<(), InterpError> {
-        let (base, receiver) = {
-            let frame = self.frames.last().unwrap();
-            (
-                frame
-                    .super_base
-                    .clone()
-                    .unwrap_or_else(|| frame.this.clone()),
-                frame.this.clone(),
-            )
-        };
+        let (base, receiver) = self.super_property_base()?;
         let name = prop_name(key);
         let setter = obj_as_object(&base).and_then(|object| {
             object
@@ -1490,6 +1974,21 @@ impl Interpreter {
                 "super property assignment failed",
             )))
         }
+    }
+
+    fn super_property_base(&self) -> Result<(Value, Value), InterpError> {
+        let frame = self.frames.last().unwrap();
+        let receiver = self.current_this();
+        let base = if let Some(base) = &frame.super_base {
+            base.clone()
+        } else if let Some(superclass) = &frame.superclass {
+            get_property(superclass, &Value::string("prototype"))
+        } else {
+            return Err(InterpError::Throw(type_error(
+                "super property access has no superclass",
+            )));
+        };
+        Ok((base, receiver))
     }
 
     pub(crate) fn enqueue_promise_job(&mut self, job: PromiseJob) {
@@ -1683,10 +2182,45 @@ impl Interpreter {
             None
         };
         let mut f = JsFunction::new(func.name.clone(), id, func.param_count);
+        let object_prototype = self
+            .ctx
+            .realm
+            .borrow()
+            .globals
+            .get("Object")
+            .map(|object| get_property(object, &Value::string("prototype")));
+        if let Some(object_prototype) = object_prototype {
+            let function_prototype = f.object.borrow().properties.get("prototype").and_then(
+                |descriptor| match descriptor {
+                    PropertyDescriptor::Data { value, .. } => obj_as_object(value).cloned(),
+                    PropertyDescriptor::Accessor { .. } => None,
+                },
+            );
+            if let Some(function_prototype) = function_prototype {
+                function_prototype.borrow_mut().proto = Some(object_prototype);
+            }
+        }
         f.module_index = module_index as u32;
         f.upvalues = upvalues;
         f.this_cell = this_cell;
         f.is_generator = func.is_generator;
+        if is_arrow {
+            f.superclass = self
+                .frames
+                .last()
+                .and_then(|frame| frame.superclass.clone())
+                .map(Box::new);
+        }
+        f.private_brands = self
+            .frames
+            .last()
+            .map(|frame| frame.private_brands.clone())
+            .unwrap_or_default();
+        if !f.private_brands.contains_key(&id) {
+            let brand = self.next_private_brand;
+            self.next_private_brand += 1;
+            f.private_brands.insert(id, brand);
+        }
         f
     }
 
@@ -1698,6 +2232,313 @@ impl Interpreter {
             return c.get().unwrap_or_else(|_| Value::undefined());
         }
         frame.this.clone()
+    }
+
+    /// ECMAScript ToPropertyKey with the String hint. Class computed names use
+    /// this at definition time, so user conversion code and abrupt completion
+    /// cannot be deferred until an instance is created.
+    fn to_property_key_value(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        value: Value,
+    ) -> Result<Value, InterpError> {
+        match value.data() {
+            ValueData::Symbol(_) => return Ok(value),
+            ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_) => {}
+            _ => return Ok(Value::string(to_string(&value))),
+        }
+
+        let object = obj_as_object(&value).cloned();
+        let explicit_null_prototype = object
+            .as_ref()
+            .is_some_and(|object| object.borrow().explicit_null_prototype);
+        let mut had_explicit_conversion = false;
+        for name in ["toString", "valueOf"] {
+            let has_own = object
+                .as_ref()
+                .is_some_and(|object| object.borrow().properties.contains_key(name));
+            had_explicit_conversion |= has_own;
+            let method = self.get_property_value(modules, &value, &Value::string(name), &value)?;
+            if method.as_function().is_none() {
+                continue;
+            }
+            let primitive = self.call_value(modules, method, Vec::new(), value.clone())?;
+            match primitive.data() {
+                ValueData::Symbol(_) => return Ok(primitive),
+                ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_) => {}
+                _ => return Ok(Value::string(to_string(&primitive))),
+            }
+        }
+        if explicit_null_prototype || had_explicit_conversion {
+            Err(InterpError::Throw(type_error(
+                "cannot convert object to property key",
+            )))
+        } else {
+            // Ordinary Object.prototype.toString is represented as a VM
+            // fallback until intrinsic prototype objects are fully wired.
+            Ok(Value::string(to_string(&value)))
+        }
+    }
+
+    /// Parse, compile and execute ECMAScript eval code in the current realm.
+    /// Direct eval additionally inherits `this`, class private brands and the
+    /// syntactic permissions of the active class execution context. Lexical
+    /// binding cells are intentionally kept behind this boundary so the next
+    /// environment-record step can add them without coupling Parser to the VM.
+    pub(crate) fn eval_value(
+        &mut self,
+        modules: &BytecodeGraph<'_>,
+        input: Value,
+        direct: bool,
+    ) -> Result<Value, InterpError> {
+        let source_text = match input.data() {
+            ValueData::String(value) => value.as_str().to_string(),
+            _ => return Ok(input),
+        };
+
+        let mut private_names = HashMap::new();
+        let mut inherited_brands = HashMap::new();
+        let mut this_value = Value::undefined();
+        let mut superclass = None;
+        let mut function_name = "<main>".to_string();
+        let mut outer_bindings: HashMap<String, js_runtime::value::Cell> = HashMap::new();
+        let mut global_var_cells = Vec::new();
+        if direct {
+            let frame = self.frames.last().ok_or_else(|| {
+                InterpError::Internal("direct eval has no active execution context".into())
+            })?;
+            inherited_brands = frame.private_brands.clone();
+            this_value = self.current_this();
+            superclass = frame.superclass.clone();
+            if let Some(module_ptr) = self.module_ptr(modules, frame.module_index) {
+                let module = unsafe { &*module_ptr };
+                let function = func_ref(module, frame.func_index);
+                function_name = function.name.clone();
+                for (name, slot) in function.locals.entries() {
+                    if let Some(cell) = frame.locals.get(slot as usize) {
+                        outer_bindings.insert(name.to_string(), cell.clone());
+                    }
+                }
+                for (name, cell) in function.upvalue_names.iter().zip(&frame.upvalues) {
+                    outer_bindings
+                        .entry(name.clone())
+                        .or_insert_with(|| cell.clone());
+                }
+                for constant in module.constants.items() {
+                    let ValueData::String(encoded) = constant.data() else {
+                        continue;
+                    };
+                    let Some((class_id, description)) = encoded.as_str().split_once('\0') else {
+                        continue;
+                    };
+                    let Ok(class_id) = class_id.parse::<u32>() else {
+                        continue;
+                    };
+                    if inherited_brands.contains_key(&class_id) {
+                        private_names.insert(description.to_string(), class_id);
+                    }
+                }
+            }
+        } else {
+            // Script `var` bindings belong to the Global Environment Record.
+            // The baseline VM stores them in the entry frame for slot speed;
+            // expose those same cells to indirect eval's global environment.
+            for frame in &self.frames {
+                let Some(module_ptr) = self.module_ptr(modules, frame.module_index) else {
+                    continue;
+                };
+                let module = unsafe { &*module_ptr };
+                if frame.func_index != 0 || module.is_module {
+                    continue;
+                }
+                for (name, slot) in module.main.locals.entries() {
+                    if let Some(cell) = frame.locals.get(slot as usize) {
+                        if let Ok(value) = cell.get() {
+                            self.ctx
+                                .realm
+                                .borrow_mut()
+                                .globals
+                                .insert(name.to_string(), value);
+                            global_var_cells.push((name.to_string(), cell.clone()));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        let inside_initializer = function_name == "<class-instance-initializer>"
+            || function_name == "<class-static-initializer>";
+        let parse_context = js_parser::early_errors::EvalContext {
+            strict: direct && !private_names.is_empty(),
+            private_names: private_names.keys().cloned().collect(),
+            allow_super_property: direct && superclass.is_some(),
+            allow_super_call: false,
+            allow_new_target: direct,
+            reject_arguments: direct && inside_initializer,
+        };
+        let source = std::sync::Arc::new(js_syntax::SourceFile::new(
+            "<eval>",
+            std::sync::Arc::<str>::from(source_text.as_str()),
+        ));
+        let sess = js_parser::ParseSess::from_shared(source.clone());
+        let program = js_parser::Parser::new(&sess)
+            .parse_syntax(js_syntax::ProgramKind::Script)
+            .and_then(|program| {
+                let mut errors = js_parser::early_errors::check_eval(&program, &parse_context);
+                for diagnostic in &mut errors {
+                    diagnostic.classify(js_diagnostics::DiagnosticPhase::EarlyError, "JS-EARLY");
+                }
+                if errors.is_empty() {
+                    Ok(program)
+                } else {
+                    Err(errors)
+                }
+            })
+            .map_err(|errors| {
+                let message = errors
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                InterpError::Throw(type_error_named("SyntaxError", &message))
+            })?;
+        let bytecode =
+            js_bytecode::compile_eval_program_with_source(&program, source, private_names, {
+                let mut names: Vec<_> = outer_bindings.keys().cloned().collect();
+                names.sort();
+                names
+            })
+            .map_err(|errors| {
+                let message = errors
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                InterpError::Throw(type_error_named("SyntaxError", &message))
+            })?;
+
+        let mut ordered_bindings: Vec<_> = outer_bindings.into_iter().collect();
+        ordered_bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        let outer_cells = ordered_bindings.into_iter().map(|(_, cell)| cell).collect();
+        let eval_module_index = modules.len() + self.eval_modules.len();
+        self.eval_modules
+            .push((eval_module_index, Box::new(bytecode)));
+        let result = self.run_eval_bytecode(
+            modules,
+            eval_module_index,
+            this_value,
+            inherited_brands,
+            superclass,
+            outer_cells,
+        );
+        for (name, cell) in global_var_cells {
+            if let Some(value) = self.ctx.realm.borrow().globals.get(&name).cloned() {
+                let _ = cell.set(value);
+            }
+        }
+        result
+    }
+
+    fn run_eval_bytecode(
+        &mut self,
+        enclosing_modules: &BytecodeGraph<'_>,
+        eval_module_index: usize,
+        this_value: Value,
+        private_brands: HashMap<u32, u64>,
+        superclass: Option<Value>,
+        outer_cells: Vec<js_runtime::value::Cell>,
+    ) -> Result<Value, InterpError> {
+        let module_ptr = self
+            .module_ptr(enclosing_modules, eval_module_index)
+            .ok_or_else(|| InterpError::Internal("eval bytecode was not retained".into()))?;
+        let module = unsafe { &*module_ptr };
+        js_bytecode::verify_module(module).map_err(|errors| {
+            InterpError::Internal(format!("invalid eval bytecode: {}", errors[0]))
+        })?;
+        let caller_depth = self.frames.len();
+        let mut frame = CallFrame::for_module(
+            eval_module_index,
+            0,
+            module.main.locals.slot_count(),
+            module.main.span,
+        );
+        frame.this = this_value;
+        frame.private_brands = private_brands;
+        frame.superclass = superclass;
+        frame.upvalues = module
+            .main
+            .upvalues
+            .iter()
+            .map(|spec| {
+                if !spec.is_local {
+                    return Err(InterpError::Internal(
+                        "eval outer binding unexpectedly references an upvalue".into(),
+                    ));
+                }
+                outer_cells
+                    .get(spec.index as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        InterpError::Internal(format!(
+                            "eval outer binding slot {} is missing",
+                            spec.index
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.frames.push(frame);
+        while self.frames.len() > caller_depth {
+            match self.step(enclosing_modules) {
+                Ok(Step::More) => {}
+                Ok(Step::Done(value)) => return Ok(value),
+                Ok(Step::Suspend(_)) => {
+                    return Err(InterpError::Internal(
+                        "await is not supported in classic eval code".into(),
+                    ))
+                }
+                Err(error) => match self.handle_exception(enclosing_modules, error, caller_depth) {
+                    Ok(()) => {}
+                    Err(error) => return Err(error),
+                },
+            }
+        }
+        Ok(self.top().stack.pop())
+    }
+
+    fn private_name(
+        &self,
+        module: &BytecodeModule,
+        operand: u16,
+    ) -> Result<js_runtime::object::PrivateName, InterpError> {
+        let encoded = match module.constants.get(operand).data() {
+            ValueData::String(value) => value.as_str(),
+            _ => {
+                return Err(InterpError::Internal(
+                    "private-name operand is not a string constant".into(),
+                ))
+            }
+        };
+        let (class_id, description) = encoded.split_once('\0').ok_or_else(|| {
+            InterpError::Internal("private-name constant has no class identity".into())
+        })?;
+        let class_id = class_id.parse::<u32>().map_err(|_| {
+            InterpError::Internal("private-name constant has an invalid class identity".into())
+        })?;
+        let brand = self
+            .frames
+            .last()
+            .and_then(|frame| frame.private_brands.get(&class_id))
+            .copied()
+            .ok_or_else(|| {
+                InterpError::Internal(format!(
+                    "private environment for class function {class_id} was not captured"
+                ))
+            })?;
+        Ok(js_runtime::object::PrivateName {
+            brand,
+            description: description.to_string(),
+        })
     }
 
     /// Push a new frame for `callee` with the given `this` binding and args.
@@ -1714,13 +2555,24 @@ impl Interpreter {
         let f = match callee.as_function() {
             Some(f) => f.clone(),
             None => {
-                self.top().stack.push(if is_construct {
-                    this
+                self.pending_err = Some(InterpError::Throw(type_error(if is_construct {
+                    "value is not a constructor"
                 } else {
-                    Value::undefined()
-                });
+                    "value is not callable"
+                })));
                 return;
             }
+        };
+        let mut args = args;
+        if !f.bound_args.is_empty() {
+            let mut combined = f.bound_args.clone();
+            combined.extend(args);
+            args = combined;
+        }
+        let this = if is_construct {
+            this
+        } else {
+            f.bound_this.as_deref().cloned().unwrap_or(this)
         };
         // Bound recursion depth: JS calls drive Rust recursion through
         // `step → invoke → call_value → step`, so this prevents a native
@@ -1750,17 +2602,23 @@ impl Interpreter {
                     self.error_trace = prior_trace;
                     self.checkout_generator(gen, arg);
                 }
+                Ok(NativeResult::ResumeAsyncGenerator(gen, arg, promise)) => {
+                    self.error_trace = prior_trace;
+                    self.checkout_generator(gen, arg);
+                    self.top().async_generator_promise = Some(promise);
+                }
                 Err(e) => self.pending_err = Some(e),
             }
             return;
         }
         let module_index = f.module_index as usize;
-        let Some(module) = modules.get(module_index).copied() else {
+        let Some(module_ptr) = self.module_ptr(modules, module_index) else {
             self.pending_err = Some(InterpError::Internal(format!(
                 "function refers to missing bytecode module {module_index}"
             )));
             return;
         };
+        let module = unsafe { &*module_ptr };
         let id = f.id as usize;
         let func = func_ref(module, id);
         // Calling a `function*` creates a generator object (it does not run).
@@ -1773,6 +2631,7 @@ impl Interpreter {
         }
         let (slot_count, param_count, span) = func_meta(module, id);
         let mut nf = CallFrame::for_module(module_index, id, slot_count, span);
+        nf.arguments = args.clone();
         for i in 0..(param_count as usize).min(args.len()) {
             nf.locals[i] = new_cell(args[i].clone());
         }
@@ -1783,7 +2642,10 @@ impl Interpreter {
             nf.this = this;
         }
         nf.is_construct = is_construct;
+        nf.constructor = is_construct.then(|| callee.clone());
         nf.superclass = f.superclass.as_deref().cloned();
+        nf.private_brands = f.private_brands;
+        nf.class_field_keys = f.class_field_keys;
         self.frames.push(nf);
     }
 
@@ -1812,12 +2674,14 @@ impl Interpreter {
             locals,
             stack: Vec::new(),
             upvalues: f.upvalues.clone(),
+            private_brands: f.private_brands.clone(),
             this: if f.this_cell.is_some() {
                 Value::undefined()
             } else {
                 this
             },
             captured_this: f.this_cell.clone(),
+            is_async: func.is_async,
             done: false,
             started: false,
         }
@@ -1836,6 +2700,7 @@ impl Interpreter {
             locals,
             stack,
             upvalues,
+            private_brands,
             this,
             captured_this,
         ) = {
@@ -1857,6 +2722,7 @@ impl Interpreter {
                 std::mem::take(&mut s.locals),
                 std::mem::take(&mut s.stack),
                 std::mem::take(&mut s.upvalues),
+                std::mem::take(&mut s.private_brands),
                 std::mem::replace(&mut s.this, Value::undefined()),
                 s.captured_this.take(),
             )
@@ -1871,6 +2737,7 @@ impl Interpreter {
         frame.pc = pc;
         frame.locals = locals;
         frame.upvalues = upvalues;
+        frame.private_brands = private_brands;
         frame.this = this;
         frame.captured_this = captured_this;
         frame.generator = Some(gen);
@@ -1929,8 +2796,7 @@ fn func_ref<'a>(module: &'a BytecodeModule, index: usize) -> &'a BytecodeFunctio
     }
 }
 
-fn runtime_frame(modules: &BytecodeGraph<'_>, frame: &CallFrame) -> RuntimeFrame {
-    let module = modules[frame.module_index];
+fn runtime_frame(module: &BytecodeModule, frame: &CallFrame) -> RuntimeFrame {
     RuntimeFrame {
         function: func_ref(module, frame.func_index).name.clone(),
         span: frame.span,
@@ -2106,7 +2972,7 @@ pub(crate) fn eq_strict(a: Value, b: Value) -> bool {
         (Boolean(x), Boolean(y)) => x == y,
         (Null, Null) | (Undefined, Undefined) => true,
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
-        (Function(x), Function(y)) => x.id == y.id,
+        (Function(x), Function(y)) => Rc::ptr_eq(&x.object, &y.object),
         (Symbol(x), Symbol(y)) => x.id == y.id,
         (Symbol(_), _) | (_, Symbol(_)) => false,
         _ => false,
@@ -2256,6 +3122,18 @@ pub(crate) fn to_string(v: &Value) -> String {
 fn format_number(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
+    } else if n == f64::INFINITY {
+        "Infinity".to_string()
+    } else if n == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else if n != 0.0 && (n.abs() < 1e-6 || n.abs() >= 1e21) {
+        let scientific = format!("{n:e}");
+        if let Some((mantissa, exponent)) = scientific.split_once('e') {
+            let exponent = exponent.parse::<i32>().unwrap_or(0);
+            format!("{mantissa}e{exponent:+}")
+        } else {
+            scientific
+        }
     } else if n.fract() == 0.0 && n.abs() < 1e21 {
         format!("{}", n as i64)
     } else {
@@ -2500,6 +3378,109 @@ fn define_accessor(object: &Value, key: &Value, function: Value, getter: bool) {
             attr: js_runtime::object::Attribute::writable(),
         },
     );
+}
+
+fn define_private_element(
+    object: &Value,
+    name: js_runtime::object::PrivateName,
+    value: Value,
+    opcode: Opcode,
+) -> Result<(), InterpError> {
+    let handle = obj_as_object(object)
+        .cloned()
+        .ok_or_else(|| InterpError::Throw(type_error("private element base is not an object")))?;
+    let mut data = handle.borrow_mut();
+    let descriptor = match opcode {
+        Opcode::DefinePrivate => PropertyDescriptor::Data {
+            value,
+            attr: js_runtime::object::Attribute {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        },
+        Opcode::DefinePrivateMethod | Opcode::DefinePrivateMethodTemplate => {
+            PropertyDescriptor::Data {
+                value,
+                attr: js_runtime::object::Attribute::read_only(),
+            }
+        }
+        Opcode::DefinePrivateGetter
+        | Opcode::DefinePrivateSetter
+        | Opcode::DefinePrivateGetterTemplate
+        | Opcode::DefinePrivateSetterTemplate => {
+            let templates = matches!(
+                opcode,
+                Opcode::DefinePrivateGetterTemplate | Opcode::DefinePrivateSetterTemplate
+            );
+            let existing = if templates {
+                data.private_instance_elements.remove(&name)
+            } else {
+                data.private_elements.remove(&name)
+            };
+            let (mut get, mut set) = match existing {
+                Some(PropertyDescriptor::Accessor { get, set, .. }) => (get, set),
+                Some(previous) => {
+                    if templates {
+                        data.private_instance_elements.insert(name, previous);
+                    } else {
+                        data.private_elements.insert(name, previous);
+                    }
+                    return Err(InterpError::Throw(type_error(
+                        "private element is already declared",
+                    )));
+                }
+                None => (None, None),
+            };
+            if matches!(
+                opcode,
+                Opcode::DefinePrivateGetter | Opcode::DefinePrivateGetterTemplate
+            ) {
+                get = Some(value);
+            } else {
+                set = Some(value);
+            }
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                attr: js_runtime::object::Attribute::read_only(),
+            }
+        }
+        _ => unreachable!("non-private-definition opcode"),
+    };
+    let previous = if matches!(
+        opcode,
+        Opcode::DefinePrivateMethodTemplate
+            | Opcode::DefinePrivateGetterTemplate
+            | Opcode::DefinePrivateSetterTemplate
+    ) {
+        data.private_instance_elements.insert(name, descriptor)
+    } else {
+        data.private_elements.insert(name, descriptor)
+    };
+    if previous.is_some() {
+        return Err(InterpError::Throw(type_error(
+            "private element is already declared",
+        )));
+    }
+    Ok(())
+}
+
+fn install_private_elements(
+    object: &js_runtime::object::JsObject,
+    elements: &HashMap<js_runtime::object::PrivateName, PropertyDescriptor>,
+) -> Result<(), InterpError> {
+    let mut data = object.borrow_mut();
+    if elements
+        .keys()
+        .any(|name| data.private_elements.contains_key(name))
+    {
+        return Err(InterpError::Throw(type_error(
+            "private element is already installed on this object",
+        )));
+    }
+    data.private_elements.extend(elements.clone());
+    Ok(())
 }
 
 fn set_constructor_chain(object: &Value, constructor: &Value) {
@@ -2753,6 +3734,7 @@ pub(crate) fn array_append(arr: &Value, v: Value) {
 fn obj_as_object(v: &Value) -> Option<&js_runtime::object::JsObject> {
     match v.data() {
         ValueData::Object(o) => Some(o),
+        ValueData::Function(function) => Some(&function.object),
         _ => None,
     }
 }

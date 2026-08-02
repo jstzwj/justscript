@@ -31,6 +31,15 @@ pub struct ConstructorIdentity {
     pub native_id: Option<u16>,
 }
 
+/// Runtime identity of a private name. A fresh brand is allocated every time a
+/// class definition is evaluated; the description only distinguishes private
+/// names declared by that class.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PrivateName {
+    pub brand: u64,
+    pub description: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum PromiseState {
     Pending,
@@ -62,8 +71,18 @@ pub struct ObjectData {
     /// to "dictionary mode" or stores accessors / non-standard attributes.
     pub properties: HashMap<String, PropertyDescriptor>,
     pub symbol_properties: HashMap<u64, PropertyDescriptor>,
+    /// Private fields/methods/accessors, intentionally outside ordinary own
+    /// property storage so reflection and string/symbol property operations
+    /// cannot observe them.
+    pub private_elements: HashMap<PrivateName, PropertyDescriptor>,
+    /// Private methods/accessors created once during class evaluation and
+    /// installed at that class's base/derived instance-initialization boundary.
+    pub private_instance_elements: HashMap<PrivateName, PropertyDescriptor>,
     /// The internal prototype (`[[Prototype]]`), or `None` for the null proto.
     pub proto: Option<Value>,
+    /// Distinguishes `Object.create(null)` from ordinary objects whose
+    /// intrinsic Object prototype is still represented by VM fallback logic.
+    pub explicit_null_prototype: bool,
     /// The object's class name (`[[Class]]`), e.g. `"Object"`, `"Array"`.
     pub class: &'static str,
     /// True for exotic objects such as arrays, functions, etc.

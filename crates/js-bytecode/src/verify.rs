@@ -10,7 +10,7 @@ use std::fmt;
 
 /// Version of the in-memory bytecode contract. This is intentionally separate
 /// from any future serialized file-format version.
-pub const BYTECODE_FORMAT_VERSION: u32 = 2;
+pub const BYTECODE_FORMAT_VERSION: u32 = 12;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifyError {
@@ -70,6 +70,17 @@ fn verify_function(
             ),
         });
     }
+    if function.upvalues.len() != function.upvalue_names.len() {
+        errors.push(VerifyError {
+            function: function_id,
+            pc: None,
+            message: format!(
+                "upvalue/name length mismatch: {} != {}",
+                function.upvalues.len(),
+                function.upvalue_names.len()
+            ),
+        });
+    }
 
     for (pc, instruction) in function.code.iter().enumerate() {
         let operand = instruction.operand as usize;
@@ -84,6 +95,7 @@ fn verify_function(
             OperandKind::JumpTarget => operand <= function.code.len(),
             OperandKind::ArgumentCount => true,
             OperandKind::Handler => operand < function.handlers.len(),
+            OperandKind::ClassField => true,
         };
         if !valid {
             errors.push(VerifyError {

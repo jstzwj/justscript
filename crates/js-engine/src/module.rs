@@ -247,7 +247,7 @@ pub(crate) struct RuntimeModule {
     pub metadata: ModuleMetadata,
     pub dependencies: HashMap<String, usize>,
     pub dynamic_dependencies: HashMap<String, DynamicResolution>,
-    pub locals: Vec<Cell>,
+    pub environment: ModuleEnvironment,
     pub namespace: Option<Value>,
     pub namespace_cell: Cell,
     pub deferred_namespace: Option<Value>,
@@ -258,6 +258,35 @@ pub(crate) struct RuntimeModule {
     pub evaluation_value: Option<Value>,
     pub evaluation_error: Option<Value>,
     pub dynamic_import_waiters: Vec<js_runtime::object::JsObject>,
+}
+
+/// Slot-backed Module Environment Record.
+///
+/// Bytecode addresses bindings by slot, while linking operates on live cells.
+/// This type is the boundary between those representations: direct bindings
+/// are allocated when the module record is created and import bindings replace
+/// their reserved slot with an immutable indirect cell during instantiation.
+#[derive(Clone)]
+pub(crate) struct ModuleEnvironment {
+    bindings: Vec<Cell>,
+}
+
+impl ModuleEnvironment {
+    pub fn binding(&self, slot: usize) -> Cell {
+        self.bindings[slot].clone()
+    }
+
+    pub fn cells(&self) -> &[Cell] {
+        &self.bindings
+    }
+
+    pub fn snapshot(&self) -> Vec<Cell> {
+        self.bindings.clone()
+    }
+
+    pub fn create_import_binding(&mut self, slot: usize, target: Cell) {
+        self.bindings[slot] = Cell::immutable_import(target);
+    }
 }
 
 #[derive(Default)]
@@ -390,10 +419,18 @@ fn analyze_export(
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| js_bytecode::DEFAULT_EXPORT_LOCAL.to_string());
+            let local_slot = local_slot(bytecode, module, &local)?;
             metadata.exports.push(ExportEntry::Local {
                 exported: "default".into(),
-                local_slot: local_slot(bytecode, module, &local)?,
+                local_slot,
             });
+            // An anonymous default class uses the synthetic `*default*`
+            // binding, which is created during instantiation but remains in
+            // the TDZ until ClassDeclaration evaluation. Anonymous default
+            // functions are initialized earlier by declaration instantiation.
+            if matches!(decl.as_ref(), Decl::Class(class) if class.name.is_none()) {
+                metadata.uninitialized_slots.insert(local_slot);
+            }
             analyze_lexical_bindings(decl, bytecode, metadata);
         }
         ExportSpec::Decl(decl) => {
@@ -527,11 +564,11 @@ fn collect_pattern_names(pattern: &Pat, names: &mut Vec<String>) {
     }
 }
 
-pub(crate) fn fresh_module_cells(
+pub(crate) fn fresh_module_environment(
     bytecode: &BytecodeModule,
     metadata: &ModuleMetadata,
-) -> Vec<Cell> {
-    (0..bytecode.main.locals.slot_count())
+) -> ModuleEnvironment {
+    let bindings = (0..bytecode.main.locals.slot_count())
         .map(|slot| {
             if metadata.uninitialized_slots.contains(&usize::from(slot)) {
                 Cell::uninitialized(!metadata.immutable_slots.contains(&usize::from(slot)))
@@ -539,7 +576,8 @@ pub(crate) fn fresh_module_cells(
                 Cell::mutable(Value::undefined())
             }
         })
-        .collect()
+        .collect();
+    ModuleEnvironment { bindings }
 }
 
 fn normalize_key(key: &str) -> String {

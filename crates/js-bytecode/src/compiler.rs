@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 /// Compile a parsed [`Program`] into a [`BytecodeModule`].
 pub fn compile_program(program: &Program) -> DiagResult<BytecodeModule> {
-    compile_program_inner(program, None)
+    compile_program_inner(program, None, Vec::new(), Vec::new())
 }
 
 /// Compile a program while retaining its source for runtime diagnostics.
@@ -33,12 +33,31 @@ pub fn compile_program_with_source(
     program: &Program,
     source: Arc<SourceFile>,
 ) -> DiagResult<BytecodeModule> {
-    compile_program_inner(program, Some(source))
+    compile_program_inner(program, Some(source), Vec::new(), Vec::new())
+}
+
+/// Compile runtime eval code with the caller's active private-name
+/// environment. The numeric class identities deliberately remain unchanged so
+/// the temporary eval frame can reuse the caller's runtime brands.
+pub fn compile_eval_program_with_source(
+    program: &Program,
+    source: Arc<SourceFile>,
+    private_names: std::collections::HashMap<String, u32>,
+    outer_bindings: Vec<String>,
+) -> DiagResult<BytecodeModule> {
+    let private_scopes = if private_names.is_empty() {
+        Vec::new()
+    } else {
+        vec![private_names]
+    };
+    compile_program_inner(program, Some(source), private_scopes, outer_bindings)
 }
 
 fn compile_program_inner(
     program: &Program,
     source: Option<Arc<SourceFile>>,
+    private_scopes: Vec<std::collections::HashMap<String, u32>>,
+    outer_bindings: Vec<String>,
 ) -> DiagResult<BytecodeModule> {
     let mut ctx = CompilerCtx {
         constants: ConstantPool::new(),
@@ -46,10 +65,20 @@ fn compile_program_inner(
         errors: Vec::new(),
         loops: Vec::new(),
         scopes: Vec::new(),
+        private_scopes,
+        is_module: program.kind == js_syntax::ast::ProgramKind::Module,
         module_function_initializers: Vec::new(),
         dynamic_import_requests: Vec::new(),
     };
-    // <main> is its own (outermost) scope.
+    // Direct eval has a synthetic outer scope whose slot indices correspond to
+    // the caller-provided binding cells. Ordinary programs start at <main>.
+    if !outer_bindings.is_empty() {
+        let mut outer = Scope::default();
+        for (index, name) in outer_bindings.into_iter().enumerate() {
+            outer.locals.insert(name, index as u16);
+        }
+        ctx.scopes.push(outer);
+    }
     ctx.scopes.push(Scope::default());
     let mut main = BytecodeFunction::new(program.span, "<main>", 0);
 
@@ -73,6 +102,23 @@ fn compile_program_inner(
     // Top-level completion value: the last expression statement leaves its
     // value on the stack; `Return` pops it (or undefined if empty).
     main.emit_bare_at(Opcode::Return, program.span);
+
+    main.upvalues = ctx
+        .scopes
+        .last()
+        .unwrap()
+        .upvalues
+        .iter()
+        .map(|binding| binding.spec)
+        .collect();
+    main.upvalue_names = ctx
+        .scopes
+        .last()
+        .unwrap()
+        .upvalues
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect();
 
     if !ctx.errors.is_empty() {
         for diagnostic in &mut ctx.errors {
@@ -103,7 +149,7 @@ fn compile_block(
     for item in items {
         match item {
             js_syntax::ast::ProgramItem::Stmt(s) => compile_stmt(s, func, ctx, top_level),
-            js_syntax::ast::ProgramItem::Decl(d) => compile_decl(d, func, ctx),
+            js_syntax::ast::ProgramItem::Decl(d) => compile_decl(d, func, ctx, top_level),
         }
     }
 }
@@ -135,7 +181,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
             }
             func.emit_bare(Opcode::Return);
         }
-        Stmt::Decl(d) => compile_decl(d, func, ctx),
+        Stmt::Decl(d) => compile_decl(d, func, ctx, false),
         Stmt::If {
             test, cons, alt, ..
         } => {
@@ -187,7 +233,7 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
         } => {
             // Initializer.
             match init {
-                Some(ForInit::Var(d)) => compile_decl(d, func, ctx),
+                Some(ForInit::Var(d)) => compile_decl(d, func, ctx, false),
                 Some(ForInit::Expr(e)) => {
                     compile_expr(e, func, ctx);
                     func.emit_bare(Opcode::Pop);
@@ -323,13 +369,16 @@ fn compile_stmt(stmt: &Stmt, func: &mut BytecodeFunction, ctx: &mut CompilerCtx,
     func.annotate_since(start_pc, stmt.span());
 }
 
-fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+fn compile_decl(
+    decl: &Decl,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+    module_level: bool,
+) {
     let start_pc = func.code.len();
     match decl {
         Decl::Var {
-            kind: _,
-            declarations,
-            ..
+            kind, declarations, ..
         } => {
             for d in declarations {
                 // Ensure the pattern's binding names are in scope (idempotent;
@@ -338,12 +387,17 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 if let Some(init) = &d.init {
                     compile_expr(init, func, ctx); // [value]
                     bind_pattern(&d.name, func, ctx); // consumes
+                } else if !matches!(kind, js_syntax::ast::stmt::VarKind::Var) {
+                    // Lexical declarations are initialized when evaluation
+                    // reaches the declaration, even without an initializer.
+                    func.emit_bare(Opcode::LdaUndefined);
+                    bind_pattern(&d.name, func, ctx);
                 }
             }
         }
-        Decl::Function(f) => compile_function_decl(f, func, ctx),
+        Decl::Function(f) => compile_function_decl(f, func, ctx, module_level),
         Decl::Class(c) => {
-            let id = compile_class_value(
+            let class = compile_class_value(
                 c.span,
                 c.name.as_deref(),
                 &c.body,
@@ -352,13 +406,7 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 ctx,
             );
             if let Some(name) = &c.name {
-                if let Some(superclass) = &c.superclass {
-                    compile_expr(superclass, func, ctx);
-                }
-                func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
-                if c.superclass.is_some() {
-                    func.emit_bare(Opcode::SetClassHeritage);
-                }
+                emit_class_value(class, c.superclass.as_deref(), func, ctx);
                 let slot = ctx.declare_local(func, name);
                 func.emit(Instruction::new(Opcode::StaLocal, slot));
             }
@@ -366,24 +414,29 @@ fn compile_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Decl::Import { .. } => {}
         Decl::Export { spec, .. } => match spec {
             ExportSpec::Named { .. } | ExportSpec::All { .. } | ExportSpec::ReExport { .. } => {}
-            ExportSpec::Decl(inner) => compile_decl(inner, func, ctx),
+            ExportSpec::Decl(inner) => compile_decl(inner, func, ctx, module_level),
             ExportSpec::Default(expr) => {
-                compile_expr(expr, func, ctx);
+                compile_named_evaluation(expr, "default", func, ctx);
                 let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
                 func.emit(Instruction::new(Opcode::StaLocal, slot));
             }
-            ExportSpec::DefaultDecl(inner) => compile_default_decl(inner, func, ctx),
+            ExportSpec::DefaultDecl(inner) => compile_default_decl(inner, func, ctx, module_level),
         },
     }
     func.annotate_since(start_pc, decl.span());
 }
 
-fn compile_default_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+fn compile_default_decl(
+    decl: &Decl,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+    module_level: bool,
+) {
     match decl {
         Decl::Function(function) if function.name.is_none() => {
             let id = compile_function_value(
                 function.span,
-                None,
+                Some("default"),
                 &function.params,
                 FunctionBody::Block(&function.body),
                 false,
@@ -392,37 +445,37 @@ fn compile_default_decl(decl: &Decl, func: &mut BytecodeFunction, ctx: &mut Comp
                 func,
                 ctx,
             );
-            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
             let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
-            if ctx.scopes.len() == 1 {
+            if module_level && ctx.is_module {
                 ctx.module_function_initializers.push((slot, id));
+            } else {
+                func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+                func.emit(Instruction::new(Opcode::StaLocal, slot));
             }
-            func.emit(Instruction::new(Opcode::StaLocal, slot));
         }
         Decl::Class(class) if class.name.is_none() => {
-            let id = compile_class_value(
+            let compiled = compile_class_value(
                 class.span,
-                None,
+                Some("default"),
                 &class.body,
                 class.superclass.as_deref(),
                 func,
                 ctx,
             );
-            if let Some(superclass) = &class.superclass {
-                compile_expr(superclass, func, ctx);
-            }
-            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
-            if class.superclass.is_some() {
-                func.emit_bare(Opcode::SetClassHeritage);
-            }
+            emit_class_value(compiled, class.superclass.as_deref(), func, ctx);
             let slot = ctx.declare_local(func, crate::module::DEFAULT_EXPORT_LOCAL);
             func.emit(Instruction::new(Opcode::StaLocal, slot));
         }
-        _ => compile_decl(decl, func, ctx),
+        _ => compile_decl(decl, func, ctx, module_level),
     }
 }
 
-fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+fn compile_function_decl(
+    f: &FunctionDecl,
+    parent: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+    module_level: bool,
+) {
     let id = compile_function_value(
         f.span,
         f.name.as_deref(),
@@ -436,12 +489,13 @@ fn compile_function_decl(f: &FunctionDecl, parent: &mut BytecodeFunction, ctx: &
     );
     // Bind the function by name in the enclosing scope.
     if let Some(name) = &f.name {
-        parent.emit(Instruction::new(Opcode::LdaFunction, id as u16));
         let slot = ctx.declare_local(parent, name);
-        if ctx.scopes.len() == 1 {
+        if module_level && ctx.is_module {
             ctx.module_function_initializers.push((slot, id));
+        } else {
+            parent.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+            parent.emit(Instruction::new(Opcode::StaLocal, slot));
         }
-        parent.emit(Instruction::new(Opcode::StaLocal, slot));
     }
 }
 
@@ -511,6 +565,7 @@ fn compile_function_value(
             ctx.declare_local(&mut nested, &n);
         }
     }
+    capture_visible_environment(ctx);
 
     // Destructure pattern parameters at function entry: each scratch slot
     // holds the passed argument; spread its contents into the inner bindings.
@@ -541,6 +596,14 @@ fn compile_function_value(
         .map(|b| b.spec)
         .collect();
     nested.upvalues = upvalues;
+    nested.upvalue_names = ctx
+        .scopes
+        .last()
+        .unwrap()
+        .upvalues
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect();
     nested.annotate_since(0, span);
 
     ctx.scopes.pop();
@@ -548,89 +611,66 @@ fn compile_function_value(
     id
 }
 
-/// Compile a class into a *constructor function* and return its table id.
-///
-/// Lowering (milestone): each non-static method is compiled as a nested
-/// function and assigned onto `this` inside the constructor (`this.m = <fn>`),
-/// and non-static field initializers run as `this.f = <init>` at the top of the
-/// constructor body, before the user-written constructor body. `new C(...)`
-/// therefore yields an instance carrying its own methods, so `inst.m()` binds
-/// `this = inst` via method-call. Inheritance (`extends`/`super`) is not yet
-/// supported.
+struct CompiledClass {
+    constructor: u32,
+    instance_initializer: Option<u32>,
+    static_initializer: Option<u32>,
+    computed_keys: Vec<Expr>,
+    private_scope: std::collections::HashMap<String, u32>,
+}
+
+/// Compile a class into its constructor and hidden element initializers.
 fn compile_class_value(
     span: js_syntax::Span,
     name: Option<&str>,
     members: &[js_syntax::ast::expr::ClassMember],
     superclass: Option<&Expr>,
-    func: &mut BytecodeFunction,
+    parent: &mut BytecodeFunction,
     ctx: &mut CompilerCtx,
-) -> u32 {
-    let _ = superclass;
-
+) -> CompiledClass {
     use js_syntax::ast::expr::{ClassMemberKind, ClassMemberValue};
 
     // Locate the user constructor, if any.
     let mut ctor_params: Vec<Pat> = Vec::new();
     let mut ctor_body: Vec<Stmt> = Vec::new();
+    let mut has_constructor = false;
     for m in members {
         if matches!(m.kind, ClassMemberKind::Constructor) {
             if let ClassMemberValue::Method(f) = &m.value {
+                has_constructor = true;
                 ctor_params = f.params.clone();
                 ctor_body = f.body.clone();
             }
         }
     }
 
-    // Compile non-static methods (except the constructor) as nested functions.
-    let mut methods: Vec<(js_syntax::ast::pat::PropKey, bool, ClassMemberKind, u32)> = Vec::new();
-    for m in members {
-        if m.static_ {
-            ctx.errors.push(Diagnostic::error(
-                m.span,
-                "static class members are not supported yet",
-            ));
-            continue;
-        }
-        if matches!(m.kind, ClassMemberKind::Constructor) {
-            continue;
-        }
-        if let ClassMemberValue::Method(f) = &m.value {
-            let mname = match &m.key {
-                js_syntax::ast::pat::PropKey::Ident(n)
-                | js_syntax::ast::pat::PropKey::String(n)
-                | js_syntax::ast::pat::PropKey::Private(n) => Some(n.as_str()),
-                _ => None,
-            };
-            let id = compile_function_value(
-                f.span,
-                mname,
-                &f.params,
-                FunctionBody::Block(&f.body),
-                false,
-                f.is_async,
-                f.is_generator,
-                func,
-                ctx,
-            );
-            methods.push((m.key.clone(), m.computed, m.kind, id));
-        }
-    }
-
-    // Field initializers (non-static).
-    let mut fields: Vec<(js_syntax::ast::pat::PropKey, bool, Option<Expr>)> = Vec::new();
-    for m in members {
-        if m.static_ {
-            continue;
-        }
-        if let ClassMemberValue::Field(init) = &m.value {
-            fields.push((m.key.clone(), m.computed, init.clone()));
-        }
-    }
-
-    // Build the constructor function: its body sets up fields + methods, then
-    // runs the user constructor body.
+    // Reserve the constructor id before compiling any element. It is also the
+    // stable class-definition component of every private brand in this class.
     let id = (ctx.functions.len() + 1) as u32;
     ctx.functions.push(BytecodeFunction::default());
+    let private_names: std::collections::HashMap<_, _> = members
+        .iter()
+        .filter_map(|member| match &member.key {
+            js_syntax::ast::pat::PropKey::Private(name) => Some((name.clone(), id)),
+            _ => None,
+        })
+        .collect();
+    ctx.private_scopes.push(private_names.clone());
+    let mut computed_keys = Vec::new();
+    let computed_indices: Vec<_> = members
+        .iter()
+        .map(|member| match &member.key {
+            js_syntax::ast::pat::PropKey::Computed(expression) => {
+                let index = computed_keys.len() as u16;
+                computed_keys.push(expression.as_ref().clone());
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Build the user-visible constructor body. Instance fields execute through
+    // a separate initializer at the base/derived construction boundary.
     let fname = name.unwrap_or("<class>").to_string();
     let mut ctor = BytecodeFunction::new(span, fname, 0);
     ctx.scopes.push(Scope::default());
@@ -655,29 +695,10 @@ fn compile_class_value(
             ctx.declare_local(&mut ctor, &n);
         }
     }
+    capture_visible_environment(ctx);
 
-    // Field initializers: `this.f = <init>` (skipped if no initializer).
-    for (key, computed, init) in &fields {
-        if let Some(init) = init {
-            compile_expr(init, &mut ctor, ctx); // [v]
-            ctor.emit_bare(Opcode::Dup); // [v, v]
-            ctor.emit_bare(Opcode::LdaThis); // [v, v, this]
-            compile_prop_key_push(key, *computed, &mut ctor, ctx); // [v, v, this, key]
-            ctor.emit_bare(Opcode::SetProp); // [v]
-            ctor.emit_bare(Opcode::Pop);
-        }
-    }
-    // Method assignments: `this.m = <fn>`.
-    for (key, computed, kind, mid) in &methods {
-        ctor.emit(Instruction::new(Opcode::LdaFunction, *mid as u16)); // [fn]
-        ctor.emit_bare(Opcode::Dup); // [fn, fn]
-        ctor.emit_bare(Opcode::LdaThis); // [fn, fn, this]
-        compile_prop_key_push(key, *computed, &mut ctor, ctx); // [fn, fn, this, key]
-        ctor.emit_bare(match kind {
-            ClassMemberKind::Get => Opcode::DefineGetter,
-            ClassMemberKind::Set => Opcode::DefineSetter,
-            _ => Opcode::SetProp,
-        }); // [fn]
+    if superclass.is_some() && !has_constructor {
+        ctor.emit(Instruction::new(Opcode::CallSuper, u16::MAX));
         ctor.emit_bare(Opcode::Pop);
     }
 
@@ -696,9 +717,324 @@ fn compile_class_value(
         .map(|b| b.spec)
         .collect();
     ctor.upvalues = upvalues;
+    ctor.upvalue_names = ctx
+        .scopes
+        .last()
+        .unwrap()
+        .upvalues
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect();
     ctx.scopes.pop();
     ctx.functions[id as usize - 1] = ctor;
-    id
+
+    let has_instance_fields = members
+        .iter()
+        .any(|member| !member.static_ && matches!(member.value, ClassMemberValue::Field(_)));
+    let instance_initializer = has_instance_fields.then(|| {
+        let initializer_id = (ctx.functions.len() + 1) as u32;
+        ctx.functions.push(BytecodeFunction::default());
+        let mut initializer = BytecodeFunction::new(span, "<class-instance-initializer>", 0);
+        ctx.scopes.push(Scope::default());
+        capture_visible_environment(ctx);
+        for (member_index, member) in members.iter().enumerate() {
+            if member.static_ {
+                continue;
+            }
+            if let ClassMemberValue::Field(field) = &member.value {
+                match field {
+                    Some(expression) => {
+                        compile_expr(expression, &mut initializer, ctx);
+                        emit_field_function_name(expression, member, &mut initializer, ctx);
+                    }
+                    None => initializer.emit_bare(Opcode::LdaUndefined),
+                }
+                initializer.emit_bare(Opcode::LdaThis);
+                emit_class_element_definition(
+                    member,
+                    computed_indices[member_index],
+                    &mut initializer,
+                    ctx,
+                    false,
+                );
+            }
+        }
+        initializer.emit_bare_at(Opcode::LdaUndefined, span);
+        initializer.emit_bare_at(Opcode::Return, span);
+        initializer.annotate_since(0, span);
+        initializer.upvalues = ctx
+            .scopes
+            .last()
+            .unwrap()
+            .upvalues
+            .iter()
+            .map(|binding| binding.spec)
+            .collect();
+        initializer.upvalue_names = ctx
+            .scopes
+            .last()
+            .unwrap()
+            .upvalues
+            .iter()
+            .map(|binding| binding.name.clone())
+            .collect();
+        ctx.scopes.pop();
+        ctx.functions[initializer_id as usize - 1] = initializer;
+        initializer_id
+    });
+
+    let has_static_elements = members.iter().any(|member| {
+        member.static_
+            || matches!(member.value, ClassMemberValue::StaticBlock(_))
+            || matches!(member.value, ClassMemberValue::Method(_))
+                && !matches!(member.kind, ClassMemberKind::Constructor)
+    });
+    let static_initializer = has_static_elements.then(|| {
+        let initializer_id = (ctx.functions.len() + 1) as u32;
+        ctx.functions.push(BytecodeFunction::default());
+        let mut initializer = BytecodeFunction::new(span, "<class-static-initializer>", 0);
+        ctx.scopes.push(Scope::default());
+
+        let mut names = Vec::new();
+        for member in members {
+            if let ClassMemberValue::StaticBlock(body) = &member.value {
+                collect_bindings(body, &mut names);
+            }
+        }
+        for name in names {
+            ctx.declare_local(&mut initializer, &name);
+        }
+        capture_visible_environment(ctx);
+
+        let mut class_methods = Vec::new();
+        for (member_index, member) in members.iter().enumerate() {
+            if matches!(member.kind, ClassMemberKind::Constructor) {
+                continue;
+            }
+            if let ClassMemberValue::Method(method) = &member.value {
+                let method_name = match &member.key {
+                    js_syntax::ast::pat::PropKey::Ident(name)
+                    | js_syntax::ast::pat::PropKey::String(name) => Some(name.clone()),
+                    js_syntax::ast::pat::PropKey::Private(name) => Some(format!("#{name}")),
+                    _ => None,
+                };
+                let method_id = compile_function_value(
+                    method.span,
+                    method_name.as_deref(),
+                    &method.params,
+                    FunctionBody::Block(&method.body),
+                    false,
+                    method.is_async,
+                    method.is_generator,
+                    &mut initializer,
+                    ctx,
+                );
+                class_methods.push((member, computed_indices[member_index], method_id));
+            }
+        }
+        for (member, computed_key, method_id) in class_methods {
+            initializer.emit(Instruction::new(Opcode::LdaFunction, method_id as u16));
+            initializer.emit_bare(Opcode::LdaThis);
+            if member.static_ {
+                emit_class_element_definition(member, computed_key, &mut initializer, ctx, true);
+            } else {
+                emit_instance_method_definition(member, computed_key, &mut initializer, ctx);
+            }
+        }
+        for (member_index, member) in members.iter().enumerate() {
+            match &member.value {
+                ClassMemberValue::Field(field) if member.static_ => {
+                    match field {
+                        Some(expression) => {
+                            compile_expr(expression, &mut initializer, ctx);
+                            emit_field_function_name(expression, member, &mut initializer, ctx);
+                        }
+                        None => initializer.emit_bare(Opcode::LdaUndefined),
+                    }
+                    initializer.emit_bare(Opcode::LdaThis);
+                    emit_class_element_definition(
+                        member,
+                        computed_indices[member_index],
+                        &mut initializer,
+                        ctx,
+                        false,
+                    );
+                }
+                ClassMemberValue::StaticBlock(body) => {
+                    compile_stmt_list_body(body, &mut initializer, ctx)
+                }
+                _ => {}
+            }
+        }
+        initializer.emit_bare_at(Opcode::LdaUndefined, span);
+        initializer.emit_bare_at(Opcode::Return, span);
+        initializer.annotate_since(0, span);
+        initializer.upvalues = ctx
+            .scopes
+            .last()
+            .unwrap()
+            .upvalues
+            .iter()
+            .map(|binding| binding.spec)
+            .collect();
+        initializer.upvalue_names = ctx
+            .scopes
+            .last()
+            .unwrap()
+            .upvalues
+            .iter()
+            .map(|binding| binding.name.clone())
+            .collect();
+        ctx.scopes.pop();
+        ctx.functions[initializer_id as usize - 1] = initializer;
+        initializer_id
+    });
+
+    ctx.private_scopes.pop();
+    let _ = parent;
+    CompiledClass {
+        constructor: id,
+        instance_initializer,
+        static_initializer,
+        computed_keys,
+        private_scope: private_names,
+    }
+}
+
+fn emit_field_function_name(
+    expression: &Expr,
+    member: &js_syntax::ast::expr::ClassMember,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    let expression = match expression {
+        Expr::Paren { expr, .. } => expr.as_ref(),
+        expression => expression,
+    };
+    let anonymous = match expression {
+        Expr::Function(function) => function.name.is_none(),
+        Expr::Arrow(_) => true,
+        Expr::Class(class) => class.name.is_none(),
+        _ => false,
+    };
+    if !anonymous {
+        return;
+    }
+    let name = match &member.key {
+        js_syntax::ast::pat::PropKey::Ident(name) | js_syntax::ast::pat::PropKey::String(name) => {
+            name.clone()
+        }
+        js_syntax::ast::pat::PropKey::Private(name) => format!("#{name}"),
+        _ => return,
+    };
+    let name = ctx.constants.intern_str(name);
+    func.emit(Instruction::new(Opcode::SetFunctionName, name));
+}
+
+fn emit_instance_method_definition(
+    member: &js_syntax::ast::expr::ClassMember,
+    computed_key: Option<u16>,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    use js_syntax::ast::expr::ClassMemberKind;
+    if let js_syntax::ast::pat::PropKey::Private(name) = &member.key {
+        let private = ctx.private_name_constant(name, member.span);
+        let opcode = match member.kind {
+            ClassMemberKind::Get => Opcode::DefinePrivateGetterTemplate,
+            ClassMemberKind::Set => Opcode::DefinePrivateSetterTemplate,
+            _ => Opcode::DefinePrivateMethodTemplate,
+        };
+        func.emit(Instruction::new(opcode, private));
+        return;
+    }
+
+    let prototype = ctx.constants.intern_str("prototype");
+    func.emit(Instruction::new(Opcode::LdaConst, prototype));
+    func.emit_bare(Opcode::GetProp);
+    emit_class_element_key(member, computed_key, func, ctx);
+    func.emit_bare(match member.kind {
+        ClassMemberKind::Get => Opcode::DefineGetter,
+        ClassMemberKind::Set => Opcode::DefineSetter,
+        _ => Opcode::DefineMethod,
+    });
+}
+
+fn emit_class_element_definition(
+    member: &js_syntax::ast::expr::ClassMember,
+    computed_key: Option<u16>,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+    method: bool,
+) {
+    use js_syntax::ast::expr::ClassMemberKind;
+    if let js_syntax::ast::pat::PropKey::Private(name) = &member.key {
+        let private = ctx.private_name_constant(name, member.span);
+        let opcode = match member.kind {
+            ClassMemberKind::Get => Opcode::DefinePrivateGetter,
+            ClassMemberKind::Set => Opcode::DefinePrivateSetter,
+            _ if method => Opcode::DefinePrivateMethod,
+            _ => Opcode::DefinePrivate,
+        };
+        func.emit(Instruction::new(opcode, private));
+    } else {
+        emit_class_element_key(member, computed_key, func, ctx);
+        func.emit_bare(match member.kind {
+            ClassMemberKind::Get => Opcode::DefineGetter,
+            ClassMemberKind::Set => Opcode::DefineSetter,
+            _ if method => Opcode::DefineMethod,
+            _ => Opcode::DefineDataProperty,
+        });
+    }
+}
+
+fn emit_class_element_key(
+    member: &js_syntax::ast::expr::ClassMember,
+    computed_key: Option<u16>,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    if let Some(index) = computed_key {
+        func.emit(Instruction::new(Opcode::LoadClassFieldKey, index));
+    } else {
+        compile_prop_key_push(&member.key, member.computed, func, ctx);
+    }
+}
+
+fn emit_class_value(
+    class: CompiledClass,
+    superclass: Option<&Expr>,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    if let Some(superclass) = superclass {
+        compile_expr(superclass, func, ctx);
+    }
+    func.emit(Instruction::new(
+        Opcode::LdaFunction,
+        class.constructor as u16,
+    ));
+    if let Some(initializer) = class.instance_initializer {
+        func.emit(Instruction::new(Opcode::LdaFunction, initializer as u16));
+        func.emit_bare(Opcode::SetClassInstanceInitializer);
+    }
+    if superclass.is_some() {
+        func.emit_bare(Opcode::SetClassHeritage);
+    }
+    func.emit_bare(Opcode::ActivateClassPrivateEnvironment);
+    ctx.private_scopes.push(class.private_scope);
+    for expression in &class.computed_keys {
+        func.emit_bare(Opcode::Dup);
+        compile_expr(expression, func, ctx);
+        func.emit_bare(Opcode::DefineClassFieldKey);
+    }
+    ctx.private_scopes.pop();
+    if let Some(initializer) = class.static_initializer {
+        func.emit_bare(Opcode::Dup);
+        func.emit(Instruction::new(Opcode::LdaFunction, initializer as u16));
+        func.emit(Instruction::new(Opcode::CallMethod, 0));
+        func.emit_bare(Opcode::Pop);
+    }
 }
 
 /// Compile a function body (a `Vec<Stmt>`).
@@ -718,6 +1054,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         Expr::Paren { expr, .. } => compile_expr(expr, func, ctx),
         Expr::Unary { op, arg, .. } => match op {
             js_syntax::ast::op::UnaryOp::Delete => compile_delete(arg, func, ctx),
+            js_syntax::ast::op::UnaryOp::Typeof => compile_typeof(arg, func, ctx),
             _ => {
                 compile_expr(arg, func, ctx);
                 func.emit_bare(
@@ -732,12 +1069,12 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(right, func, ctx);
             emit_binop(*op, func);
         }
-        Expr::PrivateIn { right, .. } => {
+        Expr::PrivateIn {
+            name, right, span, ..
+        } => {
             compile_expr(right, func, ctx);
-            ctx.errors.push(Diagnostic::error(
-                expr.span(),
-                "private brand checks are not supported by bytecode compilation yet",
-            ));
+            let private = ctx.private_name_constant(name, *span);
+            func.emit(Instruction::new(Opcode::PrivateIn, private));
         }
         Expr::Logical {
             op, left, right, ..
@@ -892,9 +1229,19 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             }
         }
         Expr::Member(m) => {
-            compile_expr(&m.object, func, ctx);
-            compile_member_key_push(&m.property, func, ctx);
-            func.emit_bare(Opcode::GetProp);
+            if matches!(m.object.as_ref(), Expr::Super(_)) {
+                compile_member_key_push(&m.property, func, ctx);
+                func.emit_bare(Opcode::GetSuperProp);
+            } else {
+                compile_expr(&m.object, func, ctx);
+                if let MemberProp::Private(name) = &m.property {
+                    let private = ctx.private_name_constant(name, m.span);
+                    func.emit(Instruction::new(Opcode::GetPrivate, private));
+                } else {
+                    compile_member_key_push(&m.property, func, ctx);
+                    func.emit_bare(Opcode::GetProp);
+                }
+            }
         }
         Expr::New(n) => {
             compile_expr(&n.callee, func, ctx);
@@ -925,6 +1272,17 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(alt, func, ctx);
             patch(func, je, func.here());
         }
+        Expr::Sequence { exprs, .. } => {
+            for (index, expression) in exprs.iter().enumerate() {
+                compile_expr(expression, func, ctx);
+                if index + 1 != exprs.len() {
+                    func.emit_bare(Opcode::Pop);
+                }
+            }
+            if exprs.is_empty() {
+                func.emit_bare(Opcode::LdaUndefined);
+            }
+        }
         Expr::Assign {
             op, left, right, ..
         } => {
@@ -952,6 +1310,10 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                         if matches!(m.object.as_ref(), Expr::Super(_)) {
                             compile_member_key_push(&m.property, func, ctx);
                             func.emit_bare(Opcode::SetSuperProp);
+                        } else if let MemberProp::Private(name) = &m.property {
+                            compile_expr(&m.object, func, ctx); // [v, v, obj]
+                            let private = ctx.private_name_constant(name, m.span);
+                            func.emit(Instruction::new(Opcode::SetPrivate, private));
                         } else {
                             compile_expr(&m.object, func, ctx); // [v, v, obj]
                             compile_member_key_push(&m.property, func, ctx); // [v, v, obj, key]
@@ -960,14 +1322,24 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                     } else {
                         // Compound: load current, apply op, store, keep result.
                         compile_expr(&m.object, func, ctx); // [obj]
-                        compile_member_key_push(&m.property, func, ctx); // [obj, key]
-                        func.emit_bare(Opcode::GetProp); // [cur]
+                        if let MemberProp::Private(name) = &m.property {
+                            let private = ctx.private_name_constant(name, m.span);
+                            func.emit(Instruction::new(Opcode::GetPrivate, private));
+                        } else {
+                            compile_member_key_push(&m.property, func, ctx); // [obj, key]
+                            func.emit_bare(Opcode::GetProp); // [cur]
+                        }
                         compile_expr(right, func, ctx); // [cur, rhs]
                         emit_binop(compound_to_binop(*op), func); // [newv]
                         func.emit_bare(Opcode::Dup); // [newv, newv]
                         compile_expr(&m.object, func, ctx); // [newv, newv, obj]
-                        compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
-                        func.emit_bare(Opcode::SetProp); // [newv]
+                        if let MemberProp::Private(name) = &m.property {
+                            let private = ctx.private_name_constant(name, m.span);
+                            func.emit(Instruction::new(Opcode::SetPrivate, private));
+                        } else {
+                            compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
+                            func.emit_bare(Opcode::SetProp); // [newv]
+                        }
                     }
                 }
                 AssignTarget::Pat(_) => {
@@ -1004,8 +1376,13 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 Expr::Member(m) => {
                     compile_expr(&m.object, func, ctx); // [obj]
                     func.emit_bare(Opcode::Dup); // [obj, obj]
-                    compile_member_key_push(&m.property, func, ctx); // [obj, obj, key]
-                    func.emit_bare(Opcode::GetProp); // [obj, method]
+                    if let MemberProp::Private(name) = &m.property {
+                        let private = ctx.private_name_constant(name, m.span);
+                        func.emit(Instruction::new(Opcode::GetPrivate, private));
+                    } else {
+                        compile_member_key_push(&m.property, func, ctx); // [obj, obj, key]
+                        func.emit_bare(Opcode::GetProp); // [obj, method]
+                    }
                     let mut count = 0u16;
                     for a in &call.args {
                         if let CallArg::Expr(e) = a {
@@ -1038,7 +1415,15 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                         }
                         count += 1;
                     }
-                    func.emit(Instruction::new(Opcode::Call, count));
+                    let opcode = if matches!(
+                        call.callee.as_ref(),
+                        Expr::Ident { name, .. } if name == "eval"
+                    ) {
+                        Opcode::CallDirectEval
+                    } else {
+                        Opcode::Call
+                    };
+                    func.emit(Instruction::new(opcode, count));
                 }
             }
         }
@@ -1067,7 +1452,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
         }
         Expr::Class(c) => {
-            let id = compile_class_value(
+            let class = compile_class_value(
                 c.span,
                 c.name.as_deref(),
                 &c.body,
@@ -1075,13 +1460,7 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
                 func,
                 ctx,
             );
-            if let Some(superclass) = &c.superclass {
-                compile_expr(superclass, func, ctx);
-            }
-            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
-            if c.superclass.is_some() {
-                func.emit_bare(Opcode::SetClassHeritage);
-            }
+            emit_class_value(class, c.superclass.as_deref(), func, ctx);
         }
         Expr::This { .. } => func.emit_bare(Opcode::LdaThis),
         // The VM does not expose a new-target register yet. Preserve the
@@ -1131,6 +1510,79 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
         }
     }
     func.annotate_since(start_pc, expr.span());
+}
+
+/// Compile the specification's NamedEvaluation operation. The transparent
+/// parenthesis recursion is significant for `export default (function() {})`.
+fn compile_named_evaluation(
+    expr: &Expr,
+    inferred_name: &str,
+    func: &mut BytecodeFunction,
+    ctx: &mut CompilerCtx,
+) {
+    match expr {
+        Expr::Paren { expr, .. } => compile_named_evaluation(expr, inferred_name, func, ctx),
+        Expr::Function(function) if function.name.is_none() => {
+            let id = compile_function_value(
+                function.span,
+                Some(inferred_name),
+                &function.params,
+                FunctionBody::Block(&function.body),
+                false,
+                function.is_async,
+                function.is_generator,
+                func,
+                ctx,
+            );
+            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+        }
+        Expr::Arrow(arrow) => {
+            let body = match &arrow.body {
+                js_syntax::ast::expr::ArrowBody::Block(statements) => {
+                    FunctionBody::Block(statements)
+                }
+                js_syntax::ast::expr::ArrowBody::Expr(expression) => FunctionBody::Expr(expression),
+            };
+            let id = compile_function_value(
+                arrow.span,
+                Some(inferred_name),
+                &arrow.params,
+                body,
+                true,
+                arrow.is_async,
+                false,
+                func,
+                ctx,
+            );
+            func.emit(Instruction::new(Opcode::LdaFunction, id as u16));
+        }
+        Expr::Class(class) if class.name.is_none() => {
+            let compiled = compile_class_value(
+                class.span,
+                Some(inferred_name),
+                &class.body,
+                class.superclass.as_deref(),
+                func,
+                ctx,
+            );
+            emit_class_value(compiled, class.superclass.as_deref(), func, ctx);
+        }
+        _ => compile_expr(expr, func, ctx),
+    }
+}
+
+/// `typeof` is the one identifier operation that does not call GetValue for an
+/// unresolvable reference. Encode that distinction directly in bytecode.
+fn compile_typeof(arg: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
+    if let Expr::Ident { name, .. } = arg {
+        if name != "undefined" && matches!(ctx.resolve_var(name), VarRef::Global) {
+            let name = ctx.constants.intern_str(name);
+            func.emit(Instruction::new(Opcode::TypeofGlobal, name));
+            return;
+        }
+    }
+    compile_expr(arg, func, ctx);
+    func.emit_bare(Opcode::Typeof);
 }
 
 fn compile_lit(lit: &Lit, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
@@ -1790,20 +2242,35 @@ fn compile_update(
             // Load current value, apply +1/-1, then store with [value, obj, key]
             // ordering. Prefix yields the new value; postfix yields the old.
             compile_expr(&m.object, func, ctx); // [obj]
-            compile_member_key_push(&m.property, func, ctx); // [obj, key]
-            func.emit_bare(Opcode::GetProp); // [cur]
+            if let MemberProp::Private(name) = &m.property {
+                let private = ctx.private_name_constant(name, m.span);
+                func.emit(Instruction::new(Opcode::GetPrivate, private));
+            } else {
+                compile_member_key_push(&m.property, func, ctx); // [obj, key]
+                func.emit_bare(Opcode::GetProp); // [cur]
+            }
             if prefix {
                 emit_delta(func); // [newv]
                 func.emit_bare(Opcode::Dup); // [newv, newv]
                 compile_expr(&m.object, func, ctx); // [newv, newv, obj]
-                compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
-                func.emit_bare(Opcode::SetProp); // [newv]
+                if let MemberProp::Private(name) = &m.property {
+                    let private = ctx.private_name_constant(name, m.span);
+                    func.emit(Instruction::new(Opcode::SetPrivate, private));
+                } else {
+                    compile_member_key_push(&m.property, func, ctx); // [newv, newv, obj, key]
+                    func.emit_bare(Opcode::SetProp); // [newv]
+                }
             } else {
                 func.emit_bare(Opcode::Dup); // [cur, cur]
                 emit_delta(func); // [cur, newv]
                 compile_expr(&m.object, func, ctx); // [cur, newv, obj]
-                compile_member_key_push(&m.property, func, ctx); // [cur, newv, obj, key]
-                func.emit_bare(Opcode::SetProp); // [cur]
+                if let MemberProp::Private(name) = &m.property {
+                    let private = ctx.private_name_constant(name, m.span);
+                    func.emit(Instruction::new(Opcode::SetPrivate, private));
+                } else {
+                    compile_member_key_push(&m.property, func, ctx); // [cur, newv, obj, key]
+                    func.emit_bare(Opcode::SetProp); // [cur]
+                }
             }
         }
         _ => {
@@ -1855,6 +2322,7 @@ fn compound_to_binop(op: AssignOp) -> BinOp {
 struct CompilerCtx {
     constants: ConstantPool,
     functions: Vec<BytecodeFunction>,
+    is_module: bool,
     module_function_initializers: Vec<(u16, u32)>,
     dynamic_import_requests: Vec<String>,
     errors: Vec<Diagnostic>,
@@ -1867,6 +2335,9 @@ struct CompilerCtx {
     /// Lexical scope stack, one entry per *function* being compiled (scopes[0]
     /// is `<main>`). Drives closure upvalue resolution.
     scopes: Vec<Scope>,
+    /// Lexically nested class private environments. Values identify the class
+    /// definition whose brand owns a private spelling.
+    private_scopes: Vec<std::collections::HashMap<String, u32>>,
 }
 
 /// One function's compile-time lexical scope: its local names and the
@@ -1888,6 +2359,28 @@ struct LoopFrame {
     continues: Vec<u16>,
 }
 
+/// Retain the complete visible lexical chain on function closures. Direct eval
+/// can reference bindings that do not occur syntactically in the containing
+/// function, so capture-only-when-mentioned is insufficient for ECMAScript.
+fn capture_visible_environment(ctx: &mut CompilerCtx) {
+    if ctx.scopes.len() < 2 {
+        return;
+    }
+    let current = ctx.scopes.len() - 1;
+    let mut names = Vec::new();
+    for scope in &ctx.scopes[..current] {
+        names.extend(scope.locals.keys().cloned());
+        names.extend(scope.upvalues.iter().map(|binding| binding.name.clone()));
+    }
+    names.sort();
+    names.dedup();
+    for name in names {
+        if !ctx.scopes[current].locals.contains_key(&name) {
+            let _ = ctx.resolve_var(&name);
+        }
+    }
+}
+
 impl CompilerCtx {
     // ---- scope / upvalue resolution -------------------------------------
 
@@ -1904,6 +2397,24 @@ impl CompilerCtx {
             .locals
             .insert(name.to_string(), slot);
         slot
+    }
+
+    fn private_name_constant(&mut self, name: &str, span: js_syntax::Span) -> u16 {
+        let class_id = self
+            .private_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied());
+        match class_id {
+            Some(class_id) => self.constants.intern_str(format!("{class_id}\0{name}")),
+            None => {
+                self.errors.push(Diagnostic::error(
+                    span,
+                    format!("private name `#{name}` has no enclosing class brand"),
+                ));
+                self.constants.intern_str(format!("invalid\0{name}"))
+            }
+        }
     }
 
     /// Resolve `name` to a variable reference for the *current* function:

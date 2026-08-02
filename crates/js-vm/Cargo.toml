@@ -12,3 +12,4 @@ js-syntax.workspace = true
 js-runtime.workspace = true
 js-bytecode.workspace = true
 js-diagnostics.workspace = true
+js-parser.workspace = true

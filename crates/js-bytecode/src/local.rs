@@ -40,4 +40,11 @@ impl LocalTable {
     pub fn slot_count(&self) -> u16 {
         self.count
     }
+
+    /// Source binding names and their stable frame slots.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, u16)> {
+        self.by_name
+            .iter()
+            .map(|(name, slot)| (name.as_str(), *slot))
+    }
 }

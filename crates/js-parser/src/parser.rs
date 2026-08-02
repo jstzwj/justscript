@@ -27,7 +27,25 @@ impl Parser {
     }
 
     /// Parse a full program (script or module).
-    pub fn parse(mut self, kind: ProgramKind) -> DiagResult<Program> {
+    pub fn parse(self, kind: ProgramKind) -> DiagResult<Program> {
+        let program = self.parse_syntax(kind)?;
+
+        // Semantic early errors (strict-mode + spec constraints) — only worth
+        // running once the syntactic parse succeeded cleanly.
+        let mut early = crate::early_errors::check(&program);
+        for diagnostic in &mut early {
+            diagnostic.classify(DiagnosticPhase::EarlyError, "JS-EARLY");
+        }
+        if !early.is_empty() {
+            return Err(early);
+        }
+        Ok(program)
+    }
+
+    /// Parse grammar productions without applying a top-level early-error
+    /// context. Runtime eval uses this and supplies the caller's context after
+    /// parsing.
+    pub fn parse_syntax(mut self, kind: ProgramKind) -> DiagResult<Program> {
         if matches!(kind, ProgramKind::Module) {
             self.tokens.set_module();
         }
@@ -56,18 +74,7 @@ impl Parser {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let program = Program::new(Span::new(start.start, end.end), kind, body);
-
-        // Semantic early errors (strict-mode + spec constraints) — only worth
-        // running once the syntactic parse succeeded cleanly.
-        let mut early = crate::early_errors::check(&program);
-        for diagnostic in &mut early {
-            diagnostic.classify(DiagnosticPhase::EarlyError, "JS-EARLY");
-        }
-        if !early.is_empty() {
-            return Err(early);
-        }
-        Ok(program)
+        Ok(Program::new(Span::new(start.start, end.end), kind, body))
     }
 }
 
@@ -84,6 +91,22 @@ pub fn parse_script(src: &str) -> DiagResult<Program> {
 /// Parse `src` as a module.
 pub fn parse_module(src: &str) -> DiagResult<Program> {
     parse_named("module", src, ProgramKind::Module)
+}
+
+/// Parse direct eval code using the syntax context inherited from its caller.
+pub fn parse_eval(src: &str, context: &crate::early_errors::EvalContext) -> DiagResult<Program> {
+    let source = SourceFile::new("eval", std::sync::Arc::from(src));
+    let sess = ParseSess::new(source);
+    let program = Parser::new(&sess).parse_syntax(ProgramKind::Script)?;
+    let mut errors = crate::early_errors::check_eval(&program, context);
+    for diagnostic in &mut errors {
+        diagnostic.classify(DiagnosticPhase::EarlyError, "JS-EARLY");
+    }
+    if errors.is_empty() {
+        Ok(program)
+    } else {
+        Err(errors)
+    }
 }
 
 fn parse_named(name: &str, src: &str, kind: ProgramKind) -> DiagResult<Program> {

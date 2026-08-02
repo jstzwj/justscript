@@ -47,7 +47,8 @@ fn live_binding_and_shared_dependency_evaluate_once() {
     loader.insert(
         "counter.js",
         r#"
-evaluations = (evaluations || 0) + 1;
+export let evaluations = 0;
+evaluations += 1;
 export let value = 0;
 export function increment() { value += 1; }
 "#,
@@ -60,7 +61,7 @@ export function increment() { value += 1; }
         "main.js",
         r#"
 import './mutator.js';
-import { value } from './counter.js';
+import { value, evaluations } from './counter.js';
 value + evaluations;
 "#,
     );
@@ -490,4 +491,99 @@ fn module_const_binding_rejects_reassignment_after_initialization() {
         panic!("expected an exception: {error:?}");
     };
     assert_eq!(exception.value.error_name().as_deref(), Some("TypeError"));
+}
+
+#[test]
+fn unresolved_reference_throws_but_typeof_remains_undefined() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+assert.sameValue(typeof missing, 'undefined');
+assert.throws(ReferenceError, function() { missing; });
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    engine.install_test262_harness();
+    engine.run_module("main.js", &loader).unwrap();
+}
+
+#[test]
+fn default_export_named_evaluation_sets_function_and_class_names() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("fn.js", "export default (function() {});");
+    loader.insert("class.js", "export default class {};");
+    loader.insert(
+        "main.js",
+        r#"
+import fn from './fn.js';
+import Class from './class.js';
+fn.name + ':' + Class.name;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    match result.value.data() {
+        ValueData::String(value) => assert_eq!(value.as_str(), "default:default"),
+        other => panic!("expected a string, found {other:?}"),
+    }
+}
+
+#[test]
+fn anonymous_default_class_self_import_is_in_tdz_until_evaluation() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+assert.throws(ReferenceError, function() { typeof Class; });
+export default class {};
+import Class from './main.js';
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    engine.install_test262_harness();
+    engine.run_module("main.js", &loader).unwrap();
+}
+
+#[test]
+fn hoisted_module_function_captures_linked_import_binding() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("dep.js", "export const answer = 42;");
+    loader.insert(
+        "main.js",
+        r#"
+import { answer } from './dep.js';
+export function read() { return answer; }
+read();
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert_eq!(integer(&result.value), 42);
+}
+
+#[test]
+fn module_function_identity_is_stable_across_instantiation_and_evaluation() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "a.js",
+        r#"
+import { before } from './b.js';
+export function fn() {}
+export const stable = before === fn;
+"#,
+    );
+    loader.insert(
+        "b.js",
+        "import { fn } from './a.js'; export const before = fn;",
+    );
+    loader.insert("main.js", "import { stable } from './a.js'; stable;");
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
 }

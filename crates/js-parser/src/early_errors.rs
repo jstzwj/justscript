@@ -29,22 +29,54 @@ use crate::static_semantics::{
     var_declared_names,
 };
 
+/// Syntactic context inherited by a direct eval from its caller.
+#[derive(Clone, Debug, Default)]
+pub struct EvalContext {
+    pub strict: bool,
+    pub private_names: std::collections::HashSet<String>,
+    pub allow_super_property: bool,
+    pub allow_super_call: bool,
+    pub allow_new_target: bool,
+    pub reject_arguments: bool,
+}
+
 /// Run all early-error checks against a parsed [`Program`].
 pub fn check(program: &Program) -> Vec<Diagnostic> {
+    check_with_eval_context(program, None)
+}
+
+/// Run early errors for eval code with the syntactic context inherited from a
+/// direct caller. Indirect eval passes no context and therefore uses Script
+/// rules exactly like [`check`].
+pub fn check_eval(program: &Program, context: &EvalContext) -> Vec<Diagnostic> {
+    check_with_eval_context(program, Some(context))
+}
+
+fn check_with_eval_context(
+    program: &Program,
+    eval_context: Option<&EvalContext>,
+) -> Vec<Diagnostic> {
     let is_module = program.kind == ProgramKind::Module;
+    let inherited_private = eval_context
+        .filter(|context| !context.private_names.is_empty())
+        .map(|context| context.private_names.clone())
+        .into_iter()
+        .collect();
     let mut c = Checker {
         errors: Vec::new(),
         is_module,
-        strict: is_module || program_contains_use_strict(&program.body),
+        strict: is_module
+            || eval_context.is_some_and(|context| context.strict)
+            || program_contains_use_strict(&program.body),
         scopes: vec![Scope::new(true)],
         // Modules allow top-level `await`; classic scripts do not. `yield` is
         // never valid at the top level.
         await_ctx: vec![is_module],
         yield_ctx: vec![false],
-        super_prop: vec![false],
-        super_call: vec![false],
-        new_target_allowed: false,
-        private_env: Vec::new(),
+        super_prop: vec![eval_context.is_some_and(|context| context.allow_super_property)],
+        super_call: vec![eval_context.is_some_and(|context| context.allow_super_call)],
+        new_target_allowed: eval_context.is_some_and(|context| context.allow_new_target),
+        private_env: inherited_private,
         static_block_depth: 0,
         labels: Vec::new(),
         breakable_depth: 0,
@@ -61,6 +93,18 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
             );
         }
         c.check_item(item);
+    }
+    if eval_context.is_some_and(|context| context.reject_arguments) {
+        for item in &program.body {
+            if let ProgramItem::Stmt(statement) = item {
+                if statements_contain_arguments(std::slice::from_ref(statement)) {
+                    c.err(
+                        statement.span(),
+                        "`arguments` is not allowed in direct eval inside a class initializer",
+                    );
+                }
+            }
+        }
     }
     c.errors
 }

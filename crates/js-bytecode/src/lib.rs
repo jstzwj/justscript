@@ -17,7 +17,9 @@ pub mod module;
 pub mod opcode;
 pub mod verify;
 
-pub use compiler::{compile_program, compile_program_with_source};
+pub use compiler::{
+    compile_eval_program_with_source, compile_program, compile_program_with_source,
+};
 pub use constant::ConstantPool;
 pub use local::LocalTable;
 pub use module::{BytecodeFunction, BytecodeModule, DEFAULT_EXPORT_LOCAL};

@@ -7,8 +7,9 @@
 //! swap can happen behind the scenes: callers go through [`Value::data`] /
 //! the constructors and never match on the raw enum.
 
-use crate::object::JsObject;
+use crate::object::{Attribute, JsObject, ObjectData, PropertyDescriptor};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -176,7 +177,10 @@ impl Value {
         self.is_null() || self.is_undefined()
     }
     pub fn is_object(&self) -> bool {
-        matches!(self.data, ValueData::Object(_))
+        matches!(
+            self.data,
+            ValueData::Object(_) | ValueData::Function(_) | ValueData::Generator(_)
+        )
     }
     pub fn is_function(&self) -> bool {
         matches!(self.data, ValueData::Function(_))
@@ -272,8 +276,10 @@ pub struct GeneratorState {
     pub locals: Vec<Cell>,
     pub stack: Vec<Value>,
     pub upvalues: Vec<Cell>,
+    pub private_brands: HashMap<u32, u64>,
     pub this: Value,
     pub captured_this: Option<Cell>,
+    pub is_async: bool,
     /// `true` once the body has completed; further `.next()` returns done.
     pub done: bool,
     /// `false` until the first `.next()` (pc starts at 0).
@@ -292,6 +298,10 @@ pub struct GeneratorState {
 #[derive(Clone, Debug)]
 pub struct JsFunction {
     pub name: String,
+    /// Ordinary object state carried by every callable. Keeping this handle on
+    /// the function value gives functions stable object identity and lets
+    /// property operations use the same descriptor machinery as objects.
+    pub object: JsObject,
     /// Index of the defining bytecode module in the active runtime graph.
     pub module_index: u32,
     pub id: u32,
@@ -309,16 +319,68 @@ pub struct JsFunction {
     /// Host/native functions may retain one object as internal bound state
     /// (currently Promise resolving functions).
     pub bound_object: Option<JsObject>,
+    /// Bound-function internal slots.
+    pub bound_this: Option<Box<Value>>,
+    pub bound_args: Vec<Value>,
     /// Constructor referenced by `extends`, evaluated when the class is defined.
     pub superclass: Option<Box<Value>>,
+    /// Hidden closure that evaluates this class's instance field definitions.
+    pub instance_initializer: Option<Box<Value>>,
+    /// Computed class element keys evaluated once per class definition. The
+    /// constructor and its hidden initializers share this table.
+    pub class_field_keys: Rc<RefCell<Vec<Value>>>,
+    /// Runtime private environments captured by this closure, keyed by the
+    /// class constructor's bytecode id in this function's module.
+    pub private_brands: HashMap<u32, u64>,
     /// `true` for `function*` — calling it produces a generator object.
     pub is_generator: bool,
 }
 
 impl JsFunction {
     pub fn new(name: impl Into<String>, id: u32, param_count: u16) -> JsFunction {
+        let name = name.into();
+        let object = ObjectData::new_handle();
+        {
+            let mut data = object.borrow_mut();
+            data.class = "Function";
+            data.callable = true;
+            data.properties.insert(
+                "name".into(),
+                PropertyDescriptor::Data {
+                    value: Value::string(name.clone()),
+                    attr: Attribute {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                },
+            );
+            data.properties.insert(
+                "length".into(),
+                PropertyDescriptor::Data {
+                    value: Value::integer(i32::from(param_count)),
+                    attr: Attribute {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                },
+            );
+            data.properties.insert(
+                "prototype".into(),
+                PropertyDescriptor::Data {
+                    value: Value::object(ObjectData::new_handle()),
+                    attr: Attribute {
+                        writable: true,
+                        enumerable: false,
+                        configurable: false,
+                    },
+                },
+            );
+        }
         JsFunction {
-            name: name.into(),
+            name,
+            object,
             module_index: 0,
             id,
             param_count,
@@ -327,7 +389,12 @@ impl JsFunction {
             native: None,
             bound_generator: None,
             bound_object: None,
+            bound_this: None,
+            bound_args: Vec::new(),
             superclass: None,
+            instance_initializer: None,
+            class_field_keys: Rc::new(RefCell::new(Vec::new())),
+            private_brands: HashMap::new(),
             is_generator: false,
         }
     }

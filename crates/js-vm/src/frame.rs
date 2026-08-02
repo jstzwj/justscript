@@ -10,6 +10,7 @@ use crate::stack::OperandStack;
 use js_runtime::value::{Cell, Value};
 use js_syntax::Span;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub struct CallFrame {
@@ -20,6 +21,8 @@ pub struct CallFrame {
     pub func_index: usize,
     pub pc: usize,
     pub locals: Vec<Cell>,
+    /// Original arguments supplied to this invocation.
+    pub arguments: Vec<Value>,
     /// Cells captured from the enclosing environment (closures).
     pub upvalues: Vec<Cell>,
     /// The `this` binding for this frame (ordinary functions / `new`).
@@ -33,15 +36,24 @@ pub struct CallFrame {
     /// True if this frame is a `new` invocation: on `return`, a non-object
     /// result is replaced by the freshly-constructed `this`.
     pub is_construct: bool,
+    /// Constructor whose instance elements belong to this construct frame.
+    pub constructor: Option<Value>,
     /// If this frame runs a generator body, the owning generator object — used
     /// by `Yield` to save the frame back and by `Return` to mark it done.
     pub generator: Option<Rc<RefCell<js_runtime::value::GeneratorState>>>,
+    /// Promise for the active AsyncGenerator request, if this is an async
+    /// generator frame checked out by `.next()`.
+    pub async_generator_promise: Option<js_runtime::object::JsObject>,
     /// Active exception handlers (innermost last), pushed by `TryBegin`.
     pub try_stack: Vec<ActiveTry>,
     /// An exception awaiting re-raise after a `finally` block completes.
     pub pending_throw: Option<Value>,
     /// Runtime class heritage for derived constructors/methods.
     pub superclass: Option<Value>,
+    /// Private environments captured by the executing function.
+    pub private_brands: HashMap<u32, u64>,
+    /// Definition-time computed keys shared with the active class initializer.
+    pub class_field_keys: Rc<RefCell<Vec<Value>>>,
     /// Base object initialized by the most recent `super()` call.
     pub super_base: Option<Value>,
 }
@@ -72,16 +84,21 @@ impl CallFrame {
             locals: (0..slot_count)
                 .map(|_| new_cell(Value::undefined()))
                 .collect(),
+            arguments: Vec::new(),
             upvalues: Vec::new(),
             this: Value::undefined(),
             captured_this: None,
             stack: OperandStack::with_capacity(16),
             span,
             is_construct: false,
+            constructor: None,
             generator: None,
+            async_generator_promise: None,
             try_stack: Vec::new(),
             pending_throw: None,
             superclass: None,
+            private_brands: HashMap::new(),
+            class_field_keys: Rc::new(RefCell::new(Vec::new())),
             super_base: None,
         }
     }

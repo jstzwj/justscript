@@ -49,8 +49,18 @@ pub enum Opcode {
     LdaFalse,
     /// Push a function value (function-table index `operand`).
     LdaFunction,
+    /// Apply SetFunctionName to the value on top using string constant `operand`.
+    SetFunctionName,
     /// Stack `[superclass, class]` -> `[class]` and records class heritage.
     SetClassHeritage,
+    /// Stack `[class, initializer]` -> `[class]`; records instance field work.
+    SetClassInstanceInitializer,
+    /// Stack `[class, key]` -> `[class]`; append a definition-time computed key.
+    DefineClassFieldKey,
+    /// Load computed class element key `operand` captured during definition.
+    LoadClassFieldKey,
+    /// Make the class value on top's private environment active in this frame.
+    ActivateClassPrivateEnvironment,
     /// Push the current `this` binding.
     LdaThis,
     /// Load captured upvalue slot `operand` and push it.
@@ -135,21 +145,44 @@ pub enum Opcode {
     NewArray,
     /// `callee`, pop `operand` args, push result.
     Call,
+    /// Call an IdentifierReference named `eval`. The VM performs direct-eval
+    /// semantics only when the resolved callee is the realm's intrinsic eval;
+    /// a shadowed binding is invoked as an ordinary function.
+    CallDirectEval,
     /// Method call: stack `[obj, fn, args...]`, `this` = obj.
     CallMethod,
     /// `new` call with `operand` args.
     New,
-    /// Call the current derived constructor's superclass.
+    /// Call the current derived constructor's superclass. `u16::MAX` forwards
+    /// all arguments from a synthesized default constructor.
     CallSuper,
     /// Set a property through the current method's super base.
     SetSuperProp,
+    /// Read a property through the current method's super base.
+    GetSuperProp,
     /// Pop object + key, push the property.
     GetProp,
     /// Pop value + key + object.
     SetProp,
+    /// Define a public class field (`enumerable: true`).
+    DefineDataProperty,
+    /// Define a public class method (`enumerable: false`).
+    DefineMethod,
     /// Define an accessor. Stack input is `[function, object, key]`.
     DefineGetter,
     DefineSetter,
+    /// Private element operations. `operand` identifies a class-local private
+    /// name whose runtime brand is captured by the executing closure.
+    GetPrivate,
+    SetPrivate,
+    DefinePrivate,
+    DefinePrivateMethod,
+    DefinePrivateGetter,
+    DefinePrivateSetter,
+    DefinePrivateMethodTemplate,
+    DefinePrivateGetterTemplate,
+    DefinePrivateSetterTemplate,
+    PrivateIn,
     /// Stack `[target, source]` -> `[target]`, copying enumerable own properties.
     CopyDataProperties,
     /// Delete an own property. Stack input is `[object, key]`; pushes a bool.
@@ -162,6 +195,9 @@ pub enum Opcode {
     NewRegex,
     /// Push the named global `operand` (constant index).
     GetGlobal,
+    /// Apply `typeof` to a named global reference. Unlike `GetGlobal`, an
+    /// unresolvable reference produces the string `"undefined"`.
+    TypeofGlobal,
     /// Set the named global `operand`.
     SetGlobal,
     /// Pop a module specifier and push the host's dynamic-import Promise.
@@ -193,6 +229,7 @@ pub enum OperandKind {
     JumpTarget,
     ArgumentCount,
     Handler,
+    ClassField,
 }
 
 impl Opcode {
@@ -200,20 +237,34 @@ impl Opcode {
         use OperandKind::*;
         match self {
             Opcode::LdaConst
+            | Opcode::SetFunctionName
             | Opcode::NewRegex
             | Opcode::GetGlobal
+            | Opcode::TypeofGlobal
             | Opcode::SetGlobal
-            | Opcode::DeleteGlobal => Constant,
+            | Opcode::DeleteGlobal
+            | Opcode::GetPrivate
+            | Opcode::SetPrivate
+            | Opcode::DefinePrivate
+            | Opcode::DefinePrivateMethod
+            | Opcode::DefinePrivateGetter
+            | Opcode::DefinePrivateSetter
+            | Opcode::DefinePrivateMethodTemplate
+            | Opcode::DefinePrivateGetterTemplate
+            | Opcode::DefinePrivateSetterTemplate
+            | Opcode::PrivateIn => Constant,
             Opcode::LdaLocal | Opcode::StaLocal => Local,
             Opcode::LdaUpvalue | Opcode::StaUpvalue => Upvalue,
             Opcode::LdaFunction => Function,
             Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue => JumpTarget,
             Opcode::Call
+            | Opcode::CallDirectEval
             | Opcode::CallMethod
             | Opcode::New
             | Opcode::CallSuper
             | Opcode::NewArray => ArgumentCount,
             Opcode::TryBegin => Handler,
+            Opcode::LoadClassFieldKey => ClassField,
             _ => None,
         }
     }

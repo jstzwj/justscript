@@ -473,6 +473,7 @@ version = "0.1.0"
 dependencies = [
  "js-bytecode",
  "js-diagnostics",
+ "js-parser",
  "js-runtime",
  "js-syntax",
 ]

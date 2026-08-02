@@ -924,3 +924,215 @@ fn delete_distinguishes_properties_and_bindings() {
         ValueData::Boolean(true)
     ));
 }
+
+#[test]
+fn static_class_elements_run_with_constructor_as_this() {
+    assert!(matches!(
+        run(r#"
+class Counter {
+    static value = 40;
+    static { this.value += 1; }
+    static answer() { return this.value + 1; }
+}
+Counter.answer();
+"#),
+        ValueData::Integer(42)
+    ));
+}
+
+#[test]
+fn private_fields_are_branded_and_support_get_set_and_in() {
+    assert!(matches!(
+        run(r#"
+class Counter {
+    #value = 40;
+    increment() { this.#value += 2; return this.#value; }
+    has(value) { return #value in value; }
+}
+let counter = new Counter();
+counter.increment() === 42 && counter.has(counter) && !counter.has({});
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn static_private_fields_live_on_the_constructor() {
+    assert!(matches!(
+        run(r#"
+class Counter {
+    static #value = 40;
+    static increment() { this.#value += 2; return this.#value; }
+}
+Counter.increment();
+"#),
+        ValueData::Integer(42)
+    ));
+}
+
+#[test]
+fn equal_private_spellings_in_distinct_classes_do_not_share_a_brand() {
+    let mut engine = Engine::default_interpreter();
+    let error = engine
+        .run(
+            r#"
+class A { #value = 1; read(other) { return other.#value; } }
+class B { #value = 2; }
+new A().read(new B());
+"#,
+        )
+        .unwrap_err();
+    let js_engine::EngineError::Exception(exception) = error else {
+        panic!("expected a JavaScript exception, found {error:?}");
+    };
+    assert_eq!(exception.value.error_name().as_deref(), Some("TypeError"));
+}
+
+#[test]
+fn each_class_evaluation_allocates_a_fresh_private_brand() {
+    assert!(matches!(
+        run(r#"
+function make() {
+    class C {
+        #method() { return 42; }
+        read(other) { return other.#method(); }
+    }
+    return new C();
+}
+let first = make();
+let second = make();
+let isolated = false;
+try { first.read(second); } catch (error) { isolated = error instanceof TypeError; }
+first.read(first) === 42 && second.read(second) === 42 && isolated;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn derived_construction_forwards_arguments_and_rejects_duplicate_private_brand() {
+    assert!(matches!(
+        run(r#"
+class Base { constructor(value) { return value; } }
+class Derived extends Base { #method() {} }
+let object = {};
+new Derived(object);
+let duplicateRejected = false;
+try { new Derived(object); } catch (error) { duplicateRejected = error instanceof TypeError; }
+duplicateRejected;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn multi_level_derived_construction_initializes_each_class_once_in_order() {
+    assert!(matches!(
+        run(r#"
+let order = [];
+class A { #a = order.push("A"); hasA() { return #a in this; } }
+class B extends A { #b = order.push("B"); hasB() { return #b in this; } }
+class C extends B { #c = order.push("C"); hasC() { return #c in this; } }
+let value = new C();
+order.join("") === "ABC" && value.hasA() && value.hasB() && value.hasC();
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn derived_fields_run_after_super_and_before_the_remaining_constructor_body() {
+    assert!(matches!(
+        run(r#"
+let order = [];
+class Base { field = order.push("base"); }
+class Derived extends Base {
+    field = order.push("derived");
+    constructor() {
+        order.push("before");
+        super();
+        order.push("after");
+    }
+}
+new Derived();
+order.join(":");
+"#),
+        ValueData::String(value) if value.as_str() == "before:base:derived:after"
+    ));
+}
+
+#[test]
+fn class_accessors_use_descriptors_for_reads_and_writes() {
+    assert!(matches!(
+        run(r#"
+let stored;
+class C {
+    static get value() { return stored; }
+    static set value(next) { stored = next; }
+}
+C.value = 42;
+C.value;
+"#),
+        ValueData::Integer(42)
+    ));
+}
+
+#[test]
+fn anonymous_class_field_functions_receive_field_names() {
+    assert!(matches!(
+        run(r#"
+class C {
+    static #private = () => 1;
+    static public = function() {};
+    static names() { return this.#private.name + ":" + this.public.name; }
+}
+C.names();
+"#),
+        ValueData::String(value) if value.as_str() == "#private:public"
+    ));
+}
+
+#[test]
+fn computed_class_keys_are_converted_once_at_definition_time() {
+    assert!(matches!(
+        run(r#"
+let conversions = 0;
+let key = { toString() { conversions += 1; return "answer"; } };
+class C { [key] = 42; }
+let first = new C();
+let second = new C();
+conversions === 1 && first.answer === 42 && second.answer === 42;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn direct_eval_inherits_lexical_this_and_private_environment() {
+    assert!(matches!(
+        run(r#"
+let observed = false;
+class C {
+    #value = 42;
+    read() {
+        return eval("observed = true; () => this.#value");
+    }
+}
+let closure = new C().read();
+observed && closure() === 42;
+"#),
+        ValueData::Boolean(true)
+    ));
+}
+
+#[test]
+fn calling_and_constructing_non_callable_values_throw_type_error() {
+    let mut engine = Engine::default_interpreter();
+    for source in ["null()", "new (42)()"] {
+        let error = engine.run(source).unwrap_err();
+        let js_engine::EngineError::Exception(exception) = error else {
+            panic!("expected JavaScript exception, found {error:?}");
+        };
+        assert_eq!(exception.value.error_name().as_deref(), Some("TypeError"));
+    }
+}

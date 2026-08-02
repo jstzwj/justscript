@@ -2,7 +2,7 @@
 
 use crate::config::{EngineConfig, ExecutionMode};
 use crate::module::{
-    analyze_module, fresh_module_cells, CompiledModule, DynamicResolution, ExportEntry,
+    analyze_module, fresh_module_environment, CompiledModule, DynamicResolution, ExportEntry,
     ImportedName, ModuleError, ModuleGraph, ModuleLoader, ModuleStatus, RuntimeModule,
 };
 use js_diagnostics::DiagnosticReport;
@@ -175,13 +175,16 @@ impl Engine {
         })?;
         let mut graph = ModuleGraph::default();
         let entry_index = self.load_module_graph(loader, &entry_key, &mut graph)?;
-        instantiate_module_functions(&mut graph)?;
         link_module(&mut graph, entry_index).map_err(EngineError::Module)?;
         for index in 0..graph.modules.len() {
             if graph.modules[index].status == ModuleStatus::Unlinked {
                 link_module(&mut graph, index).map_err(EngineError::Module)?;
             }
         }
+        // Import bindings must exist before hoisted functions close over the
+        // module environment. This is ModuleDeclarationInstantiation order,
+        // and matters for functions that reference an imported binding.
+        instantiate_module_functions(&mut graph)?;
         materialize_namespaces(&mut graph)?;
 
         // Keep bytecode owners separate from mutable graph state while the VM
@@ -196,7 +199,7 @@ impl Engine {
         let module_locals = graph
             .modules
             .iter()
-            .map(|module| module.locals.clone())
+            .map(|module| module.environment.snapshot())
             .collect();
         let module_dependencies = graph
             .modules
@@ -265,9 +268,10 @@ impl Engine {
         let namespace = Value::object(js_runtime::object::ObjectData::module_namespace(
             BTreeMap::new(),
         ));
+        let environment = fresh_module_environment(&compiled.bytecode, &metadata);
         graph.modules.push(RuntimeModule {
             key: key.to_string(),
-            locals: fresh_module_cells(&compiled.bytecode, &metadata),
+            environment,
             compiled,
             metadata,
             dependencies: Default::default(),
@@ -426,7 +430,7 @@ fn instantiate_module_functions(graph: &mut ModuleGraph) -> Result<(), EngineErr
                 &module.compiled.bytecode,
                 module_index,
                 function_id,
-                &module.locals,
+                module.environment.cells(),
             )
             .map_err(|message| {
                 EngineError::Module(ModuleError::Link {
@@ -434,12 +438,16 @@ fn instantiate_module_functions(graph: &mut ModuleGraph) -> Result<(), EngineErr
                     message,
                 })
             })?;
-            module.locals[usize::from(slot)].set(value).map_err(|_| {
-                EngineError::Module(ModuleError::Link {
-                    module: module.key.clone(),
-                    message: format!("cannot initialize function slot {slot}"),
-                })
-            })?;
+            module
+                .environment
+                .binding(usize::from(slot))
+                .set(value)
+                .map_err(|_| {
+                    EngineError::Module(ModuleError::Link {
+                        module: module.key.clone(),
+                        message: format!("cannot initialize function slot {slot}"),
+                    })
+                })?;
         }
     }
     Ok(())
@@ -492,34 +500,32 @@ fn link_module(graph: &mut ModuleGraph, index: usize) -> Result<(), ModuleError>
             })?;
         let cell = match import.imported {
             ImportedName::Name(name) => {
-                let target = resolve_export(graph, dependency, &name, &mut HashSet::new())?
-                    .ok_or_else(|| ModuleError::Link {
+                resolve_export(graph, dependency, &name, &mut HashSet::new())?.ok_or_else(|| {
+                    ModuleError::Link {
                         module: graph.modules[index].key.clone(),
                         message: format!(
                             "module `{}` does not export `{name}`",
                             graph.modules[dependency].key
                         ),
-                    })?;
-                js_runtime::value::Cell::immutable_import(target)
+                    }
+                })?
             }
             ImportedName::Namespace => {
                 if import.phase == js_syntax::ImportPhase::Defer {
                     let namespace = module_namespace_deferred(graph, dependency)?;
-                    js_runtime::value::Cell::immutable_import(js_runtime::value::Cell::initialized(
-                        namespace, false,
-                    ))
+                    js_runtime::value::Cell::initialized(namespace, false)
                 } else {
                     let _ = module_namespace(graph, dependency)?;
-                    js_runtime::value::Cell::immutable_import(
-                        graph.modules[dependency].namespace_cell.clone(),
-                    )
+                    graph.modules[dependency].namespace_cell.clone()
                 }
             }
         };
         bindings.push((import.local_slot, cell));
     }
     for (slot, cell) in bindings {
-        graph.modules[index].locals[slot] = cell;
+        graph.modules[index]
+            .environment
+            .create_import_binding(slot, cell);
     }
     // ModuleDeclarationInstantiation validates every indirect export even when
     // no importer happens to request it.
@@ -560,7 +566,7 @@ fn resolve_export(
             ExportEntry::Local {
                 exported,
                 local_slot,
-            } if exported == name => return Ok(Some(module.locals[*local_slot].clone())),
+            } if exported == name => return Ok(Some(module.environment.binding(*local_slot))),
             ExportEntry::Indirect {
                 exported,
                 request,
@@ -922,7 +928,7 @@ impl<'a, 'b> ModuleEvaluator<'a, 'b> {
     }
 
     fn start_module(&mut self, index: usize) -> Result<(), EngineError> {
-        let locals = self.graph.modules[index].locals.clone();
+        let locals = self.graph.modules[index].environment.snapshot();
         match self
             .interpreter
             .start_module_in_graph_report(self.bytecodes, index, locals)

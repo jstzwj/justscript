@@ -40,6 +40,9 @@ pub struct BytecodeFunction {
     pub locals: LocalTable,
     /// Upvalue descriptors, in capture order; indexed by `LdaUpvalue`/`StaUpvalue`.
     pub upvalues: Vec<UpvalueSpec>,
+    /// Source binding name for each upvalue. Retained for direct eval's
+    /// environment-record bridge and debugger inspection.
+    pub upvalue_names: Vec<String>,
     /// True for arrow functions, which capture `this` lexically.
     pub is_arrow: bool,
     /// True for `function*`: calling it produces a generator object instead of
@@ -72,6 +75,7 @@ impl BytecodeFunction {
             source_map: Vec::new(),
             locals: LocalTable::new(param_count),
             upvalues: Vec::new(),
+            upvalue_names: Vec::new(),
             is_arrow: false,
             is_generator: false,
             is_async: false,

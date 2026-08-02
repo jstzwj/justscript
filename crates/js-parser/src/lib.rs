@@ -18,6 +18,6 @@ mod static_semantics;
 pub mod stmt;
 pub mod token_stream;
 
-pub use parser::{parse, parse_module, parse_script, Parser};
+pub use parser::{parse, parse_eval, parse_module, parse_script, Parser};
 pub use sess::ParseSess;
 pub use token_stream::ParserTokenStream;

@@ -51,15 +51,38 @@ language-runtime result.
 
 | Files / variants | Executed | Pass | Fail | Incomplete | Skip |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 599 / 602 | 407 | 290 | 61 | 56 | 195 |
+| 599 / 602 | 407 | 404 | 0 | 3 | 195 |
 
 This snapshot includes real filesystem `_FIXTURE.js` loading, resolution
-negatives, isolated realms, Promise jobs and async `$DONE`. The 71.3% rate over
+negatives, isolated realms, Promise jobs and async `$DONE`. The 99.3% rate over
 executed cases must not be reported as the language-runtime or project-wide
-Test262 pass rate. Current actionable clusters are top-level await (55), module
-namespace internal methods (26), and source-phase imports (2); many of those
-depend on class inheritance, object methods/spread, Symbol/property descriptor
-support and dynamic import rather than the loader itself.
+Test262 pass rate. The remaining outcomes are three source-phase
+import/re-export tests whose syntax is not part of the pinned ES module
+front-end yet.
+
+Module environments now allocate direct mutable/immutable TDZ cells before
+linking, replace import slots with initialized immutable indirect cells, and
+instantiate hoisted functions only after those imports are linked. Unresolvable
+references use GetValue semantics while `typeof` retains its specified special
+case. Default exports use the synthetic `*default*` binding and NamedEvaluation
+for anonymous function, generator, arrow, and class definitions.
+
+Class execution now gives each evaluation a fresh private brand, propagates
+private environments through element initializer and method closures, installs
+base and derived instance elements at their construction boundaries, and
+rejects duplicate private method/accessor installation. Static fields,
+methods, accessors and blocks execute with the constructor as `this`; ordinary
+property writes invoke accessor descriptors, and anonymous field definitions
+receive their field names.
+
+The focused `test/language/statements/class/elements` runtime subset currently
+reports 1,534 files / 3,054 variants, with 1,068 executed: 734 pass, 62 fail,
+272 incomplete and 1,986 skipped. Computed element keys are evaluated and
+converted once during class definition; both accessor-name computed-key
+directories pass 42 / 42. Direct and indirect eval now use runtime parsing and
+bytecode compilation, retain eval-created modules for escaping closures, and
+bridge lexical/private/class execution contexts. The largest remaining class
+element cluster is 248 incomplete variants requiring `yield*` delegation.
 
 The standards-based front-end repairs have removed all false accepts from the
 current `test/language` corpus. Block and Module Early Errors now compare the
