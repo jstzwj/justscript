@@ -109,6 +109,7 @@ pub trait NativeFn {
         this: Value,
         f: &JsFunction,
         args: Vec<Value>,
+        is_construct: bool,
     ) -> Result<NativeResult, InterpError>;
 }
 
@@ -146,6 +147,7 @@ impl NativeFn for GenThrow {
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
+        _is_construct: bool,
     ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
@@ -198,6 +200,7 @@ impl NativeFn for GenNext {
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
+        _is_construct: bool,
     ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
@@ -245,6 +248,7 @@ impl NativeFn for GenReturn {
         _this: Value,
         f: &JsFunction,
         args: Vec<Value>,
+        _is_construct: bool,
     ) -> Result<NativeResult, InterpError> {
         let gen = f.bound_generator.clone().ok_or_else(|| {
             InterpError::Internal("generator method has no bound generator".into())
@@ -330,7 +334,7 @@ pub struct Interpreter {
     /// PromiseJobs run FIFO at explicit microtask checkpoints.
     jobs: VecDeque<PromiseJob>,
     suspended_modules: HashMap<usize, SuspendedModule>,
-    dynamic_imports: Option<Vec<HashMap<String, Result<usize, String>>>>,
+    dynamic_imports: Option<Vec<Vec<Result<usize, String>>>>,
     dynamic_import_requests: VecDeque<DynamicImportRequest>,
     deferred_modules: Option<DeferredModuleGraph>,
     /// Runtime-compiled eval modules. Box allocation keeps bytecode addresses
@@ -373,12 +377,56 @@ impl Interpreter {
             template_objects: HashMap::new(),
             import_meta_objects: HashMap::new(),
         };
-        // Install the global builtins (console, Math, Object, JSON, parseInt, …).
+        // Install the VM intrinsics (global builtins, `globalThis`, the
+        // per-realm intrinsic prototypes, and the `Array.prototype` wiring)
+        // ONCE per realm. A realm is long-lived and is shared across every
+        // interpreter this engine creates (`Engine::run` / `run_module` make a
+        // fresh interpreter per call), so re-installing per interpreter would
+        // (a) mint a fresh `%ObjectPrototype%` / `%ArrayPrototype%` on every
+        // execute — breaking `getPrototypeOf(objFromExecute1) ===
+        // Array.prototype` in execute 2 — and (b) overwrite user modifications
+        // to built-ins between executes.
         {
             let mut realm = interp.ctx.realm.borrow_mut();
-            crate::builtins::install_globals(&mut realm.globals);
-            let global_this = Value::object(realm.global_object.clone());
-            realm.globals.insert("globalThis".into(), global_this);
+            if !realm.intrinsics_initialized {
+                crate::builtins::install_globals(&mut realm.globals);
+                let global_this = Value::object(realm.global_object.clone());
+                realm.globals.insert("globalThis".into(), global_this);
+                // `%ObjectPrototype%` is the property the installer left on the
+                // Object constructor namespace.
+                let object_proto_value = realm
+                    .globals
+                    .get("Object")
+                    .map(|ctor| get_property(ctor, &Value::string("prototype")));
+                realm.object_proto = object_proto_value.as_ref().and_then(obj_as_object).cloned();
+                // `%ArrayPrototype%` is a fresh ordinary object whose
+                // `[[Prototype]]` is `%ObjectPrototype%`
+                // (sec-properties-of-the-array-prototype-object), so
+                // `Object.getPrototypeOf(Array.prototype) === Object.prototype`.
+                let object_proto = realm.object_proto.clone();
+                let array_proto = js_runtime::object::ObjectData::new_handle();
+                array_proto.borrow_mut().proto = object_proto.map(Value::object);
+                realm.array_proto = Some(array_proto.clone());
+                // Wire `Array.prototype` to this realm's `%ArrayPrototype%` as a
+                // real property on the Array constructor (mirroring
+                // `Object.prototype`), so it resolves through the ordinary
+                // property walk — no thread-local, so two interpreters on one
+                // thread never cross-contaminate prototypes.
+                if let Some(array_ctor) = realm.globals.get("Array").and_then(obj_as_object) {
+                    array_ctor.borrow_mut().properties.insert(
+                        "prototype".into(),
+                        js_runtime::object::PropertyDescriptor::Data {
+                            value: Value::object(array_proto),
+                            attr: js_runtime::object::Attribute {
+                                writable: true,
+                                enumerable: false,
+                                configurable: false,
+                            },
+                        },
+                    );
+                }
+                realm.intrinsics_initialized = true;
+            }
         }
         interp
     }
@@ -431,10 +479,7 @@ impl Interpreter {
         });
     }
 
-    pub fn configure_dynamic_imports(
-        &mut self,
-        resolutions: Vec<HashMap<String, Result<usize, String>>>,
-    ) {
+    pub fn configure_dynamic_imports(&mut self, resolutions: Vec<Vec<Result<usize, String>>>) {
         self.dynamic_imports = Some(resolutions);
     }
 
@@ -448,6 +493,29 @@ impl Interpreter {
 
     pub fn has_promise_jobs(&self) -> bool {
         !self.jobs.is_empty()
+    }
+
+    /// The current realm's `%ArrayPrototype%`, for ordinary array construction.
+    /// Read straight from the realm so each interpreter's arrays link to its own
+    /// prototype — no thread-local, so two interpreters on one thread stay
+    /// isolated. Returns `None` only before realm bootstrapping sets the field.
+    pub fn array_prototype(&self) -> Option<Value> {
+        self.ctx
+            .realm
+            .borrow()
+            .array_proto
+            .as_ref()
+            .map(|handle| Value::object(handle.clone()))
+    }
+
+    /// The current realm's `%ObjectPrototype%`, for ordinary object allocation.
+    pub fn object_prototype(&self) -> Option<Value> {
+        self.ctx
+            .realm
+            .borrow()
+            .object_proto
+            .as_ref()
+            .map(|handle| Value::object(handle.clone()))
     }
 
     pub fn resolve_host_promise(
@@ -515,8 +583,16 @@ impl Interpreter {
         Ok(Value::function(value))
     }
 
-    pub(crate) fn mark_test262_done(&mut self) {
-        self.ctx.realm.borrow_mut().test262_done_called = true;
+    /// Record Test262's `$DONE` signal. When `error` is `Some`, `$DONE` was
+    /// invoked with a failure value; that value is retained so the host runner
+    /// can classify the test as failed even though the throw is swallowed by
+    /// the surrounding Promise reaction. First error wins.
+    pub(crate) fn mark_test262_done(&mut self, error: Option<Value>) {
+        let mut realm = self.ctx.realm.borrow_mut();
+        realm.test262_done_called = true;
+        if realm.test262_done_error.is_none() {
+            realm.test262_done_error = error;
+        }
     }
 
     /// Execute a compiled module's top-level function.
@@ -1723,6 +1799,7 @@ impl Interpreter {
             }
             Opcode::NewObject => {
                 let o = js_runtime::object::ObjectData::new_handle();
+                o.borrow_mut().proto = self.object_prototype();
                 self.top().stack.push(Value::object(o));
             }
             Opcode::NewRegex => {
@@ -1776,6 +1853,7 @@ impl Interpreter {
                     let mut obj = o.borrow_mut();
                     obj.class = "Array";
                     obj.is_exotic_array = true;
+                    obj.proto = self.array_prototype();
                     for (i, v) in args.iter().enumerate() {
                         obj.properties.insert(
                             i.to_string(),
@@ -2032,7 +2110,9 @@ impl Interpreter {
                 } else {
                     pop_args(self, ins.operand)
                 };
-                if let Some(value) = crate::builtins::construct_builtin(&callee, &args) {
+                if let Some(value) =
+                    crate::builtins::construct_builtin(&callee, &args, self.array_prototype())
+                {
                     set_constructor_chain(&value, &callee);
                     self.top().stack.push(value);
                     return Ok(Step::More);
@@ -2062,18 +2142,25 @@ impl Interpreter {
                 self.invoke(modules, callee, args, this, true);
             }
             Opcode::DynamicImport => {
-                let specifier = to_string(&self.top().stack.pop());
+                // The source expression was evaluated for side effects; its
+                // value (the runtime specifier) is popped only to keep the stack
+                // balanced. Resolution uses the request INDEX carried by the
+                // opcode, which encodes the full ModuleRequest (specifier +
+                // phase + attributes) — so two imports of the same specifier
+                // with different attributes resolve to distinct records. A
+                // sentinel index (`u16::MAX`, non-literal source) or an index
+                // with no host resolution yields "unresolved".
+                let _specifier = to_string(&self.top().stack.pop());
+                let request_index = ins.operand as usize;
                 let module_index = self.top().module_index;
                 let resolution = self
                     .dynamic_imports
                     .as_ref()
                     .and_then(|modules| modules.get(module_index))
-                    .and_then(|requests| requests.get(&specifier))
+                    .and_then(|requests| requests.get(request_index))
                     .cloned()
                     .unwrap_or_else(|| {
-                        Err(format!(
-                            "dynamic import `{specifier}` was not resolved by the module host"
-                        ))
+                        Err("dynamic import was not resolved by the module host".to_string())
                     });
                 let promise = crate::builtins::promise_pending();
                 self.dynamic_import_requests
@@ -3713,7 +3800,7 @@ impl Interpreter {
             // fixed after construction), so a `*const` borrow is stable for the
             // call's duration even though `self` is borrowed mutably inside it.
             let nf_ptr: *const dyn NativeFn = self.natives[nid as usize].as_ref();
-            let result = unsafe { (&*nf_ptr).call(self, modules, this, &f, args) };
+            let result = unsafe { (&*nf_ptr).call(self, modules, this, &f, args, is_construct) };
             match result {
                 Ok(NativeResult::Value(v)) => {
                     self.error_trace = prior_trace;
@@ -5078,14 +5165,20 @@ fn step_array_iterator(it: &Value) -> Value {
     }
 }
 
-/// Append `v` to an array-object (sets the next numeric index, bumps `length`).
 /// Construct an array-object from a vec of values (sets numeric indices + length).
-pub(crate) fn make_array(vals: Vec<Value>) -> Value {
+///
+/// `array_proto` is the realm's `%ArrayPrototype%`, threaded explicitly so the
+/// result links to the *current* realm's prototypes without any thread-local
+/// (which would break multi-realm isolation on one thread). Callers with an
+/// interpreter pass [`Interpreter::array_prototype`]; the few creation paths
+/// that have no realm (host bootstrapping) pass `None`.
+pub(crate) fn make_array(vals: Vec<Value>, array_proto: Option<Value>) -> Value {
     let o = js_runtime::object::ObjectData::new_handle();
     {
         let mut b = o.borrow_mut();
         b.class = "Array";
         b.is_exotic_array = true;
+        b.proto = array_proto;
         for (i, v) in vals.iter().enumerate() {
             b.properties.insert(
                 i.to_string(),

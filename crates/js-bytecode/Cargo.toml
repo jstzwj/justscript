@@ -11,3 +11,7 @@ description = "Stack-based bytecode + AST compiler for JustScript"
 js-syntax.workspace = true
 js-runtime.workspace = true
 js-diagnostics.workspace = true
+
+[dev-dependencies]
+js-parser.workspace = true
+js-vm.workspace = true

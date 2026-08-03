@@ -148,10 +148,28 @@ pub struct BytecodeModule {
     /// Top-level function declarations initialized during ModuleDeclaration-
     /// Instantiation, before any module body starts evaluating.
     pub module_function_initializers: Vec<(u16, u32)>,
-    /// Literal dynamic-import specifiers discovered during lowering. The host
-    /// preloads these module records without evaluating them.
-    pub dynamic_import_requests: Vec<String>,
+    /// Literal dynamic-import requests discovered during lowering. The host
+    /// preloads these module records without evaluating them. Each entry
+    /// carries the import phase and the attributes parsed from a literal
+    /// `{ with: { ... } }` options expression, so the host can preload the
+    /// correct typed module record (e.g. JSON vs JavaScript) for the same
+    /// specifier. Attributes are sorted; source order is not identity.
+    pub dynamic_import_requests: Vec<DynamicModuleRequest>,
     pub is_module: bool,
+}
+
+/// A literal dynamic-import request: specifier + phase + sorted attributes.
+///
+/// The phase and attributes come from the `import(source, options)` syntax
+/// when both `source` and `options` are literal enough to read at compile
+/// time. Non-literal dynamic imports are still executed; they simply are not
+/// preloaded by the host (the runtime specifier will not be found, matching
+/// the existing limitation for non-literal dynamic imports).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DynamicModuleRequest {
+    pub specifier: String,
+    pub phase: js_syntax::ImportPhase,
+    pub attributes: Vec<(String, String)>,
 }
 
 impl BytecodeModule {

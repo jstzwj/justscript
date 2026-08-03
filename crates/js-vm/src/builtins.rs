@@ -150,8 +150,13 @@ pub mod id {
     pub const OBJECT_CTOR: u16 = 131;
     pub const PROMISE_ALL: u16 = 132;
     pub const PROXY_CTOR: u16 = 133;
+    /// Test262 host surface: `%AbstractModuleSource%`. Installed on demand via
+    /// `install_test262_harness` (as `$262.AbstractModuleSource`), not present
+    /// in a plain realm. Objects exposed by source-phase imports carry this
+    /// constructor identity so `x instanceof $262.AbstractModuleSource` holds.
+    pub const ABSTRACT_MODULE_SOURCE_CTOR: u16 = 134;
     /// One-past-the-last id (for registering the dispatch table).
-    pub const COUNT: u16 = 134;
+    pub const COUNT: u16 = 135;
 }
 
 /// Resolve a static method on a global constructor function (Number/String).
@@ -190,6 +195,10 @@ pub fn native_static_value(obj: &Value, name: &str) -> Option<Value> {
     if function.native == Some(id::PROMISE_CTOR) && name == "prototype" {
         return Some(promise_prototype());
     }
+    // `Array.prototype` is NOT handled here: it is a real per-realm property on
+    // the Array constructor (set in `Interpreter::new`), so the ordinary
+    // property walk resolves it to the current realm's `%ArrayPrototype%`
+    // without any thread-local.
     if function.native == Some(id::SYMBOL_FN) {
         return match name {
             "toStringTag" => Some(Value::symbol(js_runtime::value::JsSymbol::to_string_tag())),
@@ -313,6 +322,7 @@ impl NativeFn for Builtin {
         this: Value,
         _f: &JsFunction,
         args: Vec<Value>,
+        is_construct: bool,
     ) -> Result<NativeResult, InterpError> {
         use id::*;
         let result = match self.id {
@@ -320,8 +330,8 @@ impl NativeFn for Builtin {
             ARR_POP => arr_pop(&this),
             ARR_SHIFT => arr_shift(&this),
             ARR_JOIN => arr_join(&this, args),
-            ARR_SLICE => arr_slice(&this, args),
-            ARR_CONCAT => arr_concat(&this, args),
+            ARR_SLICE => arr_slice(&this, args, interp.array_prototype()),
+            ARR_CONCAT => arr_concat(&this, args, interp.array_prototype()),
             ARR_INDEX_OF => arr_index_of(&this, args),
             ARR_INCLUDES => Value::boolean(arr_find(&this, &args).is_some()),
             ARR_REVERSE => arr_reverse(&this),
@@ -334,7 +344,7 @@ impl NativeFn for Builtin {
             ARR_SOME => return arr_some_every(interp, module, &this, args, false),
             ARR_EVERY => return arr_some_every(interp, module, &this, args, true),
             ARR_SORT => return arr_sort(interp, module, &this, args),
-            ARR_FLAT => arr_flat(&this, args),
+            ARR_FLAT => arr_flat(&this, args, interp.array_prototype()),
             ARR_FILL => arr_fill(&this, args),
             ARR_AT => arr_at(&this, args),
             STR_CHAR_AT => str_char_at(&this, args),
@@ -347,7 +357,7 @@ impl NativeFn for Builtin {
             STR_LOWER => str_map(&this, |s| s.to_lowercase()),
             STR_TRIM => str_map(&this, |s| s.trim().to_string()),
             STR_REPEAT => str_repeat(&this, args),
-            STR_SPLIT => str_split(&this, args),
+            STR_SPLIT => str_split(&this, args, interp.array_prototype()),
             STR_CONCAT => str_concat(&this, args),
             STR_PAD_START => str_pad(&this, args, true),
             STR_PAD_END => str_pad(&this, args, false),
@@ -382,9 +392,9 @@ impl NativeFn for Builtin {
                     }
                 }
                 match self.id {
-                    OBJECT_KEYS => object_keys(&args),
-                    OBJECT_VALUES => object_values(&args),
-                    OBJECT_ENTRIES => object_entries(&args),
+                    OBJECT_KEYS => object_keys(&args, interp.array_prototype()),
+                    OBJECT_VALUES => object_values(&args, interp.array_prototype()),
+                    OBJECT_ENTRIES => object_entries(&args, interp.array_prototype()),
                     OBJECT_ASSIGN => object_assign(args),
                     _ => unreachable!(),
                 }
@@ -398,7 +408,7 @@ impl NativeFn for Builtin {
             NUMBER_FN => to_number(&args),
             STRING_FN => Value::string(args.get(0).map(to_string).unwrap_or_default()),
             BOOLEAN_FN => Value::boolean(args.get(0).map(|v| is_truthy(v)).unwrap_or(false)),
-            ARRAY_CTOR => crate::interp::make_array(args),
+            ARRAY_CTOR => crate::interp::make_array(args, interp.array_prototype()),
             MAP_CTOR => collection_object("Map"),
             SET_CTOR => collection_object("Set"),
             WRAPPER_VALUE_OF => {
@@ -426,15 +436,34 @@ impl NativeFn for Builtin {
             }
             OBJECT_LOOKUP_GETTER => object_lookup_getter(&this, &args),
             OBJECT_LOOKUP_SETTER => object_lookup_accessor(&this, &args, false),
-            OBJECT_CTOR => Value::object(js_runtime::object::ObjectData::new_handle()),
+            OBJECT_CTOR => {
+                // A constructor call (`new Object()` or `super()` in a derived
+                // class) must keep the instance the construct path prepared —
+                // its [[Prototype]] is already correct (Object.prototype for
+                // `new Object()`, set by the construct fallback; the derived
+                // class's prototype when reached via `super()`). Returning a
+                // fresh object here would override that instance and break
+                // subclassing (`class C extends Object {}`). Only the function
+                // call `Object()` mints a new ordinary object.
+                if is_construct {
+                    return Ok(NativeResult::Value(this));
+                }
+                let o = js_runtime::object::ObjectData::new_handle();
+                o.borrow_mut().proto = interp.object_prototype();
+                Value::object(o)
+            }
             OBJECT_GET_PROTO => object_get_prototype(&args),
             OBJECT_SET_PROTO => return object_set_prototype(&args),
             OBJECT_IS_EXTENSIBLE => Value::boolean(object_is_extensible(&args)),
             OBJECT_PREVENT_EXTENSIONS => return object_prevent_extensions(&args, false),
             OBJECT_GET_OWN_DESC => return object_get_own_descriptor(&args),
             OBJECT_DEFINE_PROP => return object_define_property(&args, false),
-            OBJECT_GET_OWN_NAMES => object_own_keys(&args, OwnKeyKind::Strings),
-            OBJECT_GET_OWN_SYMBOLS => object_own_keys(&args, OwnKeyKind::Symbols),
+            OBJECT_GET_OWN_NAMES => {
+                object_own_keys(&args, OwnKeyKind::Strings, interp.array_prototype())
+            }
+            OBJECT_GET_OWN_SYMBOLS => {
+                object_own_keys(&args, OwnKeyKind::Symbols, interp.array_prototype())
+            }
             OBJECT_FREEZE => return object_freeze(&args),
             OBJECT_IS_FROZEN => Value::boolean(object_is_frozen(&args)),
             REFLECT_DEFINE_PROP => return object_define_property(&args, true),
@@ -450,7 +479,7 @@ impl NativeFn for Builtin {
             REFLECT_HAS => Value::boolean(reflect_has(&args)),
             REFLECT_PREVENT_EXTENSIONS => return object_prevent_extensions(&args, true),
             REFLECT_SET => Value::boolean(reflect_set(&args)),
-            REFLECT_OWN_KEYS => object_own_keys(&args, OwnKeyKind::All),
+            REFLECT_OWN_KEYS => object_own_keys(&args, OwnKeyKind::All, interp.array_prototype()),
             ARRAY_IS_ARRAY => Value::boolean(
                 matches!(args.get(0).map(|v| v.data().clone()), Some(ValueData::Object(o)) if o.borrow().is_exotic_array),
             ),
@@ -471,7 +500,9 @@ impl NativeFn for Builtin {
                     "ReferenceError",
                 )))
             }
-            JSON_PARSE => return json_parse(&args),
+            JSON_PARSE => {
+                return json_parse(&args, interp.array_prototype(), interp.object_prototype())
+            }
             NUM_TO_FIXED => return num_to_fixed(&this, &args),
             NUM_TO_STRING => return num_to_string(&this, &args),
             NUM_IS_INTEGER => Value::boolean(num_is_integer(&args)),
@@ -486,8 +517,8 @@ impl NativeFn for Builtin {
             STR_FROM_CHAR_CODE => return str_from_char_code(&args),
             STR_CODE_POINT_AT => return str_code_point_at(&this, &args),
             REGEX_TEST => regex_test(&this, &args),
-            REGEX_EXEC => return regex_exec(&this, &args),
-            STR_MATCH => return str_match(&this, &args),
+            REGEX_EXEC => return regex_exec(&this, &args, interp.array_prototype()),
+            STR_MATCH => return str_match(&this, &args, interp.array_prototype()),
             STR_SEARCH => Value::integer(str_search(&this, &args) as i32),
             // ---- test262 harness ----
             TEST262_ERROR_CTOR => {
@@ -511,8 +542,12 @@ impl NativeFn for Builtin {
                     args.into_iter().next().unwrap_or_else(Value::undefined),
                 )))
             }
-            PROMISE_ALL => return promise_all(&args),
+            PROMISE_ALL => return promise_all(&args, interp.array_prototype()),
             PROXY_CTOR => return proxy_constructor(&args),
+            // Test262 `%AbstractModuleSource%` host constructor. Returns a fresh
+            // ModuleSource object tagged with this constructor identity so the
+            // existing `instanceof` machinery recognises it.
+            ABSTRACT_MODULE_SOURCE_CTOR => return Ok(NativeResult::Value(new_module_source())),
             PROMISE_THEN => return promise_then(interp, &this, args),
             PROMISE_CATCH => {
                 let on_rejected = args.into_iter().next().unwrap_or_else(Value::undefined);
@@ -571,6 +606,12 @@ fn promise_prototype() -> Value {
     }
     PROTOTYPE.with(|prototype| Value::object(prototype.clone()))
 }
+
+// Per-realm `%ArrayPrototype%` / `%ObjectPrototype%` are read directly from the
+// interpreter's realm (`Interpreter::array_prototype` / `object_prototype`) and
+// threaded through ordinary array/object construction. There is deliberately no
+// thread-local here: a thread-local would let a second interpreter on the same
+// thread overwrite the first's prototypes, breaking realm isolation.
 
 pub(crate) fn promise_pending() -> JsObject {
     new_promise()
@@ -753,7 +794,7 @@ fn promise_resolve(
     }
 }
 
-fn promise_all(args: &[Value]) -> Result<NativeResult, InterpError> {
+fn promise_all(args: &[Value], array_proto: Option<Value>) -> Result<NativeResult, InterpError> {
     let iterable = args.first().cloned().unwrap_or_else(Value::undefined);
     let length = crate::interp::array_len(&iterable);
     let mut values = Vec::with_capacity(length);
@@ -772,7 +813,7 @@ fn promise_all(args: &[Value]) -> Result<NativeResult, InterpError> {
     }
     let promise = new_promise();
     promise.borrow_mut().promise.as_mut().unwrap().state =
-        PromiseState::Fulfilled(crate::interp::make_array(values));
+        PromiseState::Fulfilled(crate::interp::make_array(values, array_proto));
     Ok(NativeResult::Value(Value::object(promise)))
 }
 
@@ -906,7 +947,11 @@ fn collection_object(class: &'static str) -> Value {
     Value::object(object)
 }
 
-pub(crate) fn construct_builtin(callee: &Value, args: &[Value]) -> Option<Value> {
+pub(crate) fn construct_builtin(
+    callee: &Value,
+    args: &[Value],
+    array_proto: Option<Value>,
+) -> Option<Value> {
     use id::*;
     let native = callee.as_function()?.native?;
     let (class, primitive) = match native {
@@ -921,7 +966,7 @@ pub(crate) fn construct_builtin(callee: &Value, args: &[Value]) -> Option<Value>
             "Boolean",
             Some(Value::boolean(args.first().map(is_truthy).unwrap_or(false))),
         ),
-        ARRAY_CTOR => return Some(crate::interp::make_array(args.to_vec())),
+        ARRAY_CTOR => return Some(crate::interp::make_array(args.to_vec(), array_proto)),
         MAP_CTOR => return Some(collection_object("Map")),
         SET_CTOR => return Some(collection_object("Set")),
         _ => return None,
@@ -1232,9 +1277,9 @@ fn object_define_property(args: &[Value], reflect: bool) -> Result<NativeResult,
     }
 }
 
-fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
+fn object_own_keys(args: &[Value], kind: OwnKeyKind, array_proto: Option<Value>) -> Value {
     let Some(object) = args.first().and_then(crate::interp::obj_as_object) else {
-        return crate::interp::make_array(Vec::new());
+        return crate::interp::make_array(Vec::new(), array_proto);
     };
     let object = object.borrow();
     let mut keys = Vec::new();
@@ -1268,7 +1313,7 @@ fn object_own_keys(args: &[Value], kind: OwnKeyKind) -> Value {
             Value::symbol(symbol)
         }));
     }
-    crate::interp::make_array(keys)
+    crate::interp::make_array(keys, array_proto)
 }
 
 fn object_freeze(args: &[Value]) -> Result<NativeResult, InterpError> {
@@ -1475,7 +1520,7 @@ fn arr_join(this: &Value, args: Vec<Value>) -> Value {
     Value::string(parts.join(&sep))
 }
 
-fn arr_slice(this: &Value, args: Vec<Value>) -> Value {
+fn arr_slice(this: &Value, args: Vec<Value>, array_proto: Option<Value>) -> Value {
     let len = array_len(this) as isize;
     let start = clamp_index(arg_int(&args, 0).unwrap_or(0) as isize, len);
     let end = match arg_int(&args, 1) {
@@ -1488,10 +1533,10 @@ fn arr_slice(this: &Value, args: Vec<Value>) -> Value {
         out.push(array_get(this, i as usize));
         i += 1;
     }
-    make_array(out)
+    make_array(out, array_proto)
 }
 
-fn arr_concat(this: &Value, args: Vec<Value>) -> Value {
+fn arr_concat(this: &Value, args: Vec<Value>, array_proto: Option<Value>) -> Value {
     let mut out: Vec<Value> = (0..array_len(this)).map(|i| array_get(this, i)).collect();
     for a in args {
         if matches!(a.data(), ValueData::Object(o) if o.borrow().is_exotic_array) {
@@ -1502,7 +1547,7 @@ fn arr_concat(this: &Value, args: Vec<Value>) -> Value {
             out.push(a);
         }
     }
-    make_array(out)
+    make_array(out, array_proto)
 }
 
 fn arr_index_of(this: &Value, args: Vec<Value>) -> Value {
@@ -1626,7 +1671,7 @@ fn str_repeat(this: &Value, args: Vec<Value>) -> Value {
     Value::undefined()
 }
 
-fn str_split(this: &Value, args: Vec<Value>) -> Value {
+fn str_split(this: &Value, args: Vec<Value>, array_proto: Option<Value>) -> Value {
     let sep = arg_str(&args, 0);
     if let ValueData::String(s) = this.data() {
         if sep.is_empty() {
@@ -1636,12 +1681,13 @@ fn str_split(this: &Value, args: Vec<Value>) -> Value {
                     .chars()
                     .map(|c| Value::string(c.to_string()))
                     .collect(),
+                array_proto,
             );
         }
         let parts: Vec<Value> = s.as_str().split(&sep).map(Value::string).collect();
-        return make_array(parts);
+        return make_array(parts, array_proto);
     }
-    make_array(vec![this.clone()])
+    make_array(vec![this.clone()], array_proto)
 }
 
 fn str_concat(this: &Value, args: Vec<Value>) -> Value {
@@ -1705,7 +1751,7 @@ fn arr_sort(
     Ok(NativeResult::Value(this.clone()))
 }
 
-fn arr_flat(this: &Value, args: Vec<Value>) -> Value {
+fn arr_flat(this: &Value, args: Vec<Value>, array_proto: Option<Value>) -> Value {
     let depth = arg_int(&args, 0).unwrap_or(1).max(0) as usize;
     fn flatten(vals: &[Value], depth: usize, out: &mut Vec<Value>) {
         for v in vals {
@@ -1722,7 +1768,7 @@ fn arr_flat(this: &Value, args: Vec<Value>) -> Value {
     let vals: Vec<Value> = (0..len).map(|i| array_get(this, i)).collect();
     let mut out = Vec::new();
     flatten(&vals, depth, &mut out);
-    make_array(out)
+    make_array(out, array_proto)
 }
 
 fn arr_fill(this: &Value, args: Vec<Value>) -> Value {
@@ -2063,7 +2109,10 @@ fn arr_map(
         let elt = array_get(this, i);
         out.push(call_cb(interp, module, &cb, this, elt, i as i32)?);
     }
-    Ok(NativeResult::Value(make_array(out)))
+    Ok(NativeResult::Value(make_array(
+        out,
+        interp.array_prototype(),
+    )))
 }
 
 fn arr_filter(
@@ -2082,7 +2131,10 @@ fn arr_filter(
             out.push(elt);
         }
     }
-    Ok(NativeResult::Value(make_array(out)))
+    Ok(NativeResult::Value(make_array(
+        out,
+        interp.array_prototype(),
+    )))
 }
 
 fn arr_for_each(
@@ -2459,7 +2511,7 @@ fn math_sign(n: f64) -> Value {
     })
 }
 
-fn object_keys(args: &[Value]) -> Value {
+fn object_keys(args: &[Value], array_proto: Option<Value>) -> Value {
     let target = args.get(0).cloned().unwrap_or_else(Value::undefined);
     let keys: Vec<Value> = match target.data() {
         ValueData::Object(o) => {
@@ -2482,10 +2534,10 @@ fn object_keys(args: &[Value]) -> Value {
             .collect(),
         _ => Vec::new(),
     };
-    make_array(keys)
+    make_array(keys, array_proto)
 }
 
-fn object_values(args: &[Value]) -> Value {
+fn object_values(args: &[Value], array_proto: Option<Value>) -> Value {
     let target = args.get(0).cloned().unwrap_or_else(Value::undefined);
     let vals: Vec<Value> = match target.data() {
         ValueData::Object(o) => {
@@ -2513,14 +2565,14 @@ fn object_values(args: &[Value]) -> Value {
         }
         _ => Vec::new(),
     };
-    make_array(vals)
+    make_array(vals, array_proto)
 }
 
-fn object_entries(args: &[Value]) -> Value {
+fn object_entries(args: &[Value], array_proto: Option<Value>) -> Value {
     let target = args.get(0).cloned().unwrap_or_else(Value::undefined);
-    let keys = match object_keys(args).data().clone() {
-        ValueData::Object(_) => object_keys(args),
-        _ => return make_array(Vec::new()),
+    let keys = match object_keys(args, array_proto.clone()).data().clone() {
+        ValueData::Object(_) => object_keys(args, array_proto.clone()),
+        _ => return make_array(Vec::new(), array_proto),
     };
     let _ = keys;
     let mut entries: Vec<Value> = Vec::new();
@@ -2529,21 +2581,27 @@ fn object_entries(args: &[Value]) -> Value {
         if let Some(namespace) = &b.module_namespace {
             for (key, binding) in namespace {
                 if let Ok(value) = binding.get() {
-                    entries.push(make_array(vec![Value::string(key.clone()), value]));
+                    entries.push(make_array(
+                        vec![Value::string(key.clone()), value],
+                        array_proto.clone(),
+                    ));
                 }
             }
-            return make_array(entries);
+            return make_array(entries, array_proto);
         }
         for (k, d) in b.properties.iter() {
             if k == "length" && b.is_exotic_array {
                 continue;
             }
             if let js_runtime::object::PropertyDescriptor::Data { value, .. } = d {
-                entries.push(make_array(vec![Value::string(k.clone()), value.clone()]));
+                entries.push(make_array(
+                    vec![Value::string(k.clone()), value.clone()],
+                    array_proto.clone(),
+                ));
             }
         }
     }
-    make_array(entries)
+    make_array(entries, array_proto)
 }
 
 fn object_assign(args: Vec<Value>) -> Value {
@@ -2953,16 +3011,29 @@ fn thrown_name(v: &Value) -> Option<String> {
 /// as a throw so the runner observes it. (Async scheduling itself isn't
 /// supported, but synchronous `$DONE(value)` rejection paths still matter.)
 fn done(interp: &mut Interpreter, args: &[Value]) -> Result<NativeResult, InterpError> {
-    interp.mark_test262_done();
-    match args.get(0) {
-        Some(v) if !matches!(v.data(), ValueData::Undefined) => Err(InterpError::Throw(v.clone())),
-        _ => Ok(NativeResult::Value(Value::undefined())),
+    // `$DONE` with a non-undefined argument signals an async failure. Record
+    // the value on the realm BEFORE throwing: the throw occurs inside a Promise
+    // reaction and is otherwise lost, which previously let failing async tests
+    // be classified as PASS.
+    let error = args
+        .get(0)
+        .filter(|v| !matches!(v.data(), ValueData::Undefined))
+        .cloned();
+    interp.mark_test262_done(error.clone());
+    match error {
+        Some(v) => Err(InterpError::Throw(v)),
+        None => Ok(NativeResult::Value(Value::undefined())),
     }
 }
 
-/// Install the test262 harness globals (`assert`, `Test262Error`, `$DONE`) into a
-/// realm's global map. Not installed in a plain realm — the runtime conformance
-/// runner opts in.
+/// Install the test262 harness globals (`assert`, `Test262Error`, `$DONE`,
+/// `$262.AbstractModuleSource`) into a realm's global map. Not installed in a
+/// plain realm — the runtime conformance runner opts in.
+///
+/// `$262` is the host-defined object described by `test262/INTERPRETING.md`.
+/// Only the `AbstractModuleSource` property is populated today (the only
+/// property the source-phase-import tests exercise); other `$262` facets remain
+/// to be added.
 pub fn install_test262_harness(globals: &mut std::collections::HashMap<String, Value>) {
     use id::*;
     let mut assert = JsFunction::new("assert", 0, 1);
@@ -2986,6 +3057,41 @@ pub fn install_test262_harness(globals: &mut std::collections::HashMap<String, V
         native_fn("Test262Error", TEST262_ERROR_CTOR),
     );
     globals.insert("$DONE".to_string(), native_fn("$DONE", DONE));
+
+    // `%AbstractModuleSource%`: host-only constructor surfaced as
+    // `$262.AbstractModuleSource` per INTERPRETING.md. It is intentionally NOT
+    // installed on the global object.
+    let abstract_module_source = native_fn("AbstractModuleSource", ABSTRACT_MODULE_SOURCE_CTOR);
+    let dollar_262 = js_runtime::object::ObjectData::new_handle();
+    dollar_262.borrow_mut().properties.insert(
+        "AbstractModuleSource".into(),
+        js_runtime::object::PropertyDescriptor::data(abstract_module_source),
+    );
+    globals.insert("$262".to_string(), Value::object(dollar_262));
+}
+
+/// The constructor identity carried by every ModuleSource object created by the
+/// host, so `instanceof $262.AbstractModuleSource` resolves via the standard
+/// `constructor_chain` check in [`instanceof_check`].
+fn module_source_identity() -> js_runtime::object::ConstructorIdentity {
+    use id::*;
+    js_runtime::object::ConstructorIdentity {
+        module_index: 0,
+        function_id: 0,
+        native_id: Some(ABSTRACT_MODULE_SOURCE_CTOR),
+    }
+}
+
+/// Create a fresh ModuleSource object tagged with the `%AbstractModuleSource%`
+/// constructor identity. Used by the module host to populate each runtime
+/// module's `module_source_cell`, which source-phase imports bind to.
+pub fn new_module_source() -> Value {
+    let object = js_runtime::object::ObjectData::new_handle();
+    object
+        .borrow_mut()
+        .constructor_chain
+        .push(module_source_identity());
+    Value::object(object)
 }
 
 /// `a instanceof B`: for Error native constructors, checks `a.name`.
@@ -3028,26 +3134,51 @@ pub fn instanceof_check(a: &Value, b: &Value) -> bool {
 
 // ---- JSON.parse ----
 
-fn json_parse(args: &[Value]) -> Result<NativeResult, InterpError> {
-    let s = args.get(0).map(to_string).unwrap_or_default();
+fn json_parse(
+    args: &[Value],
+    array_proto: Option<Value>,
+    object_proto: Option<Value>,
+) -> Result<NativeResult, InterpError> {
+    let source = args.get(0).map(to_string).unwrap_or_default();
+    parse_json_intrinsic(&source, array_proto, object_proto)
+        .map(NativeResult::Value)
+        .map_err(|error| InterpError::Internal(format!("JSON.parse: {error}")))
+}
+
+/// Parse a JSON text into a [`Value`] using the engine's intrinsic JSON parser
+/// (`%JSON.parse%` semantics, minus the realm-global lookup). Host module
+/// loading calls this so a synthetic JSON Module Record's default export is
+/// produced by the intrinsic, never by a runtime `JSON.parse(...)` property
+/// access a dependency could have mutated (`ParseJSONModule`). `array_proto` /
+/// `object_proto` link the result to the realm's own prototypes. Mirrors
+/// `%JSON.parse%`: a trailing non-whitespace character is an error.
+pub fn parse_json_intrinsic(
+    source: &str,
+    array_proto: Option<Value>,
+    object_proto: Option<Value>,
+) -> Result<Value, String> {
     let mut parser = JsonParser {
-        chars: s.chars().collect(),
+        chars: source.chars().collect(),
         pos: 0,
+        array_proto,
+        object_proto,
     };
     parser.skip_ws();
-    let val = parser
-        .parse_value()
-        .map_err(|e| InterpError::Internal(format!("JSON.parse: {}", e)))?;
+    let value = parser.parse_value()?;
     parser.skip_ws();
     if parser.pos < parser.chars.len() {
-        return Err(InterpError::Internal("JSON.parse: trailing content".into()));
+        return Err("trailing content".into());
     }
-    Ok(NativeResult::Value(val))
+    Ok(value)
 }
 
 struct JsonParser {
     chars: Vec<char>,
     pos: usize,
+    /// `%ArrayPrototype%` linked onto parsed arrays.
+    array_proto: Option<Value>,
+    /// `%ObjectPrototype%` linked onto parsed objects.
+    object_proto: Option<Value>,
 }
 
 impl JsonParser {
@@ -3161,7 +3292,7 @@ impl JsonParser {
         let mut items = Vec::new();
         if self.peek() == Some(']') {
             self.bump();
-            return Ok(make_array(items));
+            return Ok(make_array(items, self.array_proto.clone()));
         }
         loop {
             items.push(self.parse_value()?);
@@ -3174,12 +3305,14 @@ impl JsonParser {
                 _ => return Err("expected , or ]".into()),
             }
         }
-        Ok(make_array(items))
+        Ok(make_array(items, self.array_proto.clone()))
     }
     fn parse_object(&mut self) -> Result<Value, String> {
         self.bump(); // {
         self.skip_ws();
-        let obj = Value::object(js_runtime::object::ObjectData::new_handle());
+        let handle = js_runtime::object::ObjectData::new_handle();
+        handle.borrow_mut().proto = self.object_proto.clone();
+        let obj = Value::object(handle);
         if self.peek() == Some('}') {
             self.bump();
             return Ok(obj);
@@ -3336,7 +3469,11 @@ fn regex_test(this: &Value, args: &[Value]) -> Value {
     Value::boolean(prog.run(&input, 0).is_some())
 }
 
-fn regex_exec(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> {
+fn regex_exec(
+    this: &Value,
+    args: &[Value],
+    array_proto: Option<Value>,
+) -> Result<NativeResult, InterpError> {
     let prog = match compile_regex_obj(this) {
         Some(p) => p,
         None => return Ok(NativeResult::Value(Value::null())),
@@ -3354,7 +3491,7 @@ fn regex_exec(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError>
                 }
             }
             // Set .index and .input on the result array.
-            let arr = make_array(items);
+            let arr = make_array(items, array_proto);
             if let Some((start, _)) = m.full_match() {
                 crate::interp::set_property(
                     &arr,
@@ -3369,7 +3506,11 @@ fn regex_exec(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError>
     }
 }
 
-fn str_match(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> {
+fn str_match(
+    this: &Value,
+    args: &[Value],
+    array_proto: Option<Value>,
+) -> Result<NativeResult, InterpError> {
     let re = args.get(0).cloned().unwrap_or_else(Value::undefined);
     // If arg is a RegExp, use it; else treat as a pattern string.
     let re_obj = if matches!(re.data(), ValueData::Object(o) if o.borrow().class == "RegExp") {
@@ -3387,7 +3528,7 @@ fn str_match(this: &Value, args: &[Value]) -> Result<NativeResult, InterpError> 
         }
         Value::object(o)
     };
-    regex_exec(&re_obj, &[this.clone()])
+    regex_exec(&re_obj, &[this.clone()], array_proto)
 }
 
 fn str_search(this: &Value, args: &[Value]) -> isize {

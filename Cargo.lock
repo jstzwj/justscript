@@ -376,8 +376,10 @@ name = "js-bytecode"
 version = "0.1.0"
 dependencies = [
  "js-diagnostics",
+ "js-parser",
  "js-runtime",
  "js-syntax",
+ "js-vm",
 ]
 
 [[package]]
@@ -426,6 +428,7 @@ dependencies = [
  "js-runtime",
  "js-syntax",
  "js-vm",
+ "serde_json",
 ]
 
 [[package]]

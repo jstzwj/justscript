@@ -587,3 +587,460 @@ export const stable = before === fn;
     let result = engine.run_module("main.js", &loader).unwrap();
     assert!(matches!(result.value.data(), ValueData::Boolean(true)));
 }
+
+// ---- typed module host: JSON / text / source-phase (PLAN C1–C4) ----
+
+/// JSON module default export round-trips a primitive value (C3).
+#[test]
+fn json_module_default_export_round_trips_a_primitive() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", "  -1.2345  ");
+    loader.insert(
+        "main.js",
+        "import value from './data.json' with { type: 'json' }; value;",
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    match result.value.data() {
+        ValueData::Number(value) => assert_eq_float(*value, -1.2345),
+        ValueData::Integer(value) => assert_eq!(*value, -1),
+        other => panic!("expected a number, found {other:?}"),
+    }
+}
+
+/// `assert.sameValue` uses `Object.is`; the harness rounds -0/+0 but not
+/// other floats. Keep a tiny epsilon helper for the JSON number round-trip.
+fn assert_eq_float(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
+
+/// The SAME JSON module imported twice must return the SAME default object
+/// identity (C3 idempotency — the graph cache keys on canonical URL + type).
+#[test]
+fn same_json_module_imported_twice_shares_object_identity() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", r#"{"answer": 42}"#);
+    loader.insert(
+        "main.js",
+        r#"
+import a from './data.json' with { type: 'json' };
+import b from './data.json' with { type: 'json' };
+a === b;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+/// A `.js`-named module imported as text yields its source as the default
+/// export and is NEVER parsed as JavaScript (C3 text type selection).
+#[test]
+fn javascript_file_imported_as_text_is_not_parsed() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("payload.js", "this is not (valid) javascript!");
+    loader.insert(
+        "main.js",
+        r#"
+import text from './payload.js' with { type: 'text' };
+text;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    match result.value.data() {
+        ValueData::String(value) => {
+            assert_eq!(value.as_str(), "this is not (valid) javascript!")
+        }
+        other => panic!("expected the unparsed text, found {other:?}"),
+    }
+}
+
+/// Empty text yields the empty string (C3).
+#[test]
+fn empty_text_module_yields_the_empty_string() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("empty.txt", "");
+    loader.insert(
+        "main.js",
+        "import text from './empty.txt' with { type: 'text' }; text === '';",
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+/// A JavaScript entry self-imported as text produces a DISTINCT typed record
+/// (C1/C3): the same canonical URL loaded once as JavaScript and once as text
+/// occupies two graph slots, so the text import does not create a false JS
+/// cycle and does not parse the entry as JavaScript.
+#[test]
+fn javascript_entry_self_imported_as_text_is_a_distinct_record() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert(
+        "main.js",
+        r#"
+// Self-import as text: must return this very source string, not re-enter JS.
+import selfSource from './main.js' with { type: 'text' };
+typeof selfSource === 'string' && selfSource.includes('Self-import as text');
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "self text-import should not create a JS cycle: {:?}",
+        result.value
+    );
+}
+
+/// Import-attribute SOURCE ORDERING does not alter request identity (C1):
+/// `{type:"json"}` and the same pair reordered must resolve to the SAME Module
+/// Record (attributes are canonicalized, not compared by source order).
+#[test]
+fn import_attribute_source_ordering_does_not_alter_request_identity() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", r#"{"v": 1}"#);
+    loader.insert(
+        "main.js",
+        // Two imports of the same JSON module with attributes in different
+        // orders. The graph cache must deduplicate them → one record → shared
+        // default object identity.
+        r#"
+import a from './data.json' with { type: 'json', another: 'x' };
+import b from './data.json' with { another: 'x', type: 'json' };
+a === b;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+/// The SAME URL with DIFFERENT module types yields DISTINCT records (C1): the
+/// graph cache key is canonical URL + module type, so `./m` as JSON and as text
+/// produce two unrelated default exports.
+#[test]
+fn same_url_with_different_module_types_yields_distinct_records() {
+    let mut loader = MemoryModuleLoader::new();
+    // The same source text loaded as JSON (parsed) vs as text (raw string).
+    loader.insert("m", r#"{"k": 7}"#);
+    loader.insert(
+        "main.js",
+        r#"
+import asJson from './m' with { type: 'json' };
+import asText from './m' with { type: 'text' };
+typeof asJson === 'object' && typeof asText === 'string' && asJson !== asText;
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(matches!(result.value.data(), ValueData::Boolean(true)));
+}
+
+/// An unsupported import `type` attribute surfaces as a structured module link
+/// error, never an internal VM fault or panic (C2).
+#[test]
+fn unsupported_import_type_is_a_link_error() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("m.wasm", "<bytes>");
+    loader.insert(
+        "main.js",
+        "import value from './m.wasm' with { type: 'webassembly' }; value;",
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let error = engine.run_module("main.js", &loader).unwrap_err();
+    let EngineError::Module(ModuleError::Link { message, .. }) = error else {
+        panic!("expected a module link error for unsupported type: {error:?}");
+    };
+    assert!(
+        message.contains("unsupported import attribute") && message.contains("webassembly"),
+        "unexpected message: {message}"
+    );
+}
+
+/// Source-phase import binds the local immutable import slot directly to the
+/// TARGET module's `module_source_cell`. Two source imports resolving to the
+/// same Module Record therefore share cell/value identity (C4), which is what
+/// makes a star re-export of a source binding unambiguous.
+#[test]
+fn source_phase_import_shares_one_module_source_across_importers() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("target.js", "export const answer = 42;");
+    loader.insert("a.js", "import source s from './target.js'; export { s };");
+    loader.insert("b.js", "import source s from './target.js'; export { s };");
+    loader.insert(
+        "main.js",
+        // Both re-exported source bindings resolve to the SAME ModuleSource
+        // object (the target module's `module_source_cell`), so the star
+        // re-export below is unambiguous.
+        r#"
+export * from './a.js';
+export * from './b.js';
+"#,
+    );
+    loader.insert(
+        "entry.js",
+        r#"
+import { s } from './main.js';
+typeof s === 'object';
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("entry.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "source-phase re-export should resolve to one ModuleSource: {:?}",
+        result.value
+    );
+}
+
+/// A source-phase import bound through a namespace re-export resolves to the
+/// ModuleSource object (C4: Module Namespace Exotic Object [[Get]]).
+#[test]
+fn source_phase_namespace_access_returns_the_module_source() {
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("target.js", "export const answer = 42;");
+    loader.insert(
+        "bridge.js",
+        "import source x from './target.js'; export { x };",
+    );
+    loader.insert(
+        "main.js",
+        r#"
+import * as ns from './bridge.js';
+typeof ns.x === 'object';
+"#,
+    );
+
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "ns.x should be the ModuleSource: {:?}",
+        result.value
+    );
+}
+
+/// The generic filesystem/memory loader does NOT understand the Test262
+/// `<module source>` host convention — it must decline (C4). The Test262 host
+/// wrapper that DOES handle the sentinel lives in js-test262, not here.
+#[test]
+fn generic_memory_loader_declines_the_module_source_sentinel() {
+    let loader = MemoryModuleLoader::new();
+    // The sentinel is not a registered module and must not be silently
+    // accepted by the generic loader.
+    let resolved = js_engine::ModuleLoader::resolve(&loader, Some("main.js"), "<module source>");
+    assert!(
+        resolved.is_err(),
+        "generic loader must not handle the sentinel"
+    );
+}
+
+#[test]
+fn json_module_values_carry_the_realm_prototypes() {
+    // Regression for json-value-array.js: a JSON module's arrays and nested
+    // objects must be connected to `%ArrayPrototype%` / `%ObjectPrototype%`,
+    // which must be the SAME objects `Array.prototype` / `Object.prototype`
+    // resolve to.
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", "[1, { \"k\": 2 }]");
+    loader.insert(
+        "main.js",
+        "import value from './data.json' with { type: 'json' };\n\
+         Object.getPrototypeOf(value) === Array.prototype &&\n\
+         Object.getPrototypeOf(value[1]) === Object.prototype &&\n\
+         Object.getOwnPropertyNames(value).length === 3;",
+    );
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "JSON prototype identity wrong: {:?}",
+        result.value
+    );
+}
+
+#[test]
+fn dynamic_import_with_attributes_resolves_a_typed_module() {
+    // Regression for json-idempotency.js: a literal
+    // `import(specifier, { with: { type: 'json' } })` must preload the request
+    // with its attributes so the dynamic import resolves a JSON (not JS)
+    // module. The same canonical URL + type must share the record produced by
+    // a static import of the same file.
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", "[1, 2, 3]");
+    loader.insert(
+        "main.js",
+        "import staticDefault from './data.json' with { type: 'json' };\n\
+         const ns = await import('./data.json', { with: { type: 'json' } });\n\
+         Array.isArray(ns.default) && ns.default.length === 3 && ns.default === staticDefault;",
+    );
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "dynamic import attributes wrong: {:?}",
+        result.value
+    );
+}
+
+#[test]
+fn multiple_engines_keep_their_own_realm_prototypes() {
+    // Regression for the thread-local prototype bug (fix #1): per-realm
+    // prototypes must not leak across engines on the same thread. Creating
+    // Engine B and running it — which under the old design overwrote a
+    // process-wide thread-local — must not change which prototype Engine A's
+    // arrays and JSON module values link to. We run A, then B (the clobbering
+    // step), then A again; A's second run must still report
+    // `getPrototypeOf(value) === Array.prototype`.
+    let mut loader_a = MemoryModuleLoader::new();
+    loader_a.insert("data.json", "[1, { \"k\": 2 }]");
+    loader_a.insert(
+        "main.js",
+        "import value from './data.json' with { type: 'json' };\n\
+         Object.getPrototypeOf(value) === Array.prototype &&\n\
+         Object.getPrototypeOf(value[1]) === Object.prototype &&\n\
+         value[0] === 1 && value[1].k === 2;",
+    );
+    let mut loader_b = MemoryModuleLoader::new();
+    loader_b.insert("data.json", "[9, 8, 7]");
+    loader_b.insert(
+        "main.js",
+        "import value from './data.json' with { type: 'json' };\n\
+         Object.getPrototypeOf(value) === Array.prototype &&\n\
+         value.length === 3;",
+    );
+
+    let mut engine_a = Engine::default_interpreter();
+    let mut engine_b = Engine::default_interpreter();
+
+    let a_first = engine_a.run_module("main.js", &loader_a).unwrap();
+    assert!(
+        matches!(a_first.value.data(), ValueData::Boolean(true)),
+        "engine A run 1 lost prototype identity: {:?}",
+        a_first.value
+    );
+    // Engine B runs on the same thread — under the old thread-local this would
+    // leave the active prototype pointing at B's realm.
+    let b = engine_b.run_module("main.js", &loader_b).unwrap();
+    assert!(
+        matches!(b.value.data(), ValueData::Boolean(true)),
+        "engine B lost prototype identity: {:?}",
+        b.value
+    );
+    // A again, after B. A's JSON module value must still link to A's own
+    // prototypes, not B's.
+    let a_again = engine_a.run_module("main.js", &loader_a).unwrap();
+    assert!(
+        matches!(a_again.value.data(), ValueData::Boolean(true)),
+        "engine A run 2 (after B) adopted B's prototype: {:?}",
+        a_again.value
+    );
+}
+
+#[test]
+fn same_specifier_with_different_dynamic_import_types_are_distinct() {
+    // Regression for the dynamic-import request-index fix (fix #2): two dynamic
+    // imports of the SAME specifier with DIFFERENT `with: { type }` must resolve
+    // to distinct Module Records — a JSON array vs the same text as a string —
+    // not collapse onto whichever type was preloaded. The `DynamicImport` opcode
+    // carries the request index, so the full ModuleRequest (specifier + phase +
+    // attributes) is the identity, per TC39 Module Requests.
+    let mut loader = MemoryModuleLoader::new();
+    loader.insert("data.json", "[1, 2, 3]");
+    loader.insert(
+        "main.js",
+        "const jsonNs = await import('./data.json', { with: { type: 'json' } });\n\
+         const textNs = await import('./data.json', { with: { type: 'text' } });\n\
+         Array.isArray(jsonNs.default) && jsonNs.default.length === 3 &&\n\
+         typeof textNs.default === 'string' && textNs.default === '[1, 2, 3]' &&\n\
+         jsonNs.default !== textNs.default;",
+    );
+    let mut engine = Engine::default_interpreter();
+    let result = engine.run_module("main.js", &loader).unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "same-specifier different-type dynamic imports collapsed to one record: {:?}",
+        result.value
+    );
+}
+
+#[test]
+fn intrinsic_prototype_chain_links_to_object_prototype() {
+    // Regression for the prototype-chain completeness fix:
+    //  - `Array.prototype.[[Prototype]] === Object.prototype`
+    //    (test262 built-ins/Array/prototype/proto.js).
+    //  - `Object()` and `new Object()` produce ordinary objects whose
+    //    [[Prototype]] is the realm's `%ObjectPrototype%`.
+    //  - array/object literals resolve through the same prototypes.
+    let mut engine = Engine::default_interpreter();
+    let result = engine
+        .run(
+            "Object.getPrototypeOf(Array.prototype) === Object.prototype &&\n\
+         Object.getPrototypeOf(Object()) === Object.prototype &&\n\
+         Object.getPrototypeOf(new Object()) === Object.prototype &&\n\
+         Object.getPrototypeOf([]) === Array.prototype &&\n\
+         Object.getPrototypeOf({}) === Object.prototype;",
+        )
+        .unwrap();
+    assert!(
+        matches!(result.value.data(), ValueData::Boolean(true)),
+        "prototype chain incomplete: {:?}",
+        result.value
+    );
+}
+
+#[test]
+fn same_engine_keeps_prototype_identity_and_builtin_modifications_across_runs() {
+    // Regression for the once-per-realm bootstrap fix: a realm is long-lived
+    // and shared across every interpreter this engine creates, so two `run`s in
+    // the same Engine must share one `%ObjectPrototype%` / `%ArrayPrototype%`
+    // (objects captured in run 1 still match the prototypes resolved in run 2),
+    // and user modifications to built-ins must NOT be overwritten by
+    // re-installation on run 2.
+    let mut engine = Engine::default_interpreter();
+    let first = engine
+        .run(
+            "globalThis.__arr = [];\n\
+             globalThis.__obj = {};\n\
+             globalThis.__arrayProto = Array.prototype;\n\
+             globalThis.__objectProto = Object.prototype;\n\
+             globalThis.__arrProto = Object.getPrototypeOf(globalThis.__arr);\n\
+             JSON.__mutated = 'yes';\n\
+             Object.getPrototypeOf(globalThis.__arr) === Array.prototype;",
+        )
+        .unwrap();
+    assert!(
+        matches!(first.value.data(), ValueData::Boolean(true)),
+        "run 1 lost prototype identity: {:?}",
+        first.value
+    );
+    let second = engine
+        .run(
+            "Object.getPrototypeOf(globalThis.__arr) === Array.prototype &&\n\
+             Object.getPrototypeOf(globalThis.__obj) === Object.prototype &&\n\
+             globalThis.__arrayProto === Array.prototype &&\n\
+             globalThis.__objectProto === Object.prototype &&\n\
+             globalThis.__arrProto === Array.prototype &&\n\
+             JSON.__mutated === 'yes';",
+        )
+        .unwrap();
+    assert!(
+        matches!(second.value.data(), ValueData::Boolean(true)),
+        "run 2 lost prototype identity or a builtin modification: {:?}",
+        second.value
+    );
+}

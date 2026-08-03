@@ -311,6 +311,55 @@ pub enum RuntimeOutcome {
 /// Tests `includes`-ing anything else need helpers we don't have → skip.
 const SUPPORTED_INCLUDES: &[&str] = &["assert.js", "sta.js"];
 
+/// The Test262 host-only specifier convention documented in
+/// `test262/INTERPRETING.md`: implementers resolve `<module source>` to a
+/// module that provides a valid Module Source (e.g. a WebAssembly module).
+/// JustScript exposes the host `%AbstractModuleSource%` object as every
+/// Module Record's `module_source_cell`, so loading this sentinel as an empty
+/// JavaScript module is sufficient — the source-phase import binds to that
+/// cell. The sentinel is intentionally NOT handled by the generic
+/// `FileModuleLoader`; it lives here in the Test262 host wrapper.
+const MODULE_SOURCE_SENTINEL: &str = "<module source>";
+
+/// A Test262-specific module host: delegates ordinary specifiers to the
+/// filesystem loader and resolves the `<module source>` virtual specifier to
+/// one stable empty module. The stable identity is what lets two fixtures
+/// importing `<module source>` share the same Module Record (and therefore
+/// the same `module_source_cell`), which the source-phase ambiguity tests
+/// rely on.
+struct Test262ModuleLoader {
+    fs: js_engine::FileModuleLoader,
+}
+
+impl Test262ModuleLoader {
+    fn new() -> Self {
+        Self {
+            fs: js_engine::FileModuleLoader,
+        }
+    }
+}
+
+impl js_engine::ModuleLoader for Test262ModuleLoader {
+    fn resolve(&self, referrer: Option<&str>, specifier: &str) -> Result<String, String> {
+        if specifier == MODULE_SOURCE_SENTINEL {
+            // Canonical key is the sentinel itself — every importer observes
+            // the same identity, so the graph cache deduplicates the request.
+            return Ok(MODULE_SOURCE_SENTINEL.to_string());
+        }
+        self.fs.resolve(referrer, specifier)
+    }
+
+    fn load(&self, key: &str) -> Result<std::sync::Arc<str>, String> {
+        if key == MODULE_SOURCE_SENTINEL {
+            // An empty JavaScript module. Its `module_source_cell` (populated
+            // by the engine for every Module Record) is what source-phase
+            // imports bind to; the body is never observed.
+            return Ok(std::sync::Arc::<str>::from(""));
+        }
+        self.fs.load(key)
+    }
+}
+
 /// Walk `root`, execute every runnable test in a **dedicated child process**
 /// (so a single test's crash — stack overflow, OOM, hang — can't take the whole
 /// runner down), and classify each outcome. Tests that are pure front-end cases
@@ -568,25 +617,37 @@ pub fn execute_test_file(
                 engine.install_test262_harness();
             }
             let execution = engine.execute(&source);
-            (execution, engine.test262_done_called())
+            (
+                execution,
+                engine.test262_done_called(),
+                engine.test262_done_error(),
+            )
         }));
         return match outcome {
-            Ok((exec, done)) => classify_async_outcome(exec, expect, async_test, done),
+            Ok((exec, done, done_error)) => {
+                classify_async_outcome(exec, expect, async_test, done, done_error)
+            }
             Err(_) => RuntimeOutcome::Incomplete("engine PANICKED".into()),
         };
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = js_engine::Engine::default_interpreter();
         engine.install_test262_harness();
-        let loader = js_engine::FileModuleLoader;
+        let loader = Test262ModuleLoader::new();
         let execution = match engine.run_module(&path.display().to_string(), &loader) {
             Ok(result) => js_engine::ExecutionOutcome::Completed(result.value),
             Err(error) => js_engine::ExecutionOutcome::Failed(error),
         };
-        (execution, engine.test262_done_called())
+        (
+            execution,
+            engine.test262_done_called(),
+            engine.test262_done_error(),
+        )
     }));
     match outcome {
-        Ok((exec, done)) => classify_async_outcome(exec, expect, async_test, done),
+        Ok((exec, done, done_error)) => {
+            classify_async_outcome(exec, expect, async_test, done, done_error)
+        }
         Err(_) => RuntimeOutcome::Incomplete("engine PANICKED".into()),
     }
 }
@@ -596,7 +657,15 @@ fn classify_async_outcome(
     expect: &Option<RuntimeExpect>,
     async_test: bool,
     done: bool,
+    done_error: Option<js_engine::Value>,
 ) -> RuntimeOutcome {
+    // `$DONE(value)` signals an async failure. The throw is swallowed by the
+    // surrounding Promise reaction, so the recorded value is the only reliable
+    // signal — it must force a FAIL even when the top-level script completed.
+    if let Some(error) = done_error {
+        let name = error.error_name().unwrap_or_else(|| "Error".into());
+        return RuntimeOutcome::Fail(format!("async $DONE({name})"));
+    }
     let outcome = classify_outcome(exec, expect);
     if async_test && matches!(outcome, RuntimeOutcome::Pass) && !done {
         RuntimeOutcome::Fail("async test completed without calling $DONE".into())
@@ -692,6 +761,7 @@ fn classify_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use js_engine::ModuleLoader;
 
     fn fm(flags: &[&str]) -> FrontMatter {
         FrontMatter {
@@ -731,5 +801,78 @@ mod tests {
         assert_eq!(files, [dir.join("case.js")]);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The Test262 host wrapper resolves the virtual `<module source>`
+    /// sentinel to a single stable canonical key, regardless of referrer, so
+    /// every importer observes the same Module Record (C4). Ordinary
+    /// specifiers delegate to the filesystem loader.
+    #[test]
+    fn test262_loader_resolves_module_source_sentinel_stably() {
+        let loader = Test262ModuleLoader::new();
+        let from_a = loader
+            .resolve(Some("/dir/a.js"), "<module source>")
+            .unwrap();
+        let from_b = loader
+            .resolve(Some("/other/b.js"), "<module source>")
+            .unwrap();
+        assert_eq!(from_a, "<module source>");
+        assert_eq!(from_a, from_b, "sentinel must canonicalize to one identity");
+        // Loads to an empty module body (the ModuleSource cell is what matters;
+        // it is populated by the engine for every record).
+        assert_eq!(loader.load("<module source>").unwrap().as_ref(), "");
+    }
+
+    /// The Test262 host wrapper still delegates ordinary specifiers to the
+    /// filesystem loader (the sentinel is the ONLY virtual path).
+    #[test]
+    fn test262_loader_delegates_ordinary_specifiers_to_filesystem() {
+        let dir = std::env::temp_dir().join(format!("justscript-t262-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("real.js");
+        std::fs::write(&path, "x").unwrap();
+        let loader = Test262ModuleLoader::new();
+        let resolved = loader
+            .resolve(Some(&path.display().to_string()), "./real.js")
+            .unwrap();
+        assert_eq!(loader.load(&resolved).unwrap().as_ref(), "x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression: `$DONE(value)` signals an async failure. The throw happens
+    /// inside a Promise reaction and used to be swallowed, so the realm only
+    /// recorded `done_called = true` and failing async tests were classified
+    /// as PASS. The realm now retains the failure value and the runner MUST
+    /// classify the test as `Fail`.
+    #[test]
+    fn done_called_with_an_error_is_classified_as_failure() {
+        let src = "Promise.resolve().then(function () {\n\
+                   \x20\x20$DONE(new Test262Error(\"forced async failure\"));\n\
+                   });";
+        let path = std::path::Path::new("done-error.js");
+        let expect = Some(RuntimeExpect::CleanRun);
+        let outcome = execute_test_file(path, src, &expect, Variant::Sloppy, true);
+        match outcome {
+            RuntimeOutcome::Fail(msg) => assert!(
+                msg.contains("$DONE"),
+                "expected an async-$DONE failure, got: {msg}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// Guard against over-triggering: a successful `$DONE()` (no argument) in a
+    /// Promise reaction must still PASS.
+    #[test]
+    fn done_called_with_no_argument_still_passes() {
+        let src = "Promise.resolve().then(function () { $DONE(); });";
+        let path = std::path::Path::new("done-ok.js");
+        let expect = Some(RuntimeExpect::CleanRun);
+        let outcome = execute_test_file(path, src, &expect, Variant::Sloppy, true);
+        assert!(
+            matches!(outcome, RuntimeOutcome::Pass),
+            "expected Pass, got {outcome:?}"
+        );
     }
 }

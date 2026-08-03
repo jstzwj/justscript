@@ -631,6 +631,189 @@ export default "ok";
     }
 
     #[test]
+    fn source_phase_import_disambiguation_and_ast_shape() {
+        use js_syntax::ast::{Decl, ImportPhase, ImportSpec, ProgramItem};
+
+        // Extract the first import declaration of a module, panicking on parse
+        // error or if the body does not start with an import.
+        fn only_import(src: &str) -> ImportSpec {
+            let m = parse_module(src).unwrap_or_else(|e| panic!("{src}: parse failed: {e:?}"));
+            match m.body.into_iter().next() {
+                Some(ProgramItem::Decl(Decl::Import { spec, .. })) => spec,
+                other => panic!("{src}: expected an Import decl, got {other:?}"),
+            }
+        }
+
+        // (1) `import source x from "m"` is phase Source with binding `x`.
+        match only_import("import source x from 'm';") {
+            ImportSpec::Default {
+                local,
+                namespace,
+                named,
+                request,
+            } => {
+                assert_eq!(local, "x");
+                assert_eq!(namespace, None);
+                assert!(
+                    named.is_empty(),
+                    "source-phase import admits no combined named spec"
+                );
+                assert_eq!(request.phase, ImportPhase::Source);
+                assert_eq!(request.specifier, "m");
+                assert!(request.attributes.is_empty());
+            }
+            other => panic!("source-phase form produced {other:?}"),
+        }
+
+        // (2) `import source from "m"` is an ordinary EVAL-phase default import
+        // whose local name is the identifier `source` — NOT source-phase.
+        match only_import("import source from 'm';") {
+            ImportSpec::Default { local, request, .. } => {
+                assert_eq!(
+                    local, "source",
+                    "eval-phase default must bind the name `source`"
+                );
+                assert_eq!(request.phase, ImportPhase::Eval);
+                assert_eq!(request.specifier, "m");
+            }
+            other => panic!("eval-phase default produced {other:?}"),
+        }
+
+        // (3) `import from from "m"` — `from` is a contextual keyword usable as
+        // a binding; this is an eval-phase default import named `from`. This
+        // mirrors the Test262 `import-source-binding-name_FIXTURE.js` shape.
+        match only_import("import from from 'm';") {
+            ImportSpec::Default { local, request, .. } => {
+                assert_eq!(local, "from");
+                assert_eq!(request.phase, ImportPhase::Eval);
+            }
+            other => panic!("`import from from` produced {other:?}"),
+        }
+
+        // (4) Source-phase import carries attributes (WithClause) and the phase
+        // survives onto the full ModuleRequest.
+        match only_import("import source binding from 'm' with { type: 'js' };") {
+            ImportSpec::Default { local, request, .. } => {
+                assert_eq!(local, "binding");
+                assert_eq!(request.phase, ImportPhase::Source);
+                assert_eq!(request.specifier, "m");
+                assert_eq!(request.attributes.len(), 1);
+                assert_eq!(request.attributes[0].key, "type");
+                assert_eq!(request.attributes[0].value, "js");
+            }
+            other => panic!("source-phase + attributes produced {other:?}"),
+        }
+
+        // (5) The literal Test262 fixture form (angle-bracketed specifier, and a
+        // trailing `export { mod }` re-export) parses and emits phase Source.
+        let fixture = "import source mod from '<module source>';\nexport { mod };\n";
+        let m = parse_module(fixture).expect("fixture must parse");
+        let mut it = m.body.into_iter();
+        match it.next() {
+            Some(ProgramItem::Decl(Decl::Import {
+                spec: ImportSpec::Default { local, request, .. },
+                ..
+            })) => {
+                assert_eq!(local, "mod");
+                assert_eq!(request.phase, ImportPhase::Source);
+                assert_eq!(request.specifier, "<module source>");
+            }
+            other => panic!("fixture import produced {other:?}"),
+        }
+        // The re-export is an ordinary local named export (the runtime
+        // reclassifies it to an indirect ~source~ export — Agent C's job).
+        match it.next() {
+            Some(ProgramItem::Decl(Decl::Export { spec, .. })) => match spec {
+                js_syntax::ast::ExportSpec::Named { items } => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].local.value(), "mod");
+                    assert_eq!(items[0].exported.value(), "mod");
+                }
+                other => panic!("fixture re-export produced {other:?}"),
+            },
+            other => panic!("fixture missing the re-export: {other:?}"),
+        }
+
+        // (6) Newlines are permitted everywhere in the production (no
+        // `[no LineTerminator here]`). This is the
+        // `import-source-newlines_FIXTURE.js` shape.
+        match only_import("import\n\n  source\n\n  y from '<do not resolve>';") {
+            ImportSpec::Default { local, request, .. } => {
+                assert_eq!(local, "y");
+                assert_eq!(request.phase, ImportPhase::Source);
+            }
+            other => panic!("multiline source-phase produced {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_phase_escaped_terminal_does_not_match() {
+        // Per ECMA-262, contextual grammar terminals must appear literally — a
+        // Unicode escape that decodes to `source` is NOT the source-phase
+        // terminal; it is an ordinary identifier binding. NOTE: the backslashes
+        // here are *literal JS source*. (A Rust `"\u{6f}"` would be resolved to
+        // `o` by Rust before reaching the parser, defeating the test.)
+        let escaped_terminal = r"import s\u{6f}urce x from 'm';";
+        // This is a SyntaxError either way: the escaped `source` is just an
+        // identifier binding, so `x` is then an unexpected second binding.
+        assert!(
+            parse_module(escaped_terminal).is_err(),
+            "an escaped `source` must NOT act as the source-phase terminal"
+        );
+
+        // But the same escape in the ordinary default-binding position is fine
+        // and binds the resolved name `source` at eval phase. (The resolved
+        // identifier `source` is a legal binding name.)
+        let escaped_binding = r"import s\u{6f}urce from 'm';";
+        let m = parse_module(escaped_binding).expect("escaped binding name should parse");
+        use js_syntax::ast::{Decl, ImportPhase, ImportSpec, ProgramItem};
+        match m.body.into_iter().next() {
+            Some(ProgramItem::Decl(Decl::Import {
+                spec: ImportSpec::Default { local, request, .. },
+                ..
+            })) => {
+                assert_eq!(
+                    local, "source",
+                    "the escape resolves to the cooked name `source`"
+                );
+                assert_eq!(request.phase, ImportPhase::Eval);
+            }
+            other => panic!("escaped eval-phase binding produced {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_phase_malformed_forms_are_syntax_errors() {
+        // The source-phase grammar admits only `import source Binding from Clause`.
+        // Each of these must be rejected, never silently accepted as the wrong
+        // phase.
+        for src in [
+            // No binding, then a `from` this is NOT source-phase: it is the
+            // ordinary eval-phase default `import source from "m"`, which is
+            // valid. Excluded from the rejection set on purpose.
+            // `* as ns` after `source` — source-phase has no namespace form.
+            "import source * as ns from 'm';",
+            // Combined default + named — source-phase has no combined form.
+            "import source x, { a } from 'm';",
+            // Combined default + namespace — source-phase has no combined form.
+            "import source x, * as ns from 'm';",
+            // Bare named form after `source` — source-phase has no named form.
+            "import source { a } from 'm';",
+            // Missing `from` entirely.
+            "import source x;",
+            // Missing binding entirely (and not the eval-phase default form).
+            "import source;",
+            // Reserved word that cannot be a binding.
+            "import source if from 'm';",
+        ] {
+            assert!(
+                parse_module(src).is_err(),
+                "malformed source-phase form should be rejected: {src}"
+            );
+        }
+    }
+
+    #[test]
     fn static_deferred_import_phase_and_grammar_boundaries() {
         use js_syntax::ast::{Decl, ImportPhase, ImportSpec, ProgramItem};
 

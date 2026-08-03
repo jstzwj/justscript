@@ -182,21 +182,124 @@ impl fmt::Display for ModuleError {
 
 impl std::error::Error for ModuleError {}
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RequestEntry {
     pub specifier: String,
     pub phase: ImportPhase,
+    /// Canonicalized import attributes; source order is not part of request
+    /// identity.
+    pub attributes: Vec<(String, String)>,
+}
+
+impl RequestEntry {
+    fn from_request(request: &ModuleRequest) -> Self {
+        let mut attributes: Vec<_> = request
+            .attributes
+            .iter()
+            .map(|attribute| (attribute.key.clone(), attribute.value.clone()))
+            .collect();
+        attributes.sort();
+        Self {
+            specifier: request.specifier.clone(),
+            phase: request.phase,
+            attributes,
+        }
+    }
+
+    pub fn module_type(&self) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find_map(|(key, value)| (key == "type").then_some(value.as_str()))
+    }
+
+    /// Render the request for diagnostics: the specifier plus its attributes
+    /// explicitly, so phase/attribute identity is never silently dropped. We do
+    /// NOT implement `Display` because that would invite misleading prints that
+    /// elide the very fields that distinguish requests.
+    pub fn describe(&self) -> String {
+        if self.attributes.is_empty() {
+            format!("`{}` (no attributes)", self.specifier)
+        } else {
+            let attrs: Vec<String> = self
+                .attributes
+                .iter()
+                .map(|(key, value)| format!("{key}: {value:?}"))
+                .collect();
+            format!("`{}` with {{ {} }}", self.specifier, attrs.join(", "))
+        }
+    }
+}
+
+/// The module type derived from normalized import attributes.
+///
+/// Per `ParseJSONModule` / `CreateTextModule`, only the `type` attribute
+/// selects a non-JavaScript module record; everything else is plain JavaScript.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ModuleType {
+    JavaScript,
+    Json,
+    Text,
+}
+
+impl ModuleType {
+    /// Select the module type from a normalized `type` attribute value.
+    ///
+    /// - no `type` attribute → [`ModuleType::JavaScript`];
+    /// - `type: "json"` → [`ModuleType::Json`];
+    /// - `type: "text"` → [`ModuleType::Text`];
+    /// - any other value → an `Err` carrying the structured diagnostic. The
+    ///   caller surfaces this as a module link error (a SyntaxError-like
+    ///   outcome), never an internal VM fault.
+    fn from_type_attribute(value: Option<&str>) -> Result<ModuleType, String> {
+        match value {
+            None => Ok(ModuleType::JavaScript),
+            Some("json") => Ok(ModuleType::Json),
+            Some("text") => Ok(ModuleType::Text),
+            Some(other) => Err(format!("unsupported import attribute `type: {other:?}`")),
+        }
+    }
+}
+
+impl RequestEntry {
+    /// Resolve this request's module type from its normalized attributes.
+    pub(crate) fn resolve_module_type(&self) -> Result<ModuleType, String> {
+        ModuleType::from_type_attribute(self.module_type())
+    }
+}
+
+/// Graph/cache identity for a loaded Module Record.
+///
+/// Identity is the canonical URL **plus** the derived [`ModuleType`], so the
+/// same canonical URL requested once as JavaScript and once as
+/// `{ type: "text" }` produces two distinct Module Records (e.g. the
+/// `text-self.js` entry loaded as JavaScript vs the same file self-imported as
+/// text). This mirrors `FinishLoadingImportedModule`'s requirement that the
+/// cache key carry the full ModuleRequest identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ModuleIdentity {
+    pub canonical_url: String,
+    pub module_type: ModuleType,
+}
+
+impl ModuleIdentity {
+    pub fn new(canonical_url: impl Into<String>, module_type: ModuleType) -> Self {
+        Self {
+            canonical_url: canonical_url.into(),
+            module_type,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) enum ImportedName {
     Name(String),
     Namespace,
+    Source,
 }
 
 #[derive(Clone)]
 pub(crate) struct ImportEntry {
-    pub request: String,
+    pub request: RequestEntry,
     pub phase: ImportPhase,
     pub imported: ImportedName,
     pub local_slot: usize,
@@ -210,15 +313,15 @@ pub(crate) enum ExportEntry {
     },
     Indirect {
         exported: String,
-        request: String,
+        request: RequestEntry,
         imported: String,
     },
     Star {
-        request: String,
+        request: RequestEntry,
     },
     Namespace {
         exported: String,
-        request: String,
+        request: RequestEntry,
     },
 }
 
@@ -232,7 +335,7 @@ pub(crate) struct ModuleMetadata {
     pub uninitialized_slots: HashSet<usize>,
     pub immutable_slots: HashSet<usize>,
     pub has_top_level_await: bool,
-    pub dynamic_requests: Vec<String>,
+    pub dynamic_requests: Vec<js_bytecode::DynamicModuleRequest>,
 }
 
 #[derive(Clone)]
@@ -245,11 +348,17 @@ pub(crate) struct RuntimeModule {
     pub key: String,
     pub compiled: Rc<CompiledModule>,
     pub metadata: ModuleMetadata,
-    pub dependencies: HashMap<String, usize>,
-    pub dynamic_dependencies: HashMap<String, DynamicResolution>,
+    pub dependencies: HashMap<RequestEntry, usize>,
+    /// Dynamic-import resolutions, indexed by the request index stored in the
+    /// `DynamicImport` opcode (which aligns 1:1 with `metadata.dynamic_requests`
+    /// in source order). Indexing by request — not specifier — keeps two imports
+    /// of the same specifier with different attributes distinct.
+    pub dynamic_dependencies: Vec<DynamicResolution>,
     pub environment: ModuleEnvironment,
     pub namespace: Option<Value>,
     pub namespace_cell: Cell,
+    /// Per-Module-Record identity exposed by source-phase imports.
+    pub module_source_cell: Cell,
     pub deferred_namespace: Option<Value>,
     pub status: ModuleStatus,
     pub pending_async_dependencies: usize,
@@ -257,7 +366,20 @@ pub(crate) struct RuntimeModule {
     pub async_evaluation_order: Option<u64>,
     pub evaluation_value: Option<Value>,
     pub evaluation_error: Option<Value>,
+    /// Pre-parsed default export for synthetic JSON modules (`ParseJSONModule`):
+    /// the value produced by the engine's intrinsic JSON parser at load time,
+    /// injected into the `*default*` cell without evaluating any bytecode. This
+    /// makes the module's default export independent of a realm-global
+    /// `JSON.parse` a dependency could have mutated. `None` for ordinary and
+    /// text modules (which evaluate their own `export default`).
+    pub default_export_value: Option<Value>,
     pub dynamic_import_waiters: Vec<js_runtime::object::JsObject>,
+    /// The type selected for this Module Record from its importer's normalized
+    /// attributes (or [`ModuleType::JavaScript`] for the entry). Synthetic
+    /// JSON/text records carry [`ModuleType::Json`] / [`ModuleType::Text`] so
+    /// the linker, evaluator, and namespace builder can specialize them
+    /// without re-deriving from attributes.
+    pub module_type: ModuleType,
 }
 
 /// Slot-backed Module Environment Record.
@@ -287,12 +409,22 @@ impl ModuleEnvironment {
     pub fn create_import_binding(&mut self, slot: usize, target: Cell) {
         self.bindings[slot] = Cell::immutable_import(target);
     }
+
+    /// Replace a direct local's cell with `cell`. Used to inject a host-prepared
+    /// value (e.g. a synthetic JSON module's default export) before instantiation
+    /// links import bindings, so importers capture the injected cell.
+    pub fn set_local(&mut self, slot: usize, cell: Cell) {
+        self.bindings[slot] = cell;
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct ModuleGraph {
     pub modules: Vec<RuntimeModule>,
-    pub by_key: HashMap<String, usize>,
+    /// Graph cache keyed by full [`ModuleIdentity`] (canonical URL + module
+    /// type). The same URL loaded as both JavaScript and
+    /// `{ type: "text" }` therefore occupies two distinct slots.
+    pub by_key: HashMap<ModuleIdentity, usize>,
 }
 
 pub(crate) fn analyze_module(compiled: &CompiledModule) -> Result<ModuleMetadata, ModuleError> {
@@ -343,7 +475,7 @@ fn analyze_import(
     match spec {
         ImportSpec::Bare { .. } => {}
         ImportSpec::Namespace { ns, .. } => metadata.imports.push(ImportEntry {
-            request: request.specifier.clone(),
+            request: RequestEntry::from_request(request),
             phase: request.phase,
             imported: ImportedName::Namespace,
             local_slot: local_slot(bytecode, module, ns)?,
@@ -351,7 +483,7 @@ fn analyze_import(
         ImportSpec::Named { items, .. } => {
             for item in items {
                 metadata.imports.push(ImportEntry {
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                     phase: request.phase,
                     imported: ImportedName::Name(item.imported.value().to_string()),
                     local_slot: local_slot(bytecode, module, &item.local)?,
@@ -365,14 +497,18 @@ fn analyze_import(
             ..
         } => {
             metadata.imports.push(ImportEntry {
-                request: request.specifier.clone(),
+                request: RequestEntry::from_request(request),
                 phase: request.phase,
-                imported: ImportedName::Name("default".into()),
+                imported: if request.phase == ImportPhase::Source {
+                    ImportedName::Source
+                } else {
+                    ImportedName::Name("default".into())
+                },
                 local_slot: local_slot(bytecode, module, local)?,
             });
             if let Some(namespace) = namespace {
                 metadata.imports.push(ImportEntry {
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                     phase: request.phase,
                     imported: ImportedName::Namespace,
                     local_slot: local_slot(bytecode, module, namespace)?,
@@ -380,7 +516,7 @@ fn analyze_import(
             }
             for item in named {
                 metadata.imports.push(ImportEntry {
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                     phase: request.phase,
                     imported: ImportedName::Name(item.imported.value().to_string()),
                     local_slot: local_slot(bytecode, module, &item.local)?,
@@ -447,7 +583,7 @@ fn analyze_export(
             for item in items {
                 metadata.exports.push(ExportEntry::Indirect {
                     exported: item.exported.value().to_string(),
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                     imported: item.local.value().to_string(),
                 });
             }
@@ -457,11 +593,11 @@ fn analyze_export(
             if let Some(exported) = exported {
                 metadata.exports.push(ExportEntry::Namespace {
                     exported: exported.value().to_string(),
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                 });
             } else {
                 metadata.exports.push(ExportEntry::Star {
-                    request: request.specifier.clone(),
+                    request: RequestEntry::from_request(request),
                 });
             }
         }
@@ -494,15 +630,9 @@ fn analyze_lexical_bindings(decl: &Decl, bytecode: &BytecodeModule, metadata: &m
 }
 
 fn push_request(metadata: &mut ModuleMetadata, request: &ModuleRequest) {
-    if !metadata
-        .requests
-        .iter()
-        .any(|entry| entry.specifier == request.specifier && entry.phase == request.phase)
-    {
-        metadata.requests.push(RequestEntry {
-            specifier: request.specifier.clone(),
-            phase: request.phase,
-        });
+    let request = RequestEntry::from_request(request);
+    if !metadata.requests.contains(&request) {
+        metadata.requests.push(request);
     }
 }
 
@@ -582,6 +712,39 @@ pub(crate) fn fresh_module_environment(
 
 fn normalize_key(key: &str) -> String {
     normalize_path(PathBuf::from(key))
+}
+
+/// Source text for a synthetic JSON Module Record.
+///
+/// Per `ParseJSONModule`, the default export is the value of parsing the source
+/// with the engine's intrinsic JSON parser — *not* a realm-global `JSON.parse`
+/// lookup that a dependency could have mutated before the module evaluates. The
+/// pipeline therefore parses the source at load time
+/// (`js_vm::builtins::parse_json_intrinsic`) and injects the value into the
+/// `*default*` cell; the module's bytecode is never evaluated.
+///
+/// This skeleton only exists so the compiler allocates the `*default*` local and
+/// a default-export entry (the AST analysis and linker need them). Its literal
+/// value is irrelevant because evaluation is skipped.
+pub(crate) const SYNTHETIC_JSON_MODULE_SOURCE: &str = "export default null;\n";
+
+/// Build the source text of a synthetic text Module Record.
+///
+/// Per `CreateTextModule`: `CreateDefaultExportSyntheticModule(source)`. The
+/// entire file contents become the single `default` export, never parsed as
+/// JavaScript. Empty text yields `""`.
+pub(crate) fn synthetic_text_module_source(original_source: &str) -> String {
+    match serde_json::to_string(original_source) {
+        Ok(quoted) => format!("export default {quoted};\n"),
+        // serde_json only fails on non-UTF strings, which we already hold as a
+        // Rust `str`; fall back to a hand encoding that escapes the characters
+        // `to_string` would (defensive — not expected to trigger).
+        Err(_) => format!(
+            "export default {};\n",
+            serde_json::to_string(&String::from_utf8_lossy(original_source.as_bytes()))
+                .unwrap_or_else(|_| "\"\"".into())
+        ),
+    }
 }
 
 fn normalize_path(path: PathBuf) -> String {

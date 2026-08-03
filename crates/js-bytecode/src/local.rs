@@ -32,6 +32,17 @@ impl LocalTable {
         i
     }
 
+    /// Associate a parameter binding with its positional frame slot.
+    ///
+    /// Parameter slots are reserved before local bindings are allocated. A
+    /// duplicate parameter name deliberately replaces the earlier mapping:
+    /// ordinary non-strict parameter instantiation exposes the last argument
+    /// supplied for that name while retaining every positional argument slot.
+    pub fn bind_parameter(&mut self, name: impl Into<String>, slot: u16) {
+        debug_assert!(slot < self.param_count);
+        self.by_name.insert(name.into(), slot);
+    }
+
     /// Look up an existing slot.
     pub fn get(&self, name: &str) -> Option<u16> {
         self.by_name.get(name).copied()

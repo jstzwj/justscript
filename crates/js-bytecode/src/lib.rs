@@ -22,6 +22,6 @@ pub use compiler::{
 };
 pub use constant::ConstantPool;
 pub use local::LocalTable;
-pub use module::{BytecodeFunction, BytecodeModule, DEFAULT_EXPORT_LOCAL};
+pub use module::{BytecodeFunction, BytecodeModule, DynamicModuleRequest, DEFAULT_EXPORT_LOCAL};
 pub use opcode::{Instruction, Opcode, OperandKind};
 pub use verify::{verify_module, VerifyError, BYTECODE_FORMAT_VERSION};

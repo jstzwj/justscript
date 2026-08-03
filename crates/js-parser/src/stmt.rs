@@ -449,6 +449,21 @@ fn eat_unescaped_keyword(tokens: &mut ParserTokenStream, keyword: Keyword) -> bo
     }
 }
 
+/// Whether the token *after* the current one could begin a BindingIdentifier —
+/// an IdentifierName (any `Ident`) or a contextual keyword usable as a binding
+/// (`await`/`yield`/`let`/`static`/`async`/`of`/`from`/`as`/`get`/`set`/…).
+/// Used by the source-phase import lookahead to disambiguate
+/// `import source <binding> from` from `import source from`.
+fn peek2_is_binding_start(tokens: &ParserTokenStream) -> bool {
+    match &tokens.peek2().kind {
+        TokenKind::Ident(_) => true,
+        TokenKind::Keyword(k) => {
+            crate::expr::keyword_binding_name(*k, tokens.current_ctx()).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// `from "module" WithClause?` — consume a complete module request.
 fn parse_module_request(tokens: &mut ParserTokenStream) -> Result<ModuleRequest, Vec<Diagnostic>> {
     parse_module_request_at_phase(tokens, ImportPhase::Eval)
@@ -686,7 +701,54 @@ fn parse_import(tokens: &mut ParserTokenStream, span: Span) -> Result<Decl, Vec<
         tokens.bump();
     }
 
-    let spec = if tokens.eat_punctuator(Punctuator::Mul) {
+    // `source` is a contextual terminal: it introduces the source-phase import
+    // production `import source ImportedBinding FromClause` ONLY when three
+    // conditions hold simultaneously:
+    //   (1) the current token is the *literal* spelling `source` — a Unicode
+    //       escape like `source` decodes to the same identifier name but,
+    //       per ECMA-262, contextual grammar terminals must be present
+    //       literally. `is_unescaped_ident_at` enforces this by inspecting the
+    //       raw source span for `\`, so an escaped `source` cannot masquerade
+    //       as the source-phase terminal. It is then free to be an ordinary
+    //       binding identifier elsewhere.
+    //   (2) the next token can begin a BindingIdentifier (an IdentifierName or
+    //       a contextual keyword); reserved words like `if` will be rejected
+    //       later by `binding_identifier`, surfacing a SyntaxError rather than
+    //       a silent misparse.
+    //   (3) the token after THAT is the `from` keyword — this is the
+    //       disambiguator that separates `import source x from "m"` (source
+    //       phase, binding `x`) from `import source from "m"` (an ordinary
+    //       eval-phase default import whose local name is the identifier
+    //       `source`). The two-token lookahead is required because `from` is
+    //       itself a valid BindingIdentifier in the eval-phase default form.
+    // The production has no `[no LineTerminator here]` restrictions, so
+    // newlines between `import`/`source`/`binding`/`from` are permitted (the
+    // `import-source-newlines_FIXTURE.js` test exercises this).
+    let is_source_phase = tokens.is_unescaped_ident_at(0, "source")
+        && peek2_is_binding_start(tokens)
+        && matches!(tokens.peek3().kind, TokenKind::Keyword(Keyword::From));
+    if is_source_phase {
+        tokens.bump();
+    }
+
+    let spec = if is_source_phase {
+        // `import source ImportedBinding from "m"` — a single binding only.
+        // The source-phase grammar does not admit the combined default+named
+        // or default+namespace forms; a trailing comma is therefore a
+        // SyntaxError (it surfaces as "expected `from`" below).
+        let local = expr::binding_identifier(tokens).ok_or_else(|| {
+            vec![Diagnostic::error(
+                tokens.span(),
+                "expected a source-phase import binding",
+            )]
+        })?;
+        ImportSpec::Default {
+            local,
+            namespace: None,
+            named: Vec::new(),
+            request: parse_module_request_at_phase(tokens, ImportPhase::Source)?,
+        }
+    } else if tokens.eat_punctuator(Punctuator::Mul) {
         // `import * as ns from "mod"`
         if !eat_unescaped_keyword(tokens, Keyword::As) {
             return Err(vec![Diagnostic::error(

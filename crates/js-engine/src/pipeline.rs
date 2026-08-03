@@ -2,8 +2,10 @@
 
 use crate::config::{EngineConfig, ExecutionMode};
 use crate::module::{
-    analyze_module, fresh_module_environment, CompiledModule, DynamicResolution, ExportEntry,
-    ImportedName, ModuleError, ModuleGraph, ModuleLoader, ModuleStatus, RuntimeModule,
+    analyze_module, fresh_module_environment, synthetic_text_module_source, CompiledModule,
+    DynamicResolution, ExportEntry, ImportedName, ModuleError, ModuleGraph, ModuleIdentity,
+    ModuleLoader, ModuleStatus, ModuleType, RequestEntry, RuntimeModule,
+    SYNTHETIC_JSON_MODULE_SOURCE,
 };
 use js_diagnostics::DiagnosticReport;
 use js_runtime::context::RealmContext;
@@ -173,8 +175,16 @@ impl Engine {
                 message,
             })
         })?;
+        let entry_identity = ModuleIdentity::new(entry_key, ModuleType::JavaScript);
+        // Create the interpreter before loading the graph: its `Interpreter::new`
+        // installs the realm globals and per-realm prototypes on the *shared*
+        // realm (`RealmContext.realm` is `Rc<RefCell<Realm>>`), so synthetic
+        // modules parsed at load time (JSON) can link their values to the
+        // realm's own Array/Object prototypes. The interpreter is configured and
+        // driven later, once the graph is linked.
+        let mut interpreter = js_vm::Interpreter::new(self.ctx_realm_clone());
         let mut graph = ModuleGraph::default();
-        let entry_index = self.load_module_graph(loader, &entry_key, &mut graph)?;
+        let entry_index = self.load_module_graph(loader, &entry_identity, &mut graph)?;
         link_module(&mut graph, entry_index).map_err(EngineError::Module)?;
         for index in 0..graph.modules.len() {
             if graph.modules[index].status == ModuleStatus::Unlinked {
@@ -195,7 +205,6 @@ impl Engine {
             .map(|module| module.compiled.clone())
             .collect();
         let bytecodes: Vec<_> = owners.iter().map(|module| &module.bytecode).collect();
-        let mut interpreter = js_vm::Interpreter::new(self.ctx_realm_clone());
         let module_locals = graph
             .modules
             .iter()
@@ -210,7 +219,7 @@ impl Engine {
                     .requests
                     .iter()
                     .filter(|request| request.phase == js_syntax::ImportPhase::Eval)
-                    .filter_map(|request| module.dependencies.get(&request.specifier).copied())
+                    .filter_map(|request| module.dependencies.get(request).copied())
                     .collect()
             })
             .collect();
@@ -222,12 +231,9 @@ impl Engine {
                 module
                     .dynamic_dependencies
                     .iter()
-                    .map(|(specifier, resolution)| {
-                        let resolution = match resolution {
-                            DynamicResolution::Resolved(index) => Ok(*index),
-                            DynamicResolution::Unresolved(message) => Err(message.clone()),
-                        };
-                        (specifier.clone(), resolution)
+                    .map(|resolution| match resolution {
+                        DynamicResolution::Resolved(index) => Ok(*index),
+                        DynamicResolution::Unresolved(message) => Err(message.clone()),
                     })
                     .collect()
             })
@@ -244,31 +250,87 @@ impl Engine {
     fn load_module_graph(
         &self,
         loader: &dyn ModuleLoader,
-        key: &str,
+        identity: &ModuleIdentity,
         graph: &mut ModuleGraph,
     ) -> Result<usize, EngineError> {
-        if let Some(index) = graph.by_key.get(key) {
+        if let Some(index) = graph.by_key.get(identity) {
             return Ok(*index);
         }
+        let key = identity.canonical_url.as_str();
         let source_text = loader.load(key).map_err(|message| {
             EngineError::Module(ModuleError::Load {
                 module: key.to_string(),
                 message,
             })
         })?;
+        // Select and validate the module type up-front (C2). An unsupported
+        // `type` attribute becomes a structured link error rather than letting
+        // the wrong parser goal run on the source.
+        let mut default_export_value: Option<Value> = None;
+        let module_text: String = match identity.module_type {
+            ModuleType::JavaScript => source_text.to_string(),
+            ModuleType::Json => {
+                // `ParseJSONModule`: the default export is the value of parsing
+                // the source with the engine's intrinsic JSON parser at load
+                // time — never a realm-global `JSON.parse` lookup a dependency
+                // could have mutated before this module evaluates. Invalid JSON
+                // is a link error. The realm's own prototypes are linked onto
+                // arrays/objects in the result. The interpreter created in
+                // `run_module` has already installed the per-realm prototypes on
+                // the shared realm, so read them straight off `ctx.realm`.
+                let (array_proto, object_proto) = {
+                    let realm = self.ctx.realm.borrow();
+                    (
+                        realm.array_proto.as_ref().map(|h| Value::object(h.clone())),
+                        realm
+                            .object_proto
+                            .as_ref()
+                            .map(|h| Value::object(h.clone())),
+                    )
+                };
+                let value =
+                    js_vm::builtins::parse_json_intrinsic(&source_text, array_proto, object_proto)
+                        .map_err(|message| {
+                            EngineError::Module(ModuleError::Load {
+                                module: key.to_string(),
+                                message: format!("invalid JSON module source: {message}"),
+                            })
+                        })?;
+                default_export_value = Some(value);
+                SYNTHETIC_JSON_MODULE_SOURCE.to_string()
+            }
+            ModuleType::Text => synthetic_text_module_source(&source_text),
+        };
         let compiled = Rc::new(
-            self.compile_named(key, &source_text, ProgramKind::Module)
+            self.compile_named(key, &module_text, ProgramKind::Module)
                 .map_err(EngineError::Compile)?,
         );
         let metadata = analyze_module(&compiled).map_err(EngineError::Module)?;
         let requests = metadata.requests.clone();
         let dynamic_requests = metadata.dynamic_requests.clone();
         let index = graph.modules.len();
-        graph.by_key.insert(key.to_string(), index);
+        graph.by_key.insert(identity.clone(), index);
         let namespace = Value::object(js_runtime::object::ObjectData::module_namespace(
             BTreeMap::new(),
         ));
-        let environment = fresh_module_environment(&compiled.bytecode, &metadata);
+        let mut environment = fresh_module_environment(&compiled.bytecode, &metadata);
+        // Inject a synthetic JSON module's pre-parsed default export into the
+        // `*default*` cell before the record is published, so import bindings
+        // captured during instantiation resolve to this value. The module's own
+        // bytecode is never evaluated (see `start_module`).
+        if let Some(value) = &default_export_value {
+            if let Some(slot) = compiled
+                .bytecode
+                .main
+                .locals
+                .get(js_bytecode::DEFAULT_EXPORT_LOCAL)
+            {
+                environment.set_local(
+                    usize::from(slot),
+                    js_runtime::value::Cell::initialized(value.clone(), false),
+                );
+            }
+        }
         graph.modules.push(RuntimeModule {
             key: key.to_string(),
             environment,
@@ -278,6 +340,14 @@ impl Engine {
             dynamic_dependencies: Default::default(),
             namespace: Some(namespace.clone()),
             namespace_cell: js_runtime::value::Cell::initialized(namespace, false),
+            // Every Module Record owns exactly one stable ModuleSource cell.
+            // Source-phase imports bind directly to this cell, and two source
+            // imports resolving to the same Module Record therefore share
+            // cell/value identity (C4).
+            module_source_cell: js_runtime::value::Cell::initialized(
+                js_vm::builtins::new_module_source(),
+                false,
+            ),
             deferred_namespace: None,
             status: ModuleStatus::Unlinked,
             pending_async_dependencies: 0,
@@ -285,16 +355,20 @@ impl Engine {
             async_evaluation_order: None,
             evaluation_value: None,
             evaluation_error: None,
+            default_export_value,
             dynamic_import_waiters: Vec::new(),
+            module_type: identity.module_type,
         });
 
         for request in requests {
-            if request.phase == js_syntax::ImportPhase::Source {
-                return Err(EngineError::Module(ModuleError::Unsupported {
+            // Validate the importer's attribute selection (C2) before resolving
+            // the dependency. Unsupported types surface as link errors.
+            let dep_module_type = request.resolve_module_type().map_err(|message| {
+                EngineError::Module(ModuleError::Link {
                     module: key.to_string(),
-                    feature: format!("{:?} import phase", request.phase),
-                }));
-            }
+                    message,
+                })
+            })?;
             let resolved = loader
                 .resolve(Some(key), &request.specifier)
                 .map_err(|message| {
@@ -304,22 +378,45 @@ impl Engine {
                         message,
                     })
                 })?;
-            let dependency = self.load_module_graph(loader, &resolved, graph)?;
+            let dep_identity = ModuleIdentity::new(resolved, dep_module_type);
+            let dependency = self.load_module_graph(loader, &dep_identity, graph)?;
             graph.modules[index]
                 .dependencies
-                .insert(request.specifier, dependency);
+                .insert(request, dependency);
         }
-        for specifier in dynamic_requests {
-            let resolution = match loader.resolve(Some(key), &specifier) {
-                Ok(resolved) => match self.load_module_graph(loader, &resolved, graph) {
-                    Ok(dependency) => DynamicResolution::Resolved(dependency),
-                    Err(error) => DynamicResolution::Unresolved(error.to_string()),
-                },
+        for request in dynamic_requests {
+            // Each dynamic-import `ModuleRequest` (specifier + phase + literal
+            // attributes from `import(src, { with: { ... } })`) is preloaded as
+            // the correct TYPED record (JSON/text/JS). Resolutions are pushed in
+            // source order so the per-request index carried by the `DynamicImport`
+            // opcode aligns with this Vec — keeping two imports of the same
+            // specifier with different attributes distinct, and sharing a record
+            // with any static import of the same canonical URL + type.
+            let entry = RequestEntry {
+                specifier: request.specifier.clone(),
+                phase: request.phase,
+                attributes: request.attributes.clone(),
+            };
+            let module_type = match entry.resolve_module_type() {
+                Ok(module_type) => module_type,
+                Err(message) => {
+                    graph.modules[index]
+                        .dynamic_dependencies
+                        .push(DynamicResolution::Unresolved(message));
+                    continue;
+                }
+            };
+            let resolution = match loader.resolve(Some(key), &request.specifier) {
+                Ok(resolved) => {
+                    let dyn_identity = ModuleIdentity::new(resolved, module_type);
+                    match self.load_module_graph(loader, &dyn_identity, graph) {
+                        Ok(dependency) => DynamicResolution::Resolved(dependency),
+                        Err(error) => DynamicResolution::Unresolved(error.to_string()),
+                    }
+                }
                 Err(message) => DynamicResolution::Unresolved(message),
             };
-            graph.modules[index]
-                .dynamic_dependencies
-                .insert(specifier, resolution);
+            graph.modules[index].dynamic_dependencies.push(resolution);
         }
         Ok(index)
     }
@@ -330,12 +427,20 @@ impl Engine {
     pub fn install_test262_harness(&mut self) {
         let mut realm = self.ctx.realm.borrow_mut();
         realm.test262_done_called = false;
+        realm.test262_done_error = None;
         js_vm::builtins::install_test262_harness(&mut realm.globals);
     }
 
     /// Whether `$DONE` was observed in this engine's dedicated Test262 realm.
     pub fn test262_done_called(&self) -> bool {
         self.ctx.realm.borrow().test262_done_called
+    }
+
+    /// The failure value passed to `$DONE`, if any. When present, the test must
+    /// be classified as failed regardless of the top-level completion value,
+    /// because the throw is swallowed by the surrounding Promise reaction.
+    pub fn test262_done_error(&self) -> Option<Value> {
+        self.ctx.realm.borrow().test262_done_error.clone()
     }
 
     /// Parse + compile + execute with the same failure taxonomy as [`Self::run`].
@@ -474,12 +579,7 @@ fn link_module(graph: &mut ModuleGraph, index: usize) -> Result<(), ModuleError>
         .metadata
         .requests
         .iter()
-        .filter_map(|request| {
-            graph.modules[index]
-                .dependencies
-                .get(&request.specifier)
-                .copied()
-        })
+        .filter_map(|request| graph.modules[index].dependencies.get(request).copied())
         .collect();
     for dependency in dependency_order {
         if let Err(error) = link_module(graph, dependency) {
@@ -496,7 +596,7 @@ fn link_module(graph: &mut ModuleGraph, index: usize) -> Result<(), ModuleError>
             .get(&import.request)
             .ok_or_else(|| ModuleError::Link {
                 module: graph.modules[index].key.clone(),
-                message: format!("request `{}` was not loaded", import.request),
+                message: format!("request {} was not loaded", import.request.describe()),
             })?;
         let cell = match import.imported {
             ImportedName::Name(name) => {
@@ -504,12 +604,17 @@ fn link_module(graph: &mut ModuleGraph, index: usize) -> Result<(), ModuleError>
                     ModuleError::Link {
                         module: graph.modules[index].key.clone(),
                         message: format!(
-                            "module `{}` does not export `{name}`",
-                            graph.modules[dependency].key
+                            "module `{}` ({:?}) does not export `{name}`",
+                            graph.modules[dependency].key, graph.modules[dependency].module_type
                         ),
                     }
                 })?
             }
+            // Source-phase import (C4): bind the local immutable import slot
+            // directly to the TARGET module's `module_source_cell`. Two source
+            // imports resolving to the same Module Record therefore observe
+            // cell identity (required for unambiguous star re-export).
+            ImportedName::Source => graph.modules[dependency].module_source_cell.clone(),
             ImportedName::Namespace => {
                 if import.phase == js_syntax::ImportPhase::Defer {
                     let namespace = module_namespace_deferred(graph, dependency)?;
@@ -551,6 +656,24 @@ fn link_module(graph: &mut ModuleGraph, index: usize) -> Result<(), ModuleError>
     Ok(())
 }
 
+/// If `cell` is (or indirectly points at) some runtime module's
+/// `module_source_cell`, return that source cell. This is the cell-identity
+/// test that lets a source-phase re-export (`import source x; export { x };`)
+/// resolve to the underlying ModuleSource. [`Cell::ptr_eq`] already recurses
+/// through indirect import cells, so a local binding created via
+/// `create_import_binding(slot, target.module_source_cell)` is recognised here.
+fn find_module_source_cell(
+    graph: &ModuleGraph,
+    cell: &js_runtime::value::Cell,
+) -> Option<js_runtime::value::Cell> {
+    for module in &graph.modules {
+        if js_runtime::value::Cell::ptr_eq(cell, &module.module_source_cell) {
+            return Some(module.module_source_cell.clone());
+        }
+    }
+    None
+}
+
 fn resolve_export(
     graph: &ModuleGraph,
     index: usize,
@@ -566,7 +689,22 @@ fn resolve_export(
             ExportEntry::Local {
                 exported,
                 local_slot,
-            } if exported == name => return Ok(Some(module.environment.binding(*local_slot))),
+            } if exported == name => {
+                let local_cell = module.environment.binding(*local_slot);
+                // Source-phase re-export (C4): `import source x from "...";
+                // export { x };` reclassifies into an indirect ExportEntry
+                // whose [[BindingName]] is ~source~. We detect it by cell
+                // identity — the local binding was created as an immutable
+                // import of the target's `module_source_cell`. Resolving the
+                // re-export therefore returns that shared source cell, which is
+                // what makes `ns.x` and named re-imports observe the
+                // ModuleSource and what lets two star exports of the same
+                // source binding agree (unambiguous).
+                if let Some(source_cell) = find_module_source_cell(graph, &local_cell) {
+                    return Ok(Some(source_cell));
+                }
+                return Ok(Some(local_cell));
+            }
             ExportEntry::Indirect {
                 exported,
                 request,
@@ -896,12 +1034,7 @@ impl<'a, 'b> ModuleEvaluator<'a, 'b> {
             .requests
             .iter()
             .filter(|request| request.phase == js_syntax::ImportPhase::Eval)
-            .filter_map(|request| {
-                self.graph.modules[index]
-                    .dependencies
-                    .get(&request.specifier)
-                    .copied()
-            })
+            .filter_map(|request| self.graph.modules[index].dependencies.get(request).copied())
             .filter(|dependency| seen.insert(*dependency))
             .collect();
         for dependency in dependency_order {
@@ -928,6 +1061,18 @@ impl<'a, 'b> ModuleEvaluator<'a, 'b> {
     }
 
     fn start_module(&mut self, index: usize) -> Result<(), EngineError> {
+        // Synthetic JSON modules never execute bytecode: their default export is
+        // the host-parsed JSON value (`ParseJSONModule`), pre-set into the
+        // `*default*` cell at load time. Running the skeleton's
+        // `export default null;` would clobber it, and would also re-introduce a
+        // realm-global dependency if the skeleton ever changed — so skip
+        // evaluation entirely. The module completes immediately; importers and
+        // the namespace read the pre-set cell.
+        if self.graph.modules[index].module_type == ModuleType::Json
+            && self.graph.modules[index].default_export_value.is_some()
+        {
+            return self.complete_module(index, Value::undefined());
+        }
         let locals = self.graph.modules[index].environment.snapshot();
         match self
             .interpreter

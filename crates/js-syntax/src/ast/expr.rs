@@ -9,7 +9,7 @@ use crate::Span;
 pub type BoxExpr = Box<Expr>;
 
 /// Which phase a static or dynamic module request targets.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub enum ImportPhase {
     /// An ordinary static import or `import(...)`.
     #[default]

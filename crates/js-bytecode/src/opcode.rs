@@ -299,7 +299,8 @@ impl Opcode {
             | Opcode::CallMethod
             | Opcode::New
             | Opcode::CallSuper
-            | Opcode::NewArray => ArgumentCount,
+            | Opcode::NewArray
+            | Opcode::DynamicImport => ArgumentCount,
             Opcode::TryBegin => Handler,
             Opcode::LoadClassFieldKey => ClassField,
             Opcode::GetTemplateObject => TemplateSite,

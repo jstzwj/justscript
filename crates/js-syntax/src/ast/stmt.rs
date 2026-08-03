@@ -244,6 +244,20 @@ pub struct ModuleRequest {
     pub attributes: Vec<ImportAttribute>,
 }
 
+impl ModuleRequest {
+    /// Whether this request targets the source phase (`import source …`).
+    #[inline]
+    pub fn is_source_phase(&self) -> bool {
+        self.phase == ImportPhase::Source
+    }
+
+    /// Whether this request targets the defer phase (`import defer * as …`).
+    #[inline]
+    pub fn is_defer_phase(&self) -> bool {
+        self.phase == ImportPhase::Defer
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportAttribute {
     pub span: Span,
@@ -297,4 +311,28 @@ pub enum ExportSpec {
 pub struct ExportItem {
     pub local: ModuleExportName,
     pub exported: ModuleExportName,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_request_phase_helpers_match_the_phase_field() {
+        let mut request = ModuleRequest {
+            specifier: "m".to_string(),
+            phase: ImportPhase::Eval,
+            attributes: Vec::new(),
+        };
+        assert!(!request.is_source_phase());
+        assert!(!request.is_defer_phase());
+
+        request.phase = ImportPhase::Source;
+        assert!(request.is_source_phase());
+        assert!(!request.is_defer_phase());
+
+        request.phase = ImportPhase::Defer;
+        assert!(!request.is_source_phase());
+        assert!(request.is_defer_phase());
+    }
 }

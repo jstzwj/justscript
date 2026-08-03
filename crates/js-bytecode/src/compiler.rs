@@ -14,7 +14,9 @@ use crate::constant::ConstantPool;
 use crate::module::{BytecodeFunction, BytecodeModule};
 use crate::opcode::{Instruction, Opcode};
 use js_diagnostics::{DiagResult, Diagnostic};
-use js_syntax::ast::expr::{AssignTarget, CallArg, Expr, MemberExpr, MemberProp, ObjectPropValue};
+use js_syntax::ast::expr::{
+    AssignTarget, CallArg, Expr, MemberExpr, MemberProp, ObjectPropKind, ObjectPropValue,
+};
 use js_syntax::ast::lit::Lit;
 use js_syntax::ast::op::{BinOp, UpdateOp};
 use js_syntax::ast::pat::Pat;
@@ -558,7 +560,7 @@ fn compile_function_value(
     let id = (ctx.functions.len() + 1) as u32;
     ctx.functions.push(BytecodeFunction::default());
     let fname = name.unwrap_or("<anonymous>").to_string();
-    let mut nested = BytecodeFunction::new(span, fname.clone(), 0);
+    let mut nested = BytecodeFunction::new(span, fname.clone(), params.len() as u16);
     nested.is_arrow = is_arrow;
     nested.is_async = is_async;
     nested.is_generator = is_generator;
@@ -573,7 +575,8 @@ fn compile_function_value(
     for (i, p) in params.iter().enumerate() {
         match p {
             Pat::Ident { name, .. } => {
-                let slot = nested.locals.intern(name);
+                let slot = i as u16;
+                nested.locals.bind_parameter(name, slot);
                 ctx.scopes
                     .last_mut()
                     .unwrap()
@@ -581,7 +584,7 @@ fn compile_function_value(
                     .insert(name.clone(), slot);
             }
             _ => {
-                let scratch = nested.locals.intern(format!("<param{}>", i));
+                let scratch = i as u16;
                 declare_pattern_names(p, &mut nested, ctx);
                 pattern_params.push((scratch, p));
             }
@@ -706,18 +709,19 @@ fn compile_class_value(
     // Build the user-visible constructor body. Instance fields execute through
     // a separate initializer at the base/derived construction boundary.
     let fname = name.unwrap_or("<class>").to_string();
-    let mut ctor = BytecodeFunction::new(span, fname, 0);
+    let mut ctor = BytecodeFunction::new(span, fname, ctor_params.len() as u16);
     ctx.scopes.push(Scope::default());
     for (i, p) in ctor_params.iter().enumerate() {
         if let Pat::Ident { name, .. } = p {
-            let slot = ctor.locals.intern(name);
+            let slot = i as u16;
+            ctor.locals.bind_parameter(name, slot);
             ctx.scopes
                 .last_mut()
                 .unwrap()
                 .locals
                 .insert(name.clone(), slot);
         } else {
-            ctor.locals.intern(format!("<ctor-param{}>", i));
+            // The positional slot was reserved by BytecodeFunction::new.
         }
     }
     ctor.param_count = ctor_params.len() as u16;
@@ -1081,6 +1085,56 @@ fn compile_stmt_list_body(body: &[Stmt], func: &mut BytecodeFunction, ctx: &mut 
     compile_block(&items, func, ctx, false);
 }
 
+/// Extract import attributes from a literal `import(source, options)` options
+/// expression of the shape `{ with: { key: "value", ... } }`. Returns `None`
+/// for any non-literal form (computed keys, non-string values, spread, or
+/// accessor properties) so the caller records the request with no static
+/// attributes. Attributes are sorted so source order is not part of request
+/// identity.
+fn extract_literal_import_attributes(options: Option<&Expr>) -> Option<Vec<(String, String)>> {
+    use js_syntax::ast::pat::PropKey;
+    let with_expr = match options {
+        Some(Expr::Object { props, .. }) => props.iter().find_map(|prop| {
+            if prop.computed || !matches!(prop.kind, ObjectPropKind::Init) {
+                return None;
+            }
+            let is_with = match &prop.key {
+                PropKey::Ident(name) | PropKey::String(name) => name == "with",
+                _ => false,
+            };
+            if !is_with {
+                return None;
+            }
+            match &prop.value {
+                ObjectPropValue::Expr(expr) => Some(expr),
+                _ => None,
+            }
+        }),
+        _ => None,
+    }?;
+    let inner_props = match with_expr {
+        Expr::Object { props, .. } => props,
+        _ => return None,
+    };
+    let mut attributes = Vec::new();
+    for prop in inner_props {
+        if prop.computed || !matches!(prop.kind, ObjectPropKind::Init) {
+            return None;
+        }
+        let key = match &prop.key {
+            PropKey::Ident(name) | PropKey::String(name) => name.clone(),
+            _ => return None,
+        };
+        let value = match &prop.value {
+            ObjectPropValue::Expr(Expr::Lit(Lit::String(_, raw, _))) => raw.clone(),
+            _ => return None,
+        };
+        attributes.push((key, value));
+    }
+    attributes.sort();
+    Some(attributes)
+}
+
 fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx) {
     let start_pc = func.code.len();
     match expr {
@@ -1119,16 +1173,20 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             // on the taken branch.
             compile_expr(left, func, ctx);
             func.emit_bare(Opcode::Dup);
+            if *op == BinOp::NullishCoal {
+                let rhs = emit_placeholder(func, Opcode::JumpIfNullish);
+                let done = emit_placeholder(func, Opcode::Jump);
+                patch(func, rhs, func.here());
+                func.emit_bare(Opcode::Pop);
+                compile_expr(right, func, ctx);
+                patch(func, done, func.here());
+                func.annotate_since(start_pc, expr.span());
+                return;
+            }
             let jmp = match op {
                 BinOp::And => emit_placeholder(func, Opcode::JumpIfFalse),
                 BinOp::Or => emit_placeholder(func, Opcode::JumpIfTrue),
-                _ => {
-                    // ?? — not short-circuited here; fall back to evaluating both.
-                    compile_expr(right, func, ctx);
-                    func.emit_bare(Opcode::Pop);
-                    func.annotate_since(start_pc, expr.span());
-                    return;
-                }
+                _ => unreachable!("logical expression has a logical operator"),
             };
             // Fall-through (a had the "continue" truthiness): drop `a`, push `b`.
             func.emit_bare(Opcode::Pop);
@@ -1568,14 +1626,41 @@ fn compile_expr(expr: &Expr, func: &mut BytecodeFunction, ctx: &mut CompilerCtx)
             compile_expr(arg, func, ctx);
             func.emit_bare(Opcode::Await);
         }
-        Expr::ImportCall { source, .. } => {
-            if let Expr::Lit(Lit::String(_, specifier, _)) = source.as_ref() {
-                if !ctx.dynamic_import_requests.contains(specifier) {
-                    ctx.dynamic_import_requests.push(specifier.clone());
+        Expr::ImportCall {
+            source,
+            phase,
+            options,
+            ..
+        } => {
+            // Resolve the static ModuleRequest (specifier + phase + attributes)
+            // when the source is a string literal, and record it so the host can
+            // preload the correct typed record. The `DynamicImport` opcode
+            // carries the request INDEX (not the specifier) so two imports of the
+            // same specifier with different attributes resolve to distinct Module
+            // Records — the full ModuleRequest is the identity (TC39). A
+            // non-literal source has no static request and resolves as
+            // "unresolved" at runtime (sentinel index `u16::MAX`).
+            let request_index = match source.as_ref() {
+                Expr::Lit(Lit::String(_, specifier, _)) => {
+                    let attributes = extract_literal_import_attributes(options.as_deref());
+                    let request = crate::module::DynamicModuleRequest {
+                        specifier: specifier.clone(),
+                        phase: *phase,
+                        attributes: attributes.unwrap_or_default(),
+                    };
+                    ctx.intern_dynamic_import_request(request)
                 }
-            }
+                _ => u16::MAX,
+            };
+            // Evaluate `source`, then `options` for side effects in source
+            // order; the options value is discarded. The runtime specifier is
+            // popped by the opcode (only the index matters for resolution).
             compile_expr(source, func, ctx);
-            func.emit_bare(Opcode::DynamicImport);
+            if let Some(opts) = options.as_deref() {
+                compile_expr(opts, func, ctx);
+                func.emit_bare(Opcode::Pop);
+            }
+            func.emit(Instruction::new(Opcode::DynamicImport, request_index));
         }
         Expr::ImportMeta(_) => func.emit_bare(Opcode::GetImportMeta),
         Expr::Regex { pattern, flags, .. } => {
@@ -2825,6 +2910,7 @@ fn compile_update(
         func.emit_bare(arith);
     };
     match arg {
+        Expr::Paren { expr, .. } => compile_update(op, prefix, expr, func, ctx, span),
         Expr::Ident { name, .. } => {
             load_ident(name, func, ctx);
             if prefix {
@@ -2902,7 +2988,7 @@ struct CompilerCtx {
     functions: Vec<BytecodeFunction>,
     is_module: bool,
     module_function_initializers: Vec<(u16, u32)>,
-    dynamic_import_requests: Vec<String>,
+    dynamic_import_requests: Vec<crate::module::DynamicModuleRequest>,
     errors: Vec<Diagnostic>,
     /// Stack of enclosing loops/switches for `break`/`continue`. Each frame
     /// records forward-jump placeholders to patch at loop exit: `breaks` → after
@@ -2978,6 +3064,29 @@ fn capture_visible_environment(ctx: &mut CompilerCtx) {
 
 impl CompilerCtx {
     // ---- scope / upvalue resolution -------------------------------------
+
+    /// Intern a dynamic-import `ModuleRequest` (specifier + phase + attributes),
+    /// returning its index in `dynamic_import_requests`. The `DynamicImport`
+    /// opcode carries this index (not the specifier) so two imports of the same
+    /// specifier with different attributes resolve to distinct Module Records —
+    /// the request's full identity (per TC39 Module Requests) is the key. A
+    /// request that already exists (same specifier/phase/attributes) reuses its
+    /// index.
+    fn intern_dynamic_import_request(
+        &mut self,
+        request: crate::module::DynamicModuleRequest,
+    ) -> u16 {
+        if let Some(index) = self
+            .dynamic_import_requests
+            .iter()
+            .position(|existing| existing == &request)
+        {
+            return index as u16;
+        }
+        let index = self.dynamic_import_requests.len() as u16;
+        self.dynamic_import_requests.push(request);
+        index
+    }
 
     /// Register a local binding name in the current scope (also allocating a
     /// slot in `func.locals`). Returns the slot index.

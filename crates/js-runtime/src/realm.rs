@@ -31,7 +31,21 @@ pub struct Realm {
     /// `%BigIntPrototype%`.
     pub bigint_proto: Option<JsObject>,
     /// Host-observable completion signal used by Test262's async protocol.
+    /// `test262_done_called` is set by `$DONE`; `test262_done_error` records the
+    /// argument when `$DONE` is called with a value (an async failure). The
+    /// runner must treat a non-`None` error as a test failure even if the
+    /// top-level script completed normally — the throw inside a Promise
+    /// reaction would otherwise be swallowed.
     pub test262_done_called: bool,
+    pub test262_done_error: Option<Value>,
+    /// Whether the VM-level intrinsics have been installed for this realm.
+    /// `install_globals`, `globalThis`, the per-realm intrinsic prototypes and
+    /// the `Array.prototype` wiring run exactly once per realm (on the first
+    /// `Interpreter::new`), so a realm reused across several
+    /// executes/interpreters keeps stable prototype identity and preserves user
+    /// modifications to built-ins. A realm is long-lived; intrinsics must not be
+    /// re-created per interpreter.
+    pub intrinsics_initialized: bool,
 }
 
 impl Realm {
@@ -49,6 +63,8 @@ impl Realm {
             symbol_proto: None,
             bigint_proto: None,
             test262_done_called: false,
+            test262_done_error: None,
+            intrinsics_initialized: false,
         };
         builtins::install_all(&mut realm);
         realm
